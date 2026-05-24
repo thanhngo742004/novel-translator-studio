@@ -1,0 +1,33 @@
+tasks:
+  language_detect:
+    primary:
+      provider: mock
+      model_class: cheap_text
+    policy:
+      structured_output: true
+      max_cost_usd: 0.001
+
+  style_learning:
+    primary:
+      provider: mock
+      model_class: strong_reasoning
+    policy:
+      structured_output: true
+      max_cost_usd: 0.20
+
+  literary_translate:
+    primary:
+      provider: mock
+      model_class: strong_writing
+    policy:
+      structured_output: false
+      max_cost_usd: 0.30
+
+  hallucination_guard:
+    primary:
+      provider: mock
+      model_class: strong_reviewer
+    policy:
+      structured_output: true
+      prefer_different_provider_from: literary_translate
+      max_cost_usd: 0.08

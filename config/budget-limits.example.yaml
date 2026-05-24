@@ -1,0 +1,21 @@
+budget:
+  daily_usd_limit: 5.0
+  per_project_usd_limit: 20.0
+  warning_threshold: 0.8
+
+task_limits:
+  style_learning:
+    max_usd_per_run: 0.50
+    allow_strong_model: true
+
+  literary_translate:
+    max_usd_per_chapter: 0.50
+    allow_strong_model: true
+
+  hallucination_guard:
+    max_usd_per_chapter: 0.25
+    allow_strong_model: true
+
+  manga_typeset_review:
+    max_usd_per_page: 0.10
+    allow_vision: true
