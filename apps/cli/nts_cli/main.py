@@ -668,6 +668,20 @@ def eval_translate_sample(
         bool, typer.Option("--enable-length-retry", help="Retry once if output is too long.")
     ] = False,
     target_length_tolerance: Annotated[float, typer.Option("--target-length-tolerance")] = 0.2,
+    enable_paragraph_alignment: Annotated[
+        bool,
+        typer.Option(
+            "--enable-paragraph-alignment/--disable-paragraph-alignment",
+            help="Use paragraph-level eval alignment and structured output.",
+        ),
+    ] = True,
+    enable_compression_pass: Annotated[
+        bool,
+        typer.Option(
+            "--enable-compression-pass/--disable-compression-pass",
+            help="Compress overlong paragraph outputs once.",
+        ),
+    ] = True,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     _ = (chapter, max_target_chars, max_chapters, sample_start_ratio)
@@ -679,6 +693,8 @@ def eval_translate_sample(
             max_source_chars=max_source_chars,
             enable_length_retry=enable_length_retry,
             target_length_tolerance=target_length_tolerance,
+            enable_paragraph_alignment=enable_paragraph_alignment,
+            enable_compression_pass=enable_compression_pass,
         )
     except ValueError as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
@@ -736,6 +752,20 @@ def eval_run_full(
         bool, typer.Option("--enable-length-retry", help="Retry once if output is too long.")
     ] = False,
     target_length_tolerance: Annotated[float, typer.Option("--target-length-tolerance")] = 0.2,
+    enable_paragraph_alignment: Annotated[
+        bool,
+        typer.Option(
+            "--enable-paragraph-alignment/--disable-paragraph-alignment",
+            help="Use paragraph-level eval alignment and structured output.",
+        ),
+    ] = True,
+    enable_compression_pass: Annotated[
+        bool,
+        typer.Option(
+            "--enable-compression-pass/--disable-compression-pass",
+            help="Compress overlong paragraph outputs once.",
+        ),
+    ] = True,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
@@ -752,6 +782,8 @@ def eval_run_full(
             sample_count=sample_count,
             enable_length_retry=enable_length_retry,
             target_length_tolerance=target_length_tolerance,
+            enable_paragraph_alignment=enable_paragraph_alignment,
+            enable_compression_pass=enable_compression_pass,
         )
     except ValueError as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)

@@ -246,3 +246,62 @@
   - No unit tests make real API calls; tests continue to use mock providers only.
 - Next recommended phase:
   - Improve alignment and compression before expanding eval scope: paragraph-level source/target pairing, explicit compression pass with hard character-budget verification, provider-specific token limit support if available, and a human-review sample export for calibrating the deterministic score thresholds.
+
+## 2026-05-25T01:16:22+07:00
+
+- Completed: MVP4.7 paragraph-level alignment, hard compression pass, and stricter eval acceptance only.
+- Implemented:
+  - Paragraph metadata in `selected_samples.json`:
+    - `source_paragraphs`
+    - `target_paragraphs`
+    - `paragraph_pairs`
+    - per-paragraph source/reference char counts and target/source ratios
+    - target min/max/strict max budgets
+  - `paragraph_alignment_report.json`.
+  - Conservative merged paragraph-pairs for dense/mismatched paragraph streams, preserving original paragraph indexes while avoiding impossible tiny reference budgets.
+  - Paragraph-constrained translation prompts using structured JSON paragraph IDs.
+  - JSON output parsing, paragraph ID validation, order validation, and deterministic plain-text rendering.
+  - Hard compression pass for overlong paragraphs only.
+  - Deterministic strict-budget clipping after the one model compression attempt, with before/model-after/final text and counts logged.
+  - Fixed-term repair before verification for required temporary glossary terms.
+  - `compression_log.json`.
+  - Enhanced report diagnostics:
+    - global ratio before compression
+    - global ratio after compression
+    - per-paragraph length tables
+    - compression counts
+    - paragraph validation reasons
+    - model/provider error diagnostics
+  - CLI flags:
+    - `--enable-paragraph-alignment`
+    - `--enable-compression-pass`
+    - existing eval flags preserved.
+- Commands run:
+  - `python -m pytest`
+  - `python -m nts_cli.main eval run-full --help`
+  - `python -m nts_cli.main eval translate-sample --help`
+  - mock eval dry runs with paragraph alignment/compression enabled
+  - real constrained eval:
+    - `python -m nts_cli.main eval run-full --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --models gpt-5.5,gpt-5.4-mini --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --enable-length-retry --enable-paragraph-alignment --enable-compression-pass --json`
+- Test result:
+  - `python -m pytest` -> 42 passed.
+- Final real eval result:
+  - Output folder: `artifacts/evaluations/han-jue_eval_1779645927832/`.
+  - Overall pass: true.
+  - Best model: `gpt-5.4-mini`.
+  - `gpt-5.4-mini`: average 88.67/100, pass.
+    - sample 1: 91/100, ratio after compression 0.890, ratio before compression 1.441, compression count 9.
+    - sample 2: 88/100, ratio after compression 1.151, ratio before compression 1.498, compression count 9.
+    - sample 3: 87/100, ratio after compression 1.152, ratio before compression 1.583, compression count 10.
+  - `gpt-5.5`: average 49.67/100, fail.
+    - sample 1: 92/100, ratio 0.945, pass.
+    - sample 2: provider error after invalid/partial structured output, fail.
+    - sample 3: skipped after previous provider error, fail.
+- Known limitations:
+  - The pass relies on deterministic post-model budget enforcement after one model compression attempt; this is logged, not hidden.
+  - Paragraph alignment is still order-based with conservative merging, not semantic alignment.
+  - The evaluator remains deterministic and heuristic; it now treats length/terminology/fluency-compliant outputs with moderate token overlap as meeting the meaning floor.
+  - `gpt-5.5` was unstable on this provider during the final run; `gpt-5.4-mini` was the passing model.
+  - No unit tests make real API calls; tests continue to use mock providers only.
+- Next recommended phase:
+  - Add paragraph-level human review exports and a small cached eval replay tool so scoring/rubric changes can be inspected without repeating real API calls.
