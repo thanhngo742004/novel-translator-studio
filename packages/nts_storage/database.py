@@ -1,75 +1,19 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
-MIGRATION_001 = """
+SCHEMA_MIGRATIONS_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     applied_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY,
-    slug TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    source_lang TEXT NOT NULL,
-    target_lang TEXT NOT NULL,
-    domain TEXT,
-    genre TEXT,
-    status TEXT NOT NULL DEFAULT 'active',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS task_runs (
-    id TEXT PRIMARY KEY,
-    task_type TEXT NOT NULL,
-    project_id TEXT,
-    status TEXT NOT NULL,
-    stage TEXT,
-    input_json TEXT,
-    state_json TEXT,
-    result_json TEXT,
-    error_json TEXT,
-    started_at TEXT,
-    finished_at TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(project_id) REFERENCES projects(id)
-);
-
-CREATE TABLE IF NOT EXISTS model_runs (
-    id TEXT PRIMARY KEY,
-    task_run_id TEXT,
-    provider_key TEXT NOT NULL,
-    adapter_type TEXT NOT NULL,
-    base_url TEXT,
-    model_name TEXT,
-    prompt_hash TEXT,
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    cost_estimate REAL,
-    status TEXT NOT NULL,
-    started_at TEXT,
-    finished_at TEXT,
-    FOREIGN KEY(task_run_id) REFERENCES task_runs(id)
-);
-
-CREATE TABLE IF NOT EXISTS provider_configs (
-    id TEXT PRIMARY KEY,
-    provider_key TEXT NOT NULL UNIQUE,
-    provider_type TEXT NOT NULL,
-    base_url TEXT,
-    api_key_env TEXT,
-    options_json TEXT,
-    last_validated_at TEXT,
-    status TEXT NOT NULL
 );
 """
 
@@ -89,19 +33,57 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def connection(db_path: Path) -> Iterator[sqlite3.Connection]:
+    conn = connect(db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def initialize_database(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with connect(db_path) as conn:
+    with connection(db_path) as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         apply_migrations(conn)
 
 
-def apply_migrations(conn: sqlite3.Connection) -> None:
-    conn.executescript(MIGRATION_001)
-    conn.execute(
-        "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-        (1, "mvp0_initial_tables", utc_now()),
-    )
+def default_migrations_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "migrations"
+
+
+def migration_version(path: Path) -> int:
+    prefix = path.name.split("_", 1)[0]
+    try:
+        return int(prefix)
+    except ValueError as exc:
+        raise ValueError(f"Migration filename must start with a numeric version: {path.name}") from exc
+
+
+def applied_migration_versions(conn: sqlite3.Connection) -> set[int]:
+    rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
+    return {int(row["version"]) for row in rows}
+
+
+def apply_migrations(conn: sqlite3.Connection, migrations_dir: Path | None = None) -> None:
+    migrations_path = migrations_dir or default_migrations_dir()
+    if not migrations_path.exists():
+        raise FileNotFoundError(f"Migrations directory not found: {migrations_path}")
+
+    conn.executescript(SCHEMA_MIGRATIONS_SQL)
+    applied = applied_migration_versions(conn)
+    for migration in sorted(migrations_path.glob("*.sql"), key=migration_version):
+        version = migration_version(migration)
+        if version in applied:
+            continue
+        sql = migration.read_text(encoding="utf-8")
+        conn.executescript(sql)
+        conn.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+            (version, migration.name, utc_now()),
+        )
+        applied.add(version)
     conn.commit()
 
 
@@ -166,4 +148,3 @@ def row_to_dict(row: sqlite3.Row, json_fields: Iterable[str] = ()) -> dict[str, 
         if field in data:
             data[field] = json_loads(data[field])
     return data
-

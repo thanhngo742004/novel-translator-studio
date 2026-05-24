@@ -30,6 +30,12 @@ class CliState:
 state = CliState()
 
 
+WorkspaceOption = Annotated[
+    Optional[Path],
+    typer.Option("--workspace", "-w", help="Workspace path. Overrides discovery."),
+]
+
+
 def _print(payload: dict, as_json: bool) -> None:
     if as_json:
         typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
@@ -44,12 +50,13 @@ def _fail(code: str, message: str, exit_code: int, as_json: bool) -> None:
     raise typer.Exit(exit_code)
 
 
+def _workspace_arg(command_workspace: Path | None = None) -> Path | None:
+    return command_workspace or state.workspace
+
+
 @app.callback()
 def main(
-    workspace: Annotated[
-        Optional[Path],
-        typer.Option("--workspace", "-w", help="Workspace path. Defaults to discovery."),
-    ] = None,
+    workspace: WorkspaceOption = None,
 ) -> None:
     state.workspace = workspace
 
@@ -67,10 +74,11 @@ def init(
 
 @app.command()
 def doctor(
+    workspace: WorkspaceOption = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
-        ws = discover_workspace(state.workspace)
+        ws = discover_workspace(_workspace_arg(workspace))
         report = build_doctor_report(ws)
     except WorkspaceError as exc:
         _fail("WORKSPACE_NOT_INITIALIZED", str(exc), 7, json_output)
@@ -83,12 +91,13 @@ def project_create(
     name: Annotated[str, typer.Option("--name")],
     source_lang: Annotated[str, typer.Option("--source-lang")],
     target_lang: Annotated[str, typer.Option("--target-lang")],
+    workspace: WorkspaceOption = None,
     domain: Annotated[str, typer.Option("--domain")] = "novel",
     genre: Annotated[Optional[str], typer.Option("--genre")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
-        ws = discover_workspace(state.workspace)
+        ws = discover_workspace(_workspace_arg(workspace))
         project = create_project(
             ws,
             slug=slug,
@@ -107,10 +116,11 @@ def project_create(
 
 @project_app.command("list")
 def project_list(
+    workspace: WorkspaceOption = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
-        ws = discover_workspace(state.workspace)
+        ws = discover_workspace(_workspace_arg(workspace))
         projects = list_projects(ws)
     except WorkspaceError as exc:
         _fail("WORKSPACE_NOT_INITIALIZED", str(exc), 7, json_output)
@@ -119,6 +129,7 @@ def project_list(
 
 @config_app.command("validate")
 def config_validate(
+    workspace: WorkspaceOption = None,
     providers: Annotated[
         Optional[Path],
         typer.Option("--providers", help="Path to providers YAML."),
@@ -130,7 +141,7 @@ def config_validate(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
-        ws = discover_workspace(state.workspace)
+        ws = discover_workspace(_workspace_arg(workspace))
     except WorkspaceError:
         ws = None
     try:
@@ -143,11 +154,12 @@ def config_validate(
 @model_app.command("test")
 def model_test(
     provider: Annotated[str, typer.Option("--provider")],
+    workspace: WorkspaceOption = None,
     prompt: Annotated[str, typer.Option("--prompt")] = "ping",
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
-        ws = discover_workspace(state.workspace)
+        ws = discover_workspace(_workspace_arg(workspace))
         result = run_mock_model_test(ws, provider_key=provider, prompt=prompt)
     except WorkspaceError as exc:
         _fail("WORKSPACE_NOT_INITIALIZED", str(exc), 7, json_output)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import closing
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -15,6 +17,16 @@ runner = CliRunner()
 
 def parse_json(output: str) -> dict:
     return json.loads(output)
+
+
+def table_names(db_path: Path) -> set[str]:
+    with closing(sqlite3.connect(db_path)) as conn:
+        return {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
 
 
 def test_cli_smoke() -> None:
@@ -35,20 +47,51 @@ def test_workspace_init_creates_expected_folders_and_db(tmp_path: Path) -> None:
         assert (workspace / rel_path).is_dir()
 
 
-def test_db_migration_initializes_core_tables(tmp_path: Path) -> None:
+def test_repeated_init_is_idempotent_and_does_not_overwrite_configs(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     result = runner.invoke(app, ["init", "--workspace", str(workspace), "--json"])
     assert result.exit_code == 0, result.output
 
-    with sqlite3.connect(workspace / "nts.db") as conn:
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            )
-        }
+    providers_path = workspace / "config" / "providers.yaml"
+    custom_providers = "providers:\n  custom_mock:\n    type: mock\n"
+    providers_path.write_text(custom_providers, encoding="utf-8")
 
-    assert {"projects", "task_runs", "model_runs", "provider_configs"}.issubset(tables)
+    second = runner.invoke(app, ["init", "--workspace", str(workspace), "--json"])
+    assert second.exit_code == 0, second.output
+    assert providers_path.read_text(encoding="utf-8") == custom_providers
+
+    with closing(sqlite3.connect(workspace / "nts.db")) as conn:
+        migration_count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
+    assert migration_count == 1
+
+
+def test_file_based_migration_initializes_core_tables_and_metadata(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    result = runner.invoke(app, ["init", "--workspace", str(workspace), "--json"])
+    assert result.exit_code == 0, result.output
+
+    tables = table_names(workspace / "nts.db")
+
+    assert {
+        "projects",
+        "task_runs",
+        "model_runs",
+        "provider_configs",
+        "schema_migrations",
+    }.issubset(tables)
+
+
+def test_doctor_accepts_command_level_and_root_level_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    runner.invoke(app, ["init", "--workspace", str(workspace), "--json"])
+
+    command_level = runner.invoke(app, ["doctor", "--workspace", str(workspace), "--json"])
+    root_level = runner.invoke(app, ["--workspace", str(workspace), "doctor", "--json"])
+
+    assert command_level.exit_code == 0, command_level.output
+    assert root_level.exit_code == 0, root_level.output
+    assert parse_json(command_level.output)["data"]["ok"] is True
+    assert parse_json(root_level.output)["data"]["ok"] is True
 
 
 def test_config_loader_parses_example_config(tmp_path: Path) -> None:
@@ -78,17 +121,30 @@ def test_config_loader_parses_example_config(tmp_path: Path) -> None:
     assert "language_detect" in payload["data"]["tasks"]
 
 
-def test_project_create_and_list(tmp_path: Path) -> None:
+def test_config_validate_default_paths_uses_workspace_config(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    runner.invoke(app, ["init", "--workspace", str(workspace), "--json"])
+
+    result = runner.invoke(app, ["config", "validate", "--workspace", str(workspace), "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = parse_json(result.output)
+    assert payload["data"]["valid"] is True
+    assert payload["data"]["providers_path"] == str(workspace / "config" / "providers.yaml")
+    assert payload["data"]["routing_path"] == str(workspace / "config" / "routing.yaml")
+
+
+def test_project_create_and_list_with_command_level_workspace(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     runner.invoke(app, ["init", "--workspace", str(workspace), "--json"])
 
     create_result = runner.invoke(
         app,
         [
-            "--workspace",
-            str(workspace),
             "project",
             "create",
+            "--workspace",
+            str(workspace),
             "--slug",
             "demo",
             "--name",
@@ -107,11 +163,38 @@ def test_project_create_and_list(tmp_path: Path) -> None:
 
     list_result = runner.invoke(
         app,
-        ["--workspace", str(workspace), "project", "list", "--json"],
+        ["project", "list", "--workspace", str(workspace), "--json"],
     )
     assert list_result.exit_code == 0, list_result.output
     listed = parse_json(list_result.output)
     assert [project["slug"] for project in listed["data"]["projects"]] == ["demo"]
+
+
+def test_project_create_and_list_after_workspace_discovery(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner.invoke(app, ["init", "--workspace", "workspace", "--json"])
+
+    create_result = runner.invoke(
+        app,
+        [
+            "project",
+            "create",
+            "--slug",
+            "discovered",
+            "--name",
+            "Discovered",
+            "--source-lang",
+            "zh",
+            "--target-lang",
+            "vi",
+            "--json",
+        ],
+    )
+    list_result = runner.invoke(app, ["project", "list", "--json"])
+
+    assert create_result.exit_code == 0, create_result.output
+    assert list_result.exit_code == 0, list_result.output
+    assert parse_json(list_result.output)["data"]["projects"][0]["slug"] == "discovered"
 
 
 def test_mock_provider_returns_deterministic_response_and_logs_model_run(tmp_path: Path) -> None:
@@ -119,10 +202,10 @@ def test_mock_provider_returns_deterministic_response_and_logs_model_run(tmp_pat
     runner.invoke(app, ["init", "--workspace", str(workspace), "--json"])
 
     args = [
-        "--workspace",
-        str(workspace),
         "model",
         "test",
+        "--workspace",
+        str(workspace),
         "--provider",
         "mock",
         "--prompt",
@@ -142,7 +225,7 @@ def test_mock_provider_returns_deterministic_response_and_logs_model_run(tmp_pat
         == "mock:66fddd00ccb86fb2"
     )
 
-    with sqlite3.connect(workspace / "nts.db") as conn:
+    with closing(sqlite3.connect(workspace / "nts.db")) as conn:
         model_run_count = conn.execute("SELECT COUNT(*) FROM model_runs").fetchone()[0]
         task_run_count = conn.execute(
             "SELECT COUNT(*) FROM task_runs WHERE task_type = 'model.test'"
@@ -150,3 +233,24 @@ def test_mock_provider_returns_deterministic_response_and_logs_model_run(tmp_pat
 
     assert model_run_count == 2
     assert task_run_count == 2
+
+
+def test_sqlite_connections_are_closed_after_commands(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    runner.invoke(app, ["init", "--workspace", str(workspace), "--json"])
+    runner.invoke(app, ["doctor", "--workspace", str(workspace), "--json"])
+    runner.invoke(
+        app,
+        [
+            "model",
+            "test",
+            "--workspace",
+            str(workspace),
+            "--provider",
+            "mock",
+            "--json",
+        ],
+    )
+
+    shutil.rmtree(workspace)
+    assert not workspace.exists()

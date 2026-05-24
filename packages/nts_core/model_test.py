@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from nts_storage.database import connect, insert_task_run, json_dumps, new_id, utc_now
+from nts_storage.database import connection, insert_task_run, json_dumps, new_id, utc_now
 from nts_storage.workspace import Workspace
 
 
@@ -23,7 +23,7 @@ def run_mock_model_test(workspace: Workspace, *, provider_key: str, prompt: str)
 
     response = _mock_response(prompt)
     now = utc_now()
-    with connect(workspace.db_path) as conn:
+    with connection(workspace.db_path) as conn:
         task_id = insert_task_run(
             conn,
             task_type="model.test",
@@ -66,4 +66,3 @@ def run_mock_model_test(workspace: Workspace, *, provider_key: str, prompt: str)
         "response": response,
         "raw_result_json": json_dumps(response),
     }
-

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from nts_storage.database import connect, insert_task_run, new_id, row_to_dict, utc_now
+from nts_storage.database import connection, insert_task_run, new_id, row_to_dict, utc_now
 from nts_storage.workspace import Workspace
 
 
@@ -39,7 +39,7 @@ def create_project(
         "updated_at": now,
     }
 
-    with connect(workspace.db_path) as conn:
+    with connection(workspace.db_path) as conn:
         try:
             conn.execute(
                 """
@@ -86,7 +86,7 @@ def create_project(
 
 
 def list_projects(workspace: Workspace) -> list[dict[str, Any]]:
-    with connect(workspace.db_path) as conn:
+    with connection(workspace.db_path) as conn:
         rows = conn.execute(
             """
             SELECT id, slug, name, source_lang, target_lang, domain, genre, status,
@@ -96,4 +96,3 @@ def list_projects(workspace: Workspace) -> list[dict[str, Any]]:
             """
         ).fetchall()
     return [row_to_dict(row) for row in rows]
-
