@@ -96,3 +96,35 @@ def list_projects(workspace: Workspace) -> list[dict[str, Any]]:
             """
         ).fetchall()
     return [row_to_dict(row) for row in rows]
+
+
+def get_project_by_slug(workspace: Workspace, slug: str) -> dict[str, Any]:
+    with connection(workspace.db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT id, slug, name, source_lang, target_lang, domain, genre, status,
+                   created_at, updated_at
+            FROM projects
+            WHERE slug = ?
+            """,
+            (slug,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"Project not found: {slug}")
+    return row_to_dict(row)
+
+
+def get_project_by_id(workspace: Workspace, project_id: str) -> dict[str, Any]:
+    with connection(workspace.db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT id, slug, name, source_lang, target_lang, domain, genre, status,
+                   created_at, updated_at
+            FROM projects
+            WHERE id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"Project not found: {project_id}")
+    return row_to_dict(row)

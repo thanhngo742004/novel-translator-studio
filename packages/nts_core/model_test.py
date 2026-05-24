@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from typing import Any
 
 from nts_storage.database import connection, insert_task_run, json_dumps, new_id, utc_now
@@ -17,12 +18,50 @@ def _mock_response(prompt: str) -> dict[str, Any]:
     }
 
 
+def log_mock_model_run(
+    conn: sqlite3.Connection,
+    *,
+    task_run_id: str,
+    provider_key: str,
+    prompt: str,
+) -> dict[str, Any]:
+    if provider_key != "mock":
+        raise ValueError("MVP1 only supports provider `mock` for model execution.")
+
+    response = _mock_response(prompt)
+    now = utc_now()
+    model_run_id = new_id("modelrun")
+    conn.execute(
+        """
+        INSERT INTO model_runs (
+            id, task_run_id, provider_key, adapter_type, base_url, model_name,
+            prompt_hash, input_tokens, output_tokens, cost_estimate, status,
+            started_at, finished_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            model_run_id,
+            task_run_id,
+            provider_key,
+            "mock",
+            "mock://local",
+            response["model"],
+            response["prompt_hash"],
+            len(prompt.split()),
+            len(response["output"].split()),
+            0.0,
+            "success",
+            now,
+            now,
+        ),
+    )
+    return {"model_run_id": model_run_id, "response": response}
+
+
 def run_mock_model_test(workspace: Workspace, *, provider_key: str, prompt: str) -> dict[str, Any]:
     if provider_key != "mock":
         raise ValueError("MVP0 only supports provider `mock`.")
 
-    response = _mock_response(prompt)
-    now = utc_now()
     with connection(workspace.db_path) as conn:
         task_id = insert_task_run(
             conn,
@@ -30,32 +69,16 @@ def run_mock_model_test(workspace: Workspace, *, provider_key: str, prompt: str)
             status="success",
             stage="completed",
             input_data={"provider": provider_key, "prompt": prompt},
-            result_data=response,
+            result_data={},
         )
-        model_run_id = new_id("modelrun")
+        logged = log_mock_model_run(
+            conn, task_run_id=task_id, provider_key=provider_key, prompt=prompt
+        )
+        model_run_id = logged["model_run_id"]
+        response = logged["response"]
         conn.execute(
-            """
-            INSERT INTO model_runs (
-                id, task_run_id, provider_key, adapter_type, base_url, model_name,
-                prompt_hash, input_tokens, output_tokens, cost_estimate, status,
-                started_at, finished_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                model_run_id,
-                task_id,
-                provider_key,
-                "mock",
-                "mock://local",
-                response["model"],
-                response["prompt_hash"],
-                len(prompt.split()),
-                len(response["output"].split()),
-                0.0,
-                "success",
-                now,
-                now,
-            ),
+            "UPDATE task_runs SET result_json = ? WHERE id = ?",
+            (json_dumps(response), task_id),
         )
         conn.commit()
 

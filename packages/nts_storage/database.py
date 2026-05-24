@@ -142,6 +142,32 @@ def insert_task_run(
     return task_id
 
 
+def update_task_run(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    status: str,
+    stage: str | None = None,
+    result_data: dict[str, Any] | None = None,
+    error_data: dict[str, Any] | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE task_runs
+        SET status = ?, stage = ?, result_json = ?, error_json = ?, finished_at = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            stage,
+            json_dumps(result_data or {}),
+            json_dumps(error_data) if error_data else None,
+            utc_now() if status in {"success", "error"} else None,
+            task_id,
+        ),
+    )
+
+
 def row_to_dict(row: sqlite3.Row, json_fields: Iterable[str] = ()) -> dict[str, Any]:
     data = dict(row)
     for field in json_fields:
