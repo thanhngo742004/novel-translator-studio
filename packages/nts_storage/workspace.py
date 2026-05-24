@@ -14,6 +14,7 @@ WORKSPACE_DIRS = [
     "artifacts/translated",
     "artifacts/manga",
     "artifacts/exports",
+    "artifacts/reports",
     "artifacts/tmp",
     "logs/runs",
     "cache",
@@ -98,4 +99,3 @@ def discover_workspace(explicit: Path | None = None) -> Workspace:
     if explicit is not None:
         raise WorkspaceError(f"Workspace is not initialized: {explicit}")
     raise WorkspaceError("Workspace is not initialized. Run `nts init --workspace <path>` first.")
-

@@ -7,6 +7,11 @@ from typing import Annotated, Optional
 import typer
 
 from nts_core.config import validate_config_files
+from nts_core.corrections import (
+    learn_corrections,
+    records_from_jsonl,
+    records_from_parallel_files,
+)
 from nts_core.doctor import build_doctor_report
 from nts_core.memory import (
     add_evidence,
@@ -36,6 +41,7 @@ memory_app = typer.Typer(help="Memory commands.")
 memory_evidence_app = typer.Typer(help="Memory evidence commands.")
 memory_status_app = typer.Typer(help="Memory status commands.")
 translate_app = typer.Typer(help="Translation commands.")
+learn_app = typer.Typer(help="Learning commands.")
 app.add_typer(project_app, name="project")
 app.add_typer(config_app, name="config")
 app.add_typer(model_app, name="model")
@@ -43,6 +49,7 @@ app.add_typer(import_app, name="import")
 app.add_typer(text_app, name="text")
 app.add_typer(memory_app, name="memory")
 app.add_typer(translate_app, name="translate")
+app.add_typer(learn_app, name="learn")
 text_app.add_typer(text_chapters_app, name="chapters")
 text_app.add_typer(text_segments_app, name="segments")
 memory_app.add_typer(memory_evidence_app, name="evidence")
@@ -399,6 +406,44 @@ def translate_text(
     try:
         ws = discover_workspace(_workspace_arg(workspace))
         result = translate_chapter_mock(ws, chapter_id=chapter, provider_key=provider)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@learn_app.command("correction")
+def learn_correction(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    raw: Annotated[Optional[Path], typer.Option("--raw", help="Raw source text file.")] = None,
+    ai: Annotated[Optional[Path], typer.Option("--ai", help="AI translation file.")] = None,
+    human: Annotated[
+        Optional[Path], typer.Option("--human", help="Human-corrected translation file.")
+    ] = None,
+    file: Annotated[Optional[Path], typer.Option("--file", help="Corrections JSONL file.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        if file is not None:
+            if any(path is not None for path in (raw, ai, human)):
+                raise ValueError("Use either --file or --raw/--ai/--human, not both.")
+            records = records_from_jsonl(file)
+            input_ref = str(file.resolve())
+        else:
+            if raw is None or ai is None or human is None:
+                raise ValueError("Use --file or provide all of --raw, --ai, and --human.")
+            records = records_from_parallel_files(raw, ai, human)
+            input_ref = json.dumps(
+                {
+                    "raw": str(raw.resolve()),
+                    "ai": str(ai.resolve()),
+                    "human": str(human.resolve()),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        result = learn_corrections(ws, project_slug=project, records=records, input_ref=input_ref)
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)

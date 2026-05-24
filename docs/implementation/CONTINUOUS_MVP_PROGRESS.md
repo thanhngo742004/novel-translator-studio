@@ -48,3 +48,33 @@
   - Translation output is intentionally mock text and must not be treated as real translation.
 - Next recommended phase:
   - MVP2 correction learning foundation: import raw/AI/human corrections, create pending correction memory candidates, attach evidence, audit writes, and emit correction reports.
+
+## 2026-05-24T20:15:00+07:00
+
+- Completed: MVP2 correction learning foundation only.
+- Implemented:
+  - `nts learn correction --raw <raw.txt> --ai <ai.txt> --human <human.txt> --project <slug>`.
+  - `nts learn correction --file <corrections.jsonl> --project <slug>`.
+  - Deterministic local AI-vs-human comparison with conservative categories:
+    - `changed_text`
+    - `possible_terminology_change`
+    - `possible_style_change`
+    - `possible_omission_or_addition`
+  - Pending `correction` memory items with project-scoped `scope_json`, low/medium confidence, `source_key` signature, and `value_json` containing raw/AI/human excerpts, error type, optional fix rule, and context.
+  - `memory_evidence` rows for every correction memory.
+  - `memory_audit_logs` create entry for every correction memory, linked to the correction learning `task_run`.
+  - JSON correction report artifacts under `artifacts/reports/`.
+  - No `model_runs`; MVP2 uses no model calls.
+- Commands run:
+  - `python -m pytest`
+  - `python -m nts_cli.main learn --help`
+  - `python -m nts_cli.main learn correction --help`
+- Test result:
+  - `python -m pytest` -> 22 passed.
+- Known limitations:
+  - Paragraph/file alignment is index-based only.
+  - Classification is heuristic and conservative; it does not claim semantic accuracy.
+  - Correction memories remain pending and do not update term/name/pronoun/style memories.
+  - No style learning, glossary extraction, LLM calls, vector DB, plugin export, manga, or GUI were implemented.
+- Next recommended phase:
+  - MVP3 compact plugin export foundation: compile active memory items into deterministic read-only bundle files, write export metadata, and keep plugins non-learning.
