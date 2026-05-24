@@ -13,6 +13,22 @@ from nts_core.corrections import (
     records_from_parallel_files,
 )
 from nts_core.doctor import build_doctor_report
+from nts_core.eval_harness import (
+    DEFAULT_LIMITS,
+    compare_translation,
+    learn_style,
+    prepare_parallel,
+    run_full,
+    translate_sample,
+)
+from nts_core.export_compiler import compile_export_bundle
+from nts_core.manga import (
+    export_manga_boxes,
+    export_manga_manifest,
+    import_manga_boxes,
+    import_manga_pages,
+    list_manga_pages,
+)
 from nts_core.memory import (
     add_evidence,
     build_bundle,
@@ -42,6 +58,12 @@ memory_evidence_app = typer.Typer(help="Memory evidence commands.")
 memory_status_app = typer.Typer(help="Memory status commands.")
 translate_app = typer.Typer(help="Translation commands.")
 learn_app = typer.Typer(help="Learning commands.")
+export_app = typer.Typer(help="Export commands.")
+manga_app = typer.Typer(help="Manga commands.")
+manga_pages_app = typer.Typer(help="Manga page commands.")
+manga_boxes_app = typer.Typer(help="Manga box commands.")
+manga_manifest_app = typer.Typer(help="Manga manifest commands.")
+eval_app = typer.Typer(help="Evaluation harness commands.")
 app.add_typer(project_app, name="project")
 app.add_typer(config_app, name="config")
 app.add_typer(model_app, name="model")
@@ -50,10 +72,16 @@ app.add_typer(text_app, name="text")
 app.add_typer(memory_app, name="memory")
 app.add_typer(translate_app, name="translate")
 app.add_typer(learn_app, name="learn")
+app.add_typer(export_app, name="export")
+app.add_typer(manga_app, name="manga")
+app.add_typer(eval_app, name="eval")
 text_app.add_typer(text_chapters_app, name="chapters")
 text_app.add_typer(text_segments_app, name="segments")
 memory_app.add_typer(memory_evidence_app, name="evidence")
 memory_app.add_typer(memory_status_app, name="status")
+manga_app.add_typer(manga_pages_app, name="pages")
+manga_app.add_typer(manga_boxes_app, name="boxes")
+manga_app.add_typer(manga_manifest_app, name="manifest")
 
 
 class CliState:
@@ -72,11 +100,15 @@ WorkspaceOption = Annotated[
 
 def _print(payload: dict, as_json: bool) -> None:
     if as_json:
-        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        typer.echo(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
     else:
         status = payload.get("status", "unknown")
         data = payload.get("data")
-        typer.echo(f"{status}: {data if data is not None else payload}")
+        if data is not None:
+            rendered = json.dumps(data, ensure_ascii=True, sort_keys=True)
+        else:
+            rendered = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        typer.echo(f"{status}: {rendered}")
 
 
 def _fail(code: str, message: str, exit_code: int, as_json: bool) -> None:
@@ -447,6 +479,283 @@ def learn_correction(
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@export_app.command("bundle")
+def export_bundle(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = compile_export_bundle(ws, project_slug=project, bundle_kind="bundle")
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@export_app.command("vbook-profile")
+def export_vbook_profile(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = compile_export_bundle(ws, project_slug=project, bundle_kind="vbook-profile")
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@manga_app.command("import")
+def manga_import(
+    path: Annotated[Path, typer.Argument(help="Image folder or .cbz archive.")],
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = import_manga_pages(ws, path=path, project_slug=project)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@manga_pages_app.command("list")
+def manga_pages_list(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        pages = list_manga_pages(ws, project_slug=project)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope({"pages": pages}), json_output)
+
+
+@manga_boxes_app.command("import")
+def manga_boxes_import(
+    boxes_json: Annotated[Path, typer.Argument(help="Boxes JSON file.")],
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = import_manga_boxes(ws, boxes_path=boxes_json, project_slug=project)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@manga_boxes_app.command("export")
+def manga_boxes_export(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = export_manga_boxes(ws, project_slug=project)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@manga_manifest_app.command("export")
+def manga_manifest_export(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = export_manga_manifest(ws, project_slug=project)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@eval_app.command("prepare-parallel")
+def eval_prepare_parallel(
+    raw: Annotated[Path, typer.Option("--raw", help="Chinese raw text file.")],
+    translated: Annotated[Path, typer.Option("--translated", help="Vietnamese translated EPUB.")],
+    project: Annotated[str, typer.Option("--project", help="Eval project key.")],
+    max_chapters: Annotated[int, typer.Option("--max-chapters")] = DEFAULT_LIMITS[
+        "alignment_max_chapters"
+    ],
+    max_source_chars: Annotated[int, typer.Option("--max-source-chars")] = DEFAULT_LIMITS[
+        "translation_sample_max_source_chars"
+    ],
+    max_target_chars: Annotated[int, typer.Option("--max-target-chars")] = DEFAULT_LIMITS[
+        "evaluation_max_target_chars"
+    ],
+    sample_start_ratio: Annotated[float, typer.Option("--sample-start-ratio")] = 0.0,
+    sample_count: Annotated[int, typer.Option("--sample-count")] = 1,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        result = prepare_parallel(
+            project=project,
+            raw_path=raw,
+            translated_path=translated,
+            max_chapters=max_chapters,
+            max_source_chars=max_source_chars,
+            max_target_chars=max_target_chars,
+            sample_start_ratio=sample_start_ratio,
+            sample_count=sample_count,
+        )
+    except ValueError as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@eval_app.command("learn-style")
+def eval_learn_style(
+    project: Annotated[str, typer.Option("--project", help="Eval project key.")],
+    chapters: Annotated[int, typer.Option("--chapters")] = 1,
+    provider: Annotated[str, typer.Option("--provider")] = "mock",
+    model: Annotated[str, typer.Option("--model")] = "mock-eval",
+    max_source_chars: Annotated[int, typer.Option("--max-source-chars")] = DEFAULT_LIMITS[
+        "style_learning_max_source_chars"
+    ],
+    max_target_chars: Annotated[int, typer.Option("--max-target-chars")] = DEFAULT_LIMITS[
+        "style_learning_max_target_chars"
+    ],
+    max_chapters: Annotated[int, typer.Option("--max-chapters")] = DEFAULT_LIMITS[
+        "alignment_max_chapters"
+    ],
+    sample_start_ratio: Annotated[float, typer.Option("--sample-start-ratio")] = 0.0,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    _ = (max_chapters, sample_start_ratio)
+    try:
+        result = learn_style(
+            project=project,
+            chapters=chapters,
+            provider_key=provider,
+            model=model,
+            max_source_chars=max_source_chars,
+            max_target_chars=max_target_chars,
+        )
+    except ValueError as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@eval_app.command("translate-sample")
+def eval_translate_sample(
+    project: Annotated[str, typer.Option("--project", help="Eval project key.")],
+    chapter: Annotated[int, typer.Option("--chapter")] = 1,
+    models: Annotated[str, typer.Option("--models")] = "mock-eval",
+    provider: Annotated[str, typer.Option("--provider")] = "mock",
+    max_source_chars: Annotated[int, typer.Option("--max-source-chars")] = DEFAULT_LIMITS[
+        "translation_sample_max_source_chars"
+    ],
+    max_target_chars: Annotated[int, typer.Option("--max-target-chars")] = DEFAULT_LIMITS[
+        "evaluation_max_target_chars"
+    ],
+    max_chapters: Annotated[int, typer.Option("--max-chapters")] = DEFAULT_LIMITS[
+        "alignment_max_chapters"
+    ],
+    sample_start_ratio: Annotated[float, typer.Option("--sample-start-ratio")] = 0.0,
+    enable_length_retry: Annotated[
+        bool, typer.Option("--enable-length-retry", help="Retry once if output is too long.")
+    ] = False,
+    target_length_tolerance: Annotated[float, typer.Option("--target-length-tolerance")] = 0.2,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    _ = (chapter, max_target_chars, max_chapters, sample_start_ratio)
+    try:
+        result = translate_sample(
+            project=project,
+            provider_key=provider,
+            models=[part.strip() for part in models.split(",") if part.strip()],
+            max_source_chars=max_source_chars,
+            enable_length_retry=enable_length_retry,
+            target_length_tolerance=target_length_tolerance,
+        )
+    except ValueError as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@eval_app.command("compare-translation")
+def eval_compare_translation(
+    project: Annotated[str, typer.Option("--project", help="Eval project key.")],
+    chapter: Annotated[int, typer.Option("--chapter")] = 1,
+    max_source_chars: Annotated[int, typer.Option("--max-source-chars")] = DEFAULT_LIMITS[
+        "evaluation_max_source_chars"
+    ],
+    max_target_chars: Annotated[int, typer.Option("--max-target-chars")] = DEFAULT_LIMITS[
+        "evaluation_max_target_chars"
+    ],
+    max_chapters: Annotated[int, typer.Option("--max-chapters")] = DEFAULT_LIMITS[
+        "alignment_max_chapters"
+    ],
+    sample_start_ratio: Annotated[float, typer.Option("--sample-start-ratio")] = 0.0,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    _ = (max_chapters, sample_start_ratio)
+    try:
+        result = compare_translation(
+            project=project,
+            chapter=chapter,
+            max_source_chars=max_source_chars,
+            max_target_chars=max_target_chars,
+        )
+    except ValueError as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@eval_app.command("run-full")
+def eval_run_full(
+    project: Annotated[str, typer.Option("--project", help="Eval project key.")],
+    raw: Annotated[Path, typer.Option("--raw", help="Chinese raw text file.")],
+    translated: Annotated[Path, typer.Option("--translated", help="Vietnamese translated EPUB.")],
+    provider: Annotated[str, typer.Option("--provider")] = "mock",
+    models: Annotated[str, typer.Option("--models")] = "mock-eval",
+    max_chapters: Annotated[int, typer.Option("--max-chapters")] = DEFAULT_LIMITS[
+        "alignment_max_chapters"
+    ],
+    max_source_chars: Annotated[int, typer.Option("--max-source-chars")] = DEFAULT_LIMITS[
+        "translation_sample_max_source_chars"
+    ],
+    max_target_chars: Annotated[int, typer.Option("--max-target-chars")] = DEFAULT_LIMITS[
+        "evaluation_max_target_chars"
+    ],
+    sample_start_ratio: Annotated[float, typer.Option("--sample-start-ratio")] = 0.0,
+    sample_count: Annotated[int, typer.Option("--sample-count")] = 1,
+    enable_length_retry: Annotated[
+        bool, typer.Option("--enable-length-retry", help="Retry once if output is too long.")
+    ] = False,
+    target_length_tolerance: Annotated[float, typer.Option("--target-length-tolerance")] = 0.2,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        result = run_full(
+            project=project,
+            raw_path=raw,
+            translated_path=translated,
+            provider_key=provider,
+            models=[part.strip() for part in models.split(",") if part.strip()],
+            max_chapters=max_chapters,
+            max_source_chars=max_source_chars,
+            max_target_chars=max_target_chars,
+            sample_start_ratio=sample_start_ratio,
+            sample_count=sample_count,
+            enable_length_retry=enable_length_retry,
+            target_length_tolerance=target_length_tolerance,
+        )
+    except ValueError as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
 
 
 if __name__ == "__main__":

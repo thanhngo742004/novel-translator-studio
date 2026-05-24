@@ -78,3 +78,171 @@
   - No style learning, glossary extraction, LLM calls, vector DB, plugin export, manga, or GUI were implemented.
 - Next recommended phase:
   - MVP3 compact plugin export foundation: compile active memory items into deterministic read-only bundle files, write export metadata, and keep plugins non-learning.
+
+## 2026-05-24T20:30:00+07:00
+
+- Completed: MVP3 compact plugin export foundation only.
+- Implemented:
+  - `export_bundles` migration.
+  - Deterministic export compiler for active memory items only.
+  - Project-scoped filtering via `scope_json`.
+  - Exclusion of `pending`, `rejected`, `deprecated`, and `draft` memory.
+  - Grouped compact bundle fields:
+    - `force_terms`
+    - `force_names`
+    - `pronoun_rules`
+    - `style_rules`
+    - `correction_rules`
+    - `warnings`
+  - Stable JSON serialization, stable ordering, deterministic checksum, and deterministic `exported_at` based on source data.
+  - Export files under `artifacts/exports/<bundle_id>/`:
+    - `bundle.json`
+    - `manifest.json`
+    - `checksums.txt`
+    - `compat/StyleSummary.txt`
+    - `compat/Pronouns.txt`
+    - `compat/LuatNhan.txt`
+  - `export_bundles` DB row for each export run.
+  - CLI:
+    - `nts export bundle --project <project_slug>`
+    - `nts export vbook-profile --project <project_slug>`
+- Commands run:
+  - `python -m pytest`
+  - `python -m nts_cli.main export --help`
+  - `python -m nts_cli.main export bundle --help`
+  - `python -m nts_cli.main export vbook-profile --help`
+- Test result:
+  - `python -m pytest` -> 27 passed.
+- Known limitations:
+  - Export is a compact bundle compiler only; no VBook runtime or integration is implemented.
+  - Compat text files are minimal deterministic projections.
+  - Only active memory exports by default; no review UI or auto-approval.
+  - No real API calls, plugin runtime, manga, GUI, OpenClaw packaging, vector DB, graph DB, cloud, or multi-user work.
+- Next recommended phase:
+  - MVP4A manga data foundation: image/CBZ import, page artifact registry, manual box JSON import/export, box versions, and manifest export without OCR/CV/inpainting/typesetting.
+
+## 2026-05-24T20:45:00+07:00
+
+- Completed: MVP4A manga data foundation and manifest workflow only.
+- Implemented:
+  - `manga_pages`, `manga_page_artifacts`, `manga_boxes`, `manga_box_versions`, `manga_ocr_results`, `manga_box_translations`, `manga_exports`, and `manga_visual_evidence` migration.
+  - Folder image import for `.jpg`, `.jpeg`, `.png`, and `.webp`.
+  - CBZ import using Python `zipfile`.
+  - Original image preservation under `artifacts/manga/<project>/pages/`.
+  - SHA-256 checksums for imported pages.
+  - Page artifact registry rows for original images.
+  - Manual boxes JSON import with stable `box_id` stored as `stable_key`.
+  - Box versioning: re-importing the same page/box creates a new `manga_box_versions` row and updates `current_version_id`.
+  - Boxes JSON export.
+  - Manga manifest export with page IDs, image paths, current boxes, and null OCR/translation fields.
+  - `manga_exports` row for manifest exports.
+- CLI:
+  - `nts manga import <path> --project <project_slug>`
+  - `nts manga pages list --project <project_slug>`
+  - `nts manga boxes import <boxes.json> --project <project_slug>`
+  - `nts manga boxes export --project <project_slug>`
+  - `nts manga manifest export --project <project_slug>`
+- Commands run:
+  - `python -m pytest`
+  - `python -m nts_cli.main manga --help`
+  - `python -m nts_cli.main manga import --help`
+  - `python -m nts_cli.main manga boxes --help`
+  - `python -m nts_cli.main manga manifest export --help`
+- Test result:
+  - `python -m pytest` -> 33 passed.
+- Known limitations:
+  - Width/height are stored as null because no image decoding dependency was added.
+  - Folder import is non-recursive; CBZ import reads supported files anywhere inside the archive.
+  - No OCR, detection, cleanup, inpainting, typesetting, GUI canvas, real manga translation, or API calls were implemented.
+- Next recommended phase:
+  - MVP4B manual OCR import/edit and translation-by-box-ID validator, still without heavy OCR/CV dependencies unless explicitly approved.
+
+## 2026-05-24T20:45:37+07:00
+
+- Completed: MVP4.5 limited real API style-learning and translation evaluation harness only.
+- Implemented:
+  - `nts eval prepare-parallel` for UTF-8 raw text chapter extraction, EPUB spine extraction, chapter-like EPUB splitting, first-chapter alignment, sample limiting, and artifact output.
+  - `nts eval learn-style` for limited temporary style profile and deterministic glossary/name/pronoun candidate artifacts.
+  - `nts eval translate-sample` for explicit provider/model calls only, with source excerpt limits and masked API-key reporting.
+  - Translation prompts include compact temporary style-profile and candidate guidance from the eval artifacts.
+  - `nts eval compare-translation` for deterministic heuristic score reports using the MVP4.5 score schema.
+  - `nts eval run-full` to run prepare, style learning, sample translation, and comparison in one constrained command.
+  - OpenAI-compatible chat/completions provider loading for `ckey_openai_compatible`, reading keys only from `CKEY_API_KEY` env or `.env.local`.
+  - ASCII-safe JSON envelope output for Windows consoles.
+- Commands run:
+  - `python -m pytest`
+  - `python -m nts_cli.main --help`
+  - `python -m nts_cli.main eval --help`
+  - `python -m nts_cli.main eval run-full --project han-jue-mock --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider mock --models mock-gpt-55,mock-gpt-54-mini --max-chapters 3 --max-source-chars 1500 --max-target-chars 2500 --json`
+  - `python -m nts_cli.main eval run-full --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --models gpt-5.5,gpt-5.4-mini --max-chapters 3 --max-source-chars 1500 --max-target-chars 2500 --json`
+- Test result:
+  - `python -m pytest` -> 38 passed.
+- Real limited eval result:
+  - Output folder: `artifacts/evaluations/han-jue_eval_1779630448069/`.
+  - Selected sample: 1495 source chars, 2481 target chars.
+  - `gpt-5.5`: total 57/100, fail.
+  - `gpt-5.4-mini`: total 57/100, fail; selected as best by deterministic tie/order.
+  - Both outputs failed threshold mainly due length/omission-addition and style-match scoring; pass/fail was not faked.
+- Known limitations:
+  - Evaluation scoring is deterministic and heuristic, not an LLM judge.
+  - Alignment is first-chapter/index based after EPUB chapter-like splitting; it does not perform semantic alignment.
+  - Style/glossary/name/pronoun extraction is temporary and not written to canonical LAMM-T memory.
+  - No unit tests make real API calls; tests use mock provider only.
+  - No GUI, manga OCR/clean/typeset, plugin runtime, fine-tuning, cloud sync, vector DB, or paid API calls inside tests.
+- Next recommended phase:
+  - MVP4.6 evaluation quality pass: add stricter prompt templates, optional human-review rubric, saved prompt/version metadata, and better local alignment validation before expanding API sample size.
+
+## 2026-05-24T21:31:53+07:00
+
+- Completed: MVP4.6 iterative prompt optimization harness only.
+- Implemented:
+  - Multi-sample eval support for `nts eval run-full` with `--sample-count`, `--enable-length-retry`, and `--target-length-tolerance`.
+  - `selected_samples.json` with per-sample source/target offsets, char counts, paragraph counts, target/source ratio, target length min/max, and selection reasons.
+  - Stricter translation prompt guidance inside the eval harness:
+    - target output length range,
+    - target paragraph guidance,
+    - concise Vietnamese webnovel style,
+    - no expansion, explanation, embellishment, translator notes, or excess paraphrase,
+    - compact system panel/bracket formatting,
+    - output-only Vietnamese translation.
+  - Fixed temporary glossary reinforcement for core Han Jue terms:
+    - `韩绝 -> Hàn Tuyệt`
+    - `玉清宗 -> Ngọc Thanh Tông`
+    - `炼气境 -> Luyện Khí cảnh`
+    - `筑基 -> Trúc Cơ`
+    - `灵根 -> linh căn`
+    - `修为 -> tu vi`
+    - `先天气运 -> tiên thiên khí vận`
+  - One-shot length retry when output/reference ratio exceeds the configured limit.
+  - Translation output folder with initial, retry, and final outputs plus translation metadata.
+  - Enhanced evaluation reports with per-sample/per-model scores, output/reference ratios, paragraph comparisons, retry flags, length penalty reasons, terminology mismatches, and final pass/fail reasons.
+  - `prompt_iteration_log.md` generation for real eval runs.
+- Commands run:
+  - `python -m pytest`
+  - `python -m nts_cli.main eval run-full --help`
+  - `python -m nts_cli.main eval run-full --project han-jue-mock46 --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider mock --models mock-gpt-55,mock-gpt-54-mini --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --enable-length-retry --json`
+  - `python -m nts_cli.main eval run-full --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --models gpt-5.5,gpt-5.4-mini --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --enable-length-retry --json`
+- Test result:
+  - `python -m pytest` -> 39 passed.
+- Real eval result after three prompt iterations:
+  - Final output folder: `artifacts/evaluations/han-jue_eval_1779632603731/`.
+  - Best model: `gpt-5.5`.
+  - `gpt-5.5`: average 71.67/100, fail.
+    - sample 1: 76/100, output/reference ratio 1.535.
+    - sample 2: 78/100, output/reference ratio 1.265.
+    - sample 3: 61/100, output/reference ratio 1.810.
+  - `gpt-5.4-mini`: average 64.33/100, fail.
+    - sample 1: 67/100, output/reference ratio 1.736.
+    - sample 2: 63/100, output/reference ratio 1.742.
+    - sample 3: 63/100, output/reference ratio 1.711.
+  - Length retry triggered for all model/sample outputs.
+  - No severe hallucination, wrong main character name, or major skipped passage was detected by the heuristic evaluator.
+  - Terminology mismatches were not detected in the final run.
+- Known limitations:
+  - MVP4.6 did not meet the real quality acceptance gate: no model passed all three samples, and output/reference ratios remained above the 0.85-1.25 target.
+  - The provider/model behavior remained verbose even with stricter prompt text, reduced max-token hints, and one-shot concise rewrite retries.
+  - Alignment is still coarse chapter/sample alignment rather than true paragraph-pair semantic alignment, so length gates may partly reflect imperfect aligned spans.
+  - The evaluator is deterministic and heuristic; it is useful for regression gates but not a substitute for human review.
+  - No unit tests make real API calls; tests continue to use mock providers only.
+- Next recommended phase:
+  - Improve alignment and compression before expanding eval scope: paragraph-level source/target pairing, explicit compression pass with hard character-budget verification, provider-specific token limit support if available, and a human-review sample export for calibrating the deterministic score thresholds.

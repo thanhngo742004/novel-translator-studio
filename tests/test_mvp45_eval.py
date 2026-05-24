@@ -1,0 +1,430 @@
+from __future__ import annotations
+
+import json
+import zipfile
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from nts_cli.main import app
+from nts_core.eval_harness import (
+    EvalProvider,
+    FIXED_GLOSSARY,
+    limited_style_prompt,
+    load_eval_provider,
+    mask_api_key,
+    normalize_provider_type,
+    translation_system_prompt,
+    validate_eval_provider,
+)
+
+
+runner = CliRunner()
+
+
+def parse_json(output: str) -> dict:
+    return json.loads(output)
+
+
+def write_eval_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    raw = tmp_path / "raw.txt"
+    raw.write_text(
+        "\n\n".join(
+            [
+                "第1章 初遇",
+                "韩觉站在窗前，看着雨水落在旧街上。他想起昨夜的梦，也想起那个没有说完的名字。",
+                "门外传来轻轻的脚步声，他收起信纸，低声说道：别让他们知道。",
+                "第2章 回声",
+                "城南的钟声响起时，韩觉已经离开客栈。他没有回头，只把伞留在门边。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    epub = tmp_path / "viettranslated.epub"
+    with zipfile.ZipFile(epub, "w") as archive:
+        archive.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>""",
+        )
+        archive.writestr(
+            "OEBPS/content.opf",
+            """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <manifest>
+    <item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c1"/>
+    <itemref idref="c2"/>
+  </spine>
+</package>""",
+        )
+        archive.writestr(
+            "OEBPS/ch1.xhtml",
+            """<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<h1>Chương 1</h1>
+<p>Hàn Giác đứng bên cửa sổ, nhìn mưa rơi xuống con phố cũ. Hắn nhớ đến giấc mơ đêm qua, cũng nhớ cái tên còn chưa kịp nói hết.</p>
+<p>Ngoài cửa vang lên tiếng bước chân rất khẽ, hắn gấp lá thư lại và thấp giọng nói: đừng để bọn họ biết.</p>
+</body></html>""",
+        )
+        archive.writestr(
+            "OEBPS/ch2.xhtml",
+            """<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<h1>Chương 2</h1>
+<p>Khi tiếng chuông phía nam thành vang lên, Hàn Giác đã rời khỏi quán trọ. Hắn không ngoảnh lại, chỉ để chiếc ô bên cửa.</p>
+</body></html>""",
+        )
+    return raw, epub
+
+
+def test_prepare_parallel_extracts_aligns_limits_and_writes_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    raw, epub = write_eval_inputs(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "prepare-parallel",
+            "--raw",
+            str(raw),
+            "--translated",
+            str(epub),
+            "--project",
+            "han-jue-test",
+            "--max-chapters",
+            "2",
+            "--max-source-chars",
+            "45",
+            "--max-target-chars",
+            "90",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    run_dir = Path(data["run_dir"])
+    assert data["alignment"]["aligned_chapters"] == 2
+    sample = data["selected_sample"]
+    assert sample["source_char_count"] <= 45
+    assert sample["target_char_count"] <= 90
+    assert "第1章" not in sample["source_text"]
+    assert {
+        "chapter_id",
+        "source_start_offset",
+        "source_end_offset",
+        "source_char_count",
+        "target_start_offset",
+        "target_end_offset",
+        "target_char_count",
+        "selection_reason",
+        "limits_used",
+    }.issubset(sample)
+    assert (run_dir / "extracted_raw_chapters.json").exists()
+    assert (run_dir / "extracted_translated_chapters.json").exists()
+    assert (run_dir / "alignment_report.json").exists()
+    assert (run_dir / "selected_sample.json").exists()
+    assert (run_dir / "selected_samples.json").exists()
+
+
+def test_learn_style_translate_compare_mock_outputs_and_score_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    raw, epub = write_eval_inputs(tmp_path)
+    prepare = runner.invoke(
+        app,
+        [
+            "eval",
+            "prepare-parallel",
+            "--raw",
+            str(raw),
+            "--translated",
+            str(epub),
+            "--project",
+            "han-jue-test",
+            "--max-chapters",
+            "2",
+            "--max-source-chars",
+            "80",
+            "--max-target-chars",
+            "140",
+            "--json",
+        ],
+    )
+    assert prepare.exit_code == 0, prepare.output
+    run_dir = Path(parse_json(prepare.output)["data"]["run_dir"])
+
+    style = runner.invoke(
+        app,
+        [
+            "eval",
+            "learn-style",
+            "--project",
+            "han-jue-test",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-style",
+            "--chapters",
+            "1",
+            "--max-source-chars",
+            "35",
+            "--max-target-chars",
+            "60",
+            "--json",
+        ],
+    )
+    assert style.exit_code == 0, style.output
+    style_data = parse_json(style.output)["data"]
+    assert style_data["prompt_limits"]["source_chars_sent"] <= 35
+    assert style_data["prompt_limits"]["target_chars_sent"] <= 60
+    glossary = json.loads((run_dir / "glossary_candidates.json").read_text(encoding="utf-8"))
+    assert {"glossary_candidates", "name_candidates", "pronoun_candidates"}.issubset(glossary)
+    prompt = translation_system_prompt(run_dir)
+    assert "Temporary style profile" in prompt
+    assert "Candidate Vietnamese renderings" in prompt
+    assert "Return only the Vietnamese translation" in prompt
+
+    translated = runner.invoke(
+        app,
+        [
+            "eval",
+            "translate-sample",
+            "--project",
+            "han-jue-test",
+            "--provider",
+            "mock",
+            "--models",
+            "mock-a,mock-b",
+            "--max-source-chars",
+            "40",
+            "--json",
+        ],
+    )
+    assert translated.exit_code == 0, translated.output
+    outputs = parse_json(translated.output)["data"]["outputs"]
+    assert outputs["mock-a"]["source_chars_sent"] <= 40
+    assert outputs["mock-b"]["source_chars_sent"] <= 40
+    assert (run_dir / "translation_mock-a.txt").exists()
+    assert (run_dir / "translation_mock-b.txt").exists()
+
+    compared = runner.invoke(
+        app,
+        [
+            "eval",
+            "compare-translation",
+            "--project",
+            "han-jue-test",
+            "--chapter",
+            "1",
+            "--max-source-chars",
+            "40",
+            "--max-target-chars",
+            "80",
+            "--json",
+        ],
+    )
+    assert compared.exit_code == 0, compared.output
+    report = parse_json(compared.output)["data"]["report"]
+    expected_score_keys = {
+        "meaning_accuracy",
+        "omission_addition",
+        "terminology_consistency",
+        "pronoun_name_consistency",
+        "vietnamese_fluency",
+        "style_match",
+        "formatting_preservation",
+        "total_score",
+        "pass",
+        "gates",
+        "notes",
+    }
+    assert expected_score_keys.issubset(report["models"]["mock-a"])
+    assert (run_dir / "evaluation_report.json").exists()
+    assert (run_dir / "evaluation_report.md").exists()
+    assert (run_dir / "model_comparison.md").exists()
+
+
+def test_run_full_mock_creates_required_eval_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    raw, epub = write_eval_inputs(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "run-full",
+            "--project",
+            "han-jue-test",
+            "--raw",
+            str(raw),
+            "--translated",
+            str(epub),
+            "--provider",
+            "mock",
+            "--models",
+            "mock-a,mock-b",
+            "--max-chapters",
+            "2",
+            "--max-source-chars",
+            "70",
+            "--max-target-chars",
+            "120",
+            "--sample-count",
+            "2",
+            "--enable-length-retry",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_dir = Path(parse_json(result.output)["data"]["run_dir"])
+    for filename in [
+        "extracted_raw_chapters.json",
+        "extracted_translated_chapters.json",
+        "alignment_report.json",
+        "selected_sample.json",
+        "selected_samples.json",
+        "style_profile_test.json",
+        "glossary_candidates.json",
+        "evaluation_report.json",
+        "evaluation_report.md",
+        "model_comparison.md",
+        "prompt_iteration_log.md",
+    ]:
+        assert (run_dir / filename).exists(), filename
+    samples = json.loads((run_dir / "selected_samples.json").read_text(encoding="utf-8"))["samples"]
+    assert len(samples) == 2
+    assert samples[0]["target_length_min"] == int(samples[0]["target_char_count"] * 0.85)
+    assert samples[0]["target_length_max"] == int(samples[0]["target_char_count"] * 1.2)
+    assert {sample["chapter_id"] for sample in samples} == {1, 2}
+    assert (run_dir / "translation_outputs" / "translation_metadata.json").exists()
+    report = json.loads((run_dir / "evaluation_report.json").read_text(encoding="utf-8"))
+    assert report["sample_count"] == 2
+    assert "samples" in report["models"]["mock-a"]
+
+
+def test_provider_config_validation_and_api_key_masking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "providers.yaml").write_text(
+        """
+providers:
+  ckey_openai_compatible:
+    type: OpenAI-compatible chat/completions
+    base_url: https://ckey.vn/v1
+    api_key_env: CKEY_API_KEY
+    route: chat/completions
+    models:
+      - gpt-5.5
+      - gpt-5.4-mini
+""",
+        encoding="utf-8",
+    )
+
+    provider = load_eval_provider("ckey_openai_compatible")
+    assert provider.type == "openai_chat_compatible"
+    assert provider.models == ("gpt-5.5", "gpt-5.4-mini")
+    assert normalize_provider_type("OpenAI-compatible chat/completions") == "openai_chat_compatible"
+    validate_eval_provider(provider)
+    with pytest.raises(ValueError, match="https"):
+        validate_eval_provider(
+            EvalProvider(
+                key="bad",
+                type="openai_chat_compatible",
+                base_url="http://example.test/v1",
+                api_key_env="CKEY_API_KEY",
+            )
+        )
+
+    raw_key = "ckey_test_secret_1234567890"
+    masked = mask_api_key(raw_key)
+    assert raw_key not in masked
+    assert masked.startswith("ckey")
+    assert masked.endswith("7890")
+    assert mask_api_key(None) == "<missing>"
+
+
+def test_limited_style_prompt_respects_configured_excerpt_limits() -> None:
+    prompt, limits = limited_style_prompt(
+        [{"text": "源" * 200}],
+        [{"text": "đích " * 200}],
+        max_source_chars=25,
+        max_target_chars=55,
+    )
+
+    assert limits == {"source_chars_sent": 25, "target_chars_sent": 55}
+    assert "源" * 26 not in prompt
+    assert prompt.count("SOURCE EXCERPT") == 1
+    assert prompt.count("TARGET EXCERPT") == 1
+
+
+def test_translation_prompt_includes_length_and_fixed_glossary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    raw, epub = write_eval_inputs(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "prepare-parallel",
+            "--raw",
+            str(raw),
+            "--translated",
+            str(epub),
+            "--project",
+            "han-jue-test",
+            "--max-chapters",
+            "2",
+            "--sample-count",
+            "2",
+            "--max-source-chars",
+            "80",
+            "--max-target-chars",
+            "140",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    run_dir = Path(parse_json(result.output)["data"]["run_dir"])
+    style = runner.invoke(
+        app,
+        [
+            "eval",
+            "learn-style",
+            "--project",
+            "han-jue-test",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-style",
+            "--json",
+        ],
+    )
+    assert style.exit_code == 0, style.output
+    sample = json.loads((run_dir / "selected_samples.json").read_text(encoding="utf-8"))[
+        "samples"
+    ][0]
+    prompt = translation_system_prompt(run_dir, sample=sample, prompt_iteration=2)
+
+    assert f"{sample['target_length_min']}-{sample['target_length_max']}" in prompt
+    assert "Do not expand, explain, embellish" in prompt
+    assert "Keep system panel/bracket formatting compact" in prompt
+    assert FIXED_GLOSSARY["韩绝"] in prompt

@@ -20,6 +20,7 @@ node_modules/
 
 # Local workspaces / data
 workspace/
+artifacts/
 data/local/
 data/private/
 *.sqlite
