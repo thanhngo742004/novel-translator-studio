@@ -49,8 +49,16 @@ from nts_core.memory import (
 )
 from nts_core.model_test import run_mock_model_test
 from nts_core.projects import create_project, get_project_by_slug, list_projects
+from nts_core.production_translation import (
+    DEFAULT_BATCH_MAX_CHAPTERS,
+    DEFAULT_CHUNK_OVERLAP_PARAGRAPHS,
+    DEFAULT_CHUNK_SIZE_CHARS,
+    DEFAULT_MAX_SOURCE_CHARS_PER_CHAPTER,
+    translate_batch_stable,
+    translate_chapter_stable,
+)
+from nts_core.stable_prompts import StablePromptBlocker
 from nts_core.text_import import get_chapter, import_text_file, list_chapters, list_segments
-from nts_core.translation import translate_chapter_mock
 from nts_shared.envelopes import error_envelope, success_envelope
 from nts_storage.workspace import WorkspaceError, discover_workspace, init_workspace
 
@@ -441,12 +449,143 @@ def memory_bundle(
 def translate_text(
     chapter: Annotated[str, typer.Option("--chapter", help="Chapter id.")],
     provider: Annotated[str, typer.Option("--provider")] = "mock",
+    model: Annotated[Optional[str], typer.Option("--model", help="Provider model name.")] = None,
     workspace: WorkspaceOption = None,
+    use_stable_prompt: Annotated[
+        bool,
+        typer.Option(
+            "--use-stable-prompt",
+            help="Use a human-approved stable prompt for production translation.",
+        ),
+    ] = False,
+    prompt_id: Annotated[Optional[str], typer.Option("--prompt-id")] = None,
+    max_source_chars: Annotated[
+        Optional[int],
+        typer.Option("--max-source-chars", help="Limit source chars for smoke tests."),
+    ] = None,
+    enable_paragraph_alignment: Annotated[
+        bool,
+        typer.Option("--enable-paragraph-alignment/--disable-paragraph-alignment"),
+    ] = True,
+    enable_compression_pass: Annotated[
+        bool,
+        typer.Option("--enable-compression-pass/--disable-compression-pass"),
+    ] = True,
+    merge_tiny_paragraphs: Annotated[
+        bool,
+        typer.Option("--merge-tiny-paragraphs/--no-merge-tiny-paragraphs"),
+    ] = True,
+    evaluate_after: Annotated[bool, typer.Option("--evaluate-after")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output_dir: Annotated[Optional[Path], typer.Option("--output-dir")] = None,
+    force: Annotated[bool, typer.Option("--force")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
         ws = discover_workspace(_workspace_arg(workspace))
-        result = translate_chapter_mock(ws, chapter_id=chapter, provider_key=provider)
+        result = translate_chapter_stable(
+            ws,
+            chapter_id=chapter,
+            provider_key=provider,
+            model=model or ("mock-eval" if provider == "mock" else ""),
+            use_stable_prompt=use_stable_prompt,
+            prompt_id=prompt_id,
+            max_source_chars=max_source_chars,
+            enable_paragraph_alignment=enable_paragraph_alignment,
+            enable_compression_pass=enable_compression_pass,
+            merge_tiny_paragraphs=merge_tiny_paragraphs,
+            evaluate_after=evaluate_after,
+            dry_run=dry_run,
+            output_dir=output_dir,
+            force=force,
+        )
+    except StablePromptBlocker as exc:
+        _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@translate_app.command("batch")
+def translate_batch(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    provider: Annotated[str, typer.Option("--provider")],
+    model: Annotated[str, typer.Option("--model")],
+    workspace: WorkspaceOption = None,
+    use_stable_prompt: Annotated[
+        bool,
+        typer.Option(
+            "--use-stable-prompt",
+            help="Use a human-approved stable prompt for production translation.",
+        ),
+    ] = False,
+    prompt_id: Annotated[Optional[str], typer.Option("--prompt-id")] = None,
+    chapters: Annotated[Optional[str], typer.Option("--chapters", help="Chapter numbers, e.g. 1-3.")] = None,
+    chapter_ids: Annotated[
+        Optional[str],
+        typer.Option("--chapter-ids", help="Comma-separated chapter ids."),
+    ] = None,
+    max_chapters: Annotated[int, typer.Option("--max-chapters")] = DEFAULT_BATCH_MAX_CHAPTERS,
+    max_source_chars_per_chapter: Annotated[
+        int,
+        typer.Option("--max-source-chars-per-chapter"),
+    ] = DEFAULT_MAX_SOURCE_CHARS_PER_CHAPTER,
+    chunk_size_chars: Annotated[int, typer.Option("--chunk-size-chars")] = DEFAULT_CHUNK_SIZE_CHARS,
+    chunk_overlap_paragraphs: Annotated[
+        int,
+        typer.Option("--chunk-overlap-paragraphs"),
+    ] = DEFAULT_CHUNK_OVERLAP_PARAGRAPHS,
+    resume: Annotated[bool, typer.Option("--resume")] = False,
+    skip_existing: Annotated[bool, typer.Option("--skip-existing/--no-skip-existing")] = True,
+    force: Annotated[bool, typer.Option("--force")] = False,
+    enable_paragraph_alignment: Annotated[
+        bool,
+        typer.Option("--enable-paragraph-alignment/--disable-paragraph-alignment"),
+    ] = True,
+    enable_compression_pass: Annotated[
+        bool,
+        typer.Option("--enable-compression-pass/--disable-compression-pass"),
+    ] = True,
+    merge_tiny_paragraphs: Annotated[
+        bool,
+        typer.Option("--merge-tiny-paragraphs/--no-merge-tiny-paragraphs"),
+    ] = True,
+    evaluate_after: Annotated[bool, typer.Option("--evaluate-after")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output_dir: Annotated[Optional[Path], typer.Option("--output-dir")] = None,
+    export_combined: Annotated[bool, typer.Option("--export-combined")] = False,
+    stop_on_error: Annotated[bool, typer.Option("--stop-on-error")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = translate_batch_stable(
+            ws,
+            project_slug=project,
+            provider_key=provider,
+            model=model,
+            use_stable_prompt=use_stable_prompt,
+            prompt_id=prompt_id,
+            chapters=chapters,
+            chapter_ids=chapter_ids,
+            max_chapters=max_chapters,
+            max_source_chars_per_chapter=max_source_chars_per_chapter,
+            chunk_size_chars=chunk_size_chars,
+            chunk_overlap_paragraphs=chunk_overlap_paragraphs,
+            resume=resume,
+            skip_existing=skip_existing,
+            force=force,
+            enable_paragraph_alignment=enable_paragraph_alignment,
+            enable_compression_pass=enable_compression_pass,
+            merge_tiny_paragraphs=merge_tiny_paragraphs,
+            evaluate_after=evaluate_after,
+            dry_run=dry_run,
+            output_dir=output_dir,
+            export_combined=export_combined,
+            stop_on_error=stop_on_error,
+        )
+    except StablePromptBlocker as exc:
+        _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)

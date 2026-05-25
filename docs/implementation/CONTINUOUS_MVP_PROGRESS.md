@@ -680,3 +680,39 @@
   - No production translation workflow is enabled.
 - Next recommended phase:
   - Human-review the new selected-output package and approve or reject it before any production translation pilot.
+
+## 2026-05-25T19:53:07+07:00
+
+- Completed: MVP4.9 stable-prompt production translation and MVP5A controlled batch chapter translation only.
+- Implemented:
+  - Approved stable prompt registry that discovers `stable_prompt.md`, `stable_prompt_metadata.json`, and `stable_prompt_approval.json` under evaluation artifacts or future `config/prompts/`.
+  - Clean production blocker when a stable prompt is missing, unapproved, rejected, or metadata is missing.
+  - Production `nts translate text --use-stable-prompt` path with approved prompt loading, provider routing, memory bundle/glossary injection, prompt artifact capture, deterministic validation, final output selector usage, translation row insert, and task/model run logging.
+  - Controlled `nts translate batch --use-stable-prompt` path with default chapter limits, chapter selection, chunking on paragraph boundaries, skip-existing, force, dry-run estimates, resumable artifact layout, per-chapter output, quality reports, combined export, and batch task logging.
+  - Production source limiting now prefers paragraph/sentence boundaries instead of cutting mid-sentence.
+  - Production provider output has a bounded structured-output retry if paragraph/unit ids are missing or reordered.
+  - Batch `actual_api_calls` now counts executed chunks instead of using the estimate.
+- Commands run:
+  - `python -m pytest tests/test_mvp49_mvp5a.py -q`
+  - `python -m pytest`
+  - `python -m nts_cli.main translate text --workspace workspace_mvp49_smoke_20260525192238 --chapter <chapter_id> --provider ckey_openai_compatible --model gpt-5.4-mini --use-stable-prompt --max-source-chars 1500 --enable-paragraph-alignment --enable-compression-pass --merge-tiny-paragraphs --force --json`
+  - `python -m nts_cli.main translate batch --workspace workspace_mvp49_smoke_20260525192238 --project han-jue --provider ckey_openai_compatible --model gpt-5.4-mini --use-stable-prompt --chapters 1-2 --max-chapters 2 --max-source-chars-per-chapter 1500 --dry-run --json`
+  - `python -m nts_cli.main translate batch --workspace workspace_mvp49_smoke_20260525192238 --project han-jue --provider ckey_openai_compatible --model gpt-5.4-mini --use-stable-prompt --chapters 1-2 --max-chapters 2 --max-source-chars-per-chapter 1500 --enable-paragraph-alignment --enable-compression-pass --merge-tiny-paragraphs --json`
+- Test result:
+  - `python -m pytest tests/test_mvp49_mvp5a.py -q` -> 9 passed.
+  - `python -m pytest` -> 102 passed.
+- Real smoke result:
+  - Approved stable prompt path used: `artifacts/evaluations/han-jue_stable_1779701585384/stable_prompt.md`
+  - Approval path used: `artifacts/evaluations/han-jue_stable_1779701585384/stable_prompt_approval.json`
+  - Production text output folder: `workspace_mvp49_smoke_20260525192238/artifacts/translations/han-jue_translation_1779712114692`
+  - Batch dry-run folder: `workspace_mvp49_smoke_20260525192238/artifacts/batches/han-jue_batch_1779712429553`
+  - Batch real output folder: `workspace_mvp49_smoke_20260525192238/artifacts/batches/han-jue_batch_1779713322759`
+  - Batch real status: success. Chapter 1 skipped due existing current translation from the text smoke; chapter 2 translated successfully.
+  - Final post-fix batch command folder: `workspace_mvp49_smoke_20260525192238/artifacts/batches/han-jue_batch_1779713754409`; both requested chapters skipped as existing current translations with `actual_api_calls = 0`.
+- Known limitations:
+  - Production no-reference quality checks use conservative source-derived budgets and warnings; they do not replace reference-based evaluation.
+  - Batch resume is minimal and artifact-based; richer retry attempt history can be added later.
+  - Batch context between chunks is intentionally minimal in MVP5A.
+  - Production translation still requires human-approved stable prompt artifacts and refuses unapproved prompts.
+- Next recommended phase:
+  - MVP5B: add operator review for production outputs, richer chapter/chunk retry metadata, optional human reference evaluation when available, and safer context carry-over between chunks.

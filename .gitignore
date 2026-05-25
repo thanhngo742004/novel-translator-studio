@@ -20,6 +20,7 @@ node_modules/
 
 # Local workspaces / data
 workspace/
+workspace_mvp*_smoke_*/
 artifacts/
 data/local/
 data/private/
