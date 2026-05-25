@@ -31,6 +31,26 @@ from nts_core.eval_harness import (
     validate_stable_prompt,
 )
 from nts_core.export_compiler import compile_export_bundle
+from nts_core.learning_loop import (
+    DEFAULT_GLOBAL_CYCLES,
+    DEFAULT_ITERATIONS,
+    DEFAULT_LEARNING_MAX_SOURCE_CHARS,
+    DEFAULT_LEARNING_MAX_TARGET_CHARS,
+    DEFAULT_REPAIR_ITERATIONS,
+    apply_test_memory,
+    approve_learning_memory,
+    ablate_learning_candidates,
+    extract_learning_memory,
+    learning_loop,
+    learning_job_status,
+    list_learning_jobs,
+    memory_review,
+    prepare_learning_dataset,
+    reject_learning_memory,
+    resume_learning_job,
+    run_resumable_learning_loop,
+    run_learning_evaluation,
+)
 from nts_core.manga import (
     export_manga_boxes,
     export_manga_manifest,
@@ -627,6 +647,299 @@ def learn_correction(
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@learn_app.command("prepare-parallel")
+def learn_prepare_parallel(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    raw: Annotated[Path, typer.Option("--raw", help="Chinese raw text file.")],
+    translated: Annotated[Path, typer.Option("--translated", help="Human translated EPUB.")],
+    workspace: WorkspaceOption = None,
+    chapters: Annotated[str, typer.Option("--chapters")] = "1-3",
+    max_source_chars: Annotated[int, typer.Option("--max-source-chars")] = DEFAULT_LEARNING_MAX_SOURCE_CHARS,
+    max_target_chars: Annotated[int, typer.Option("--max-target-chars")] = DEFAULT_LEARNING_MAX_TARGET_CHARS,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = prepare_learning_dataset(
+            ws,
+            project_slug=project,
+            raw_path=raw,
+            translated_path=translated,
+            chapters=chapters,
+            max_source_chars=max_source_chars,
+            max_target_chars=max_target_chars,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@learn_app.command("eval-production")
+def learn_eval_production(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    chapters: Annotated[str, typer.Option("--chapters")] = "1-3",
+    provider: Annotated[str, typer.Option("--provider")] = "mock",
+    model: Annotated[str, typer.Option("--model")] = "mock-eval",
+    workspace: WorkspaceOption = None,
+    use_stable_prompt: Annotated[bool, typer.Option("--use-stable-prompt")] = False,
+    run: Annotated[Optional[str], typer.Option("--run", help="Learning run id or path.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = run_learning_evaluation(
+            ws,
+            project_slug=project,
+            chapters=chapters,
+            provider_key=provider,
+            model=model,
+            use_stable_prompt=use_stable_prompt,
+            run=run,
+        )
+    except StablePromptBlocker as exc:
+        _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@learn_app.command("extract-memory")
+def learn_extract_memory(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    from_run: Annotated[str, typer.Option("--from-run", help="Learning run id or path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = extract_learning_memory(ws, project_slug=project, from_run=from_run)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("memory-review")
+def learn_memory_review(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Learning run id or path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = memory_review(ws, project_slug=project, run=run)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("apply-test-memory")
+def learn_apply_test_memory(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Learning run id or path.")],
+    workspace: WorkspaceOption = None,
+    mode: Annotated[str, typer.Option("--mode")] = "test-only",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = apply_test_memory(ws, project_slug=project, run=run, mode=mode)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("loop")
+def learn_loop_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    raw: Annotated[Path, typer.Option("--raw", help="Chinese raw text file.")],
+    translated: Annotated[Path, typer.Option("--translated", help="Human translated EPUB.")],
+    provider: Annotated[str, typer.Option("--provider")] = "mock",
+    model: Annotated[str, typer.Option("--model")] = "mock-eval",
+    workspace: WorkspaceOption = None,
+    fallback_model: Annotated[Optional[str], typer.Option("--fallback-model")] = None,
+    chapters: Annotated[str, typer.Option("--chapters")] = "1-3",
+    global_cycles: Annotated[int, typer.Option("--global-cycles")] = DEFAULT_GLOBAL_CYCLES,
+    iterations: Annotated[int, typer.Option("--iterations")] = DEFAULT_ITERATIONS,
+    repair_iterations: Annotated[int, typer.Option("--repair-iterations")] = DEFAULT_REPAIR_ITERATIONS,
+    min_improvement: Annotated[float, typer.Option("--min-improvement")] = 1.0,
+    target_improvement: Annotated[float, typer.Option("--target-improvement")] = 3.0,
+    allow_fallback_model: Annotated[bool, typer.Option("--allow-fallback-model/--no-fallback-model")] = True,
+    rollback_harmful_memory: Annotated[bool, typer.Option("--rollback-harmful-memory")] = False,
+    stop_if_baseline_high: Annotated[float, typer.Option("--stop-if-baseline-high")] = 94.0,
+    max_real_calls: Annotated[Optional[int], typer.Option("--max-real-calls")] = None,
+    use_stable_prompt: Annotated[bool, typer.Option("--use-stable-prompt")] = False,
+    resumable: Annotated[bool, typer.Option("--resumable", help="Run as a checkpointed resumable learning job.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        if resumable:
+            result = run_resumable_learning_loop(
+                ws,
+                project_slug=project,
+                raw_path=raw,
+                translated_path=translated,
+                provider_key=provider,
+                model=model,
+                fallback_model=fallback_model,
+                chapters=chapters,
+                global_cycles=global_cycles,
+                iterations=iterations,
+                repair_iterations=repair_iterations,
+                min_improvement=min_improvement,
+                target_improvement=target_improvement,
+                allow_fallback_model=allow_fallback_model,
+                rollback_harmful_memory=rollback_harmful_memory,
+                stop_if_baseline_high=stop_if_baseline_high,
+                max_real_calls=max_real_calls,
+                use_stable_prompt=use_stable_prompt,
+            )
+        else:
+            result = learning_loop(
+                ws,
+                project_slug=project,
+                raw_path=raw,
+                translated_path=translated,
+                provider_key=provider,
+                model=model,
+                fallback_model=fallback_model,
+                chapters=chapters,
+                global_cycles=global_cycles,
+                iterations=iterations,
+                repair_iterations=repair_iterations,
+                min_improvement=min_improvement,
+                target_improvement=target_improvement,
+                allow_fallback_model=allow_fallback_model,
+                rollback_harmful_memory=rollback_harmful_memory,
+                stop_if_baseline_high=stop_if_baseline_high,
+                max_real_calls=max_real_calls,
+                use_stable_prompt=use_stable_prompt,
+            )
+    except StablePromptBlocker as exc:
+        _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@learn_app.command("resume")
+def learn_resume(
+    run: Annotated[str, typer.Option("--run", help="Learning run id or path.")],
+    workspace: WorkspaceOption = None,
+    max_real_calls: Annotated[Optional[int], typer.Option("--max-real-calls")] = None,
+    force_stage: Annotated[Optional[str], typer.Option("--force-stage")] = None,
+    from_stage: Annotated[Optional[str], typer.Option("--from-stage")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = resume_learning_job(
+            ws,
+            run=run,
+            max_real_calls=max_real_calls,
+            force_stage=force_stage,
+            from_stage=from_stage,
+            dry_run=dry_run,
+        )
+    except StablePromptBlocker as exc:
+        _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@learn_app.command("status")
+def learn_status(
+    run: Annotated[str, typer.Option("--run", help="Learning run id or path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = learning_job_status(ws, run=run)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("jobs")
+def learn_jobs(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = list_learning_jobs(ws, project_slug=project)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("ablate-candidates")
+def learn_ablate_candidates(
+    run: Annotated[str, typer.Option("--run", help="Learning run id or path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = ablate_learning_candidates(ws, run=run)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("approve-memory")
+def learn_approve_memory(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Learning run id or path.")],
+    workspace: WorkspaceOption = None,
+    candidate_ids: Annotated[Optional[str], typer.Option("--candidate-ids")] = None,
+    all_candidates: Annotated[bool, typer.Option("--all")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = approve_learning_memory(
+            ws,
+            project_slug=project,
+            run=run,
+            candidate_ids=candidate_ids,
+            approve_all=all_candidates,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("reject-memory")
+def learn_reject_memory(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Learning run id or path.")],
+    workspace: WorkspaceOption = None,
+    candidate_ids: Annotated[Optional[str], typer.Option("--candidate-ids")] = None,
+    all_candidates: Annotated[bool, typer.Option("--all")] = False,
+    reason: Annotated[Optional[str], typer.Option("--reason")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = reject_learning_memory(
+            ws,
+            project_slug=project,
+            run=run,
+            candidate_ids=candidate_ids,
+            reject_all=all_candidates,
+            reason=reason,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
 
 
 @export_app.command("bundle")

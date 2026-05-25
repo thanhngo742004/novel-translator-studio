@@ -716,3 +716,145 @@
   - Production translation still requires human-approved stable prompt artifacts and refuses unapproved prompts.
 - Next recommended phase:
   - MVP5B: add operator review for production outputs, richer chapter/chunk retry metadata, optional human reference evaluation when available, and safer context carry-over between chunks.
+
+## 2026-05-25T20:42:32+07:00
+
+- Completed: MVP5B production translation review and multi-cycle learning loop foundation only.
+- Implemented:
+  - Learning dataset preparation from raw Chinese text and Vietnamese EPUB reference using existing extraction, chapter/block alignment, selected samples, and translation unit artifacts.
+  - Production learning evaluation against human reference using the approved stable prompt and existing eval harness scoring.
+  - Evidence-backed pending memory candidate extraction from AI output vs human reference:
+    - term memory
+    - name memory
+    - pronoun memory
+    - style/formatting memory
+    - correction/phrase preference memory
+  - Pending candidates are written as `memory_items` with status `pending`, evidence rows, and audit logs; no candidate becomes active by default.
+  - Human memory review artifacts:
+    - `pending_memory_candidates.md`
+    - `pending_memory_candidates.json`
+    - `memory_review_table.csv`
+    - review command suggestions
+  - Temporary test memory bundle generation with checksum and provenance.
+  - Iterative learning loop with baseline scoring, cycle/strategy logs, repair logs, rollback logs, useful/harmful candidate outputs, fallback model switch logging, and learning summary artifacts.
+  - Explicit approval/rejection commands for candidate memory.
+  - Provider/model failure fallback handling for learning loop.
+- Commands implemented:
+  - `nts learn prepare-parallel`
+  - `nts learn eval-production`
+  - `nts learn extract-memory`
+  - `nts learn memory-review`
+  - `nts learn apply-test-memory`
+  - `nts learn loop`
+  - `nts learn approve-memory`
+  - `nts learn reject-memory`
+- Commands run:
+  - `python -m pytest tests/test_mvp5b_learning.py -q`
+  - `python -m pytest`
+  - `python -m nts_cli.main learn loop --workspace workspace_mvp5b_smoke_20260525202236 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider mock --model mock-eval --fallback-model mock-eval --chapters 1-3 --global-cycles 3 --iterations 3 --repair-iterations 3 --use-stable-prompt --rollback-harmful-memory --json`
+  - `python -m nts_cli.main learn loop --workspace workspace_mvp5b_smoke_20260525202236 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 1-3 --global-cycles 3 --iterations 3 --repair-iterations 3 --use-stable-prompt --rollback-harmful-memory --json`
+  - `python -m nts_cli.main learn loop --workspace workspace_mvp5b_smoke_20260525202236 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 1-3 --global-cycles 3 --iterations 3 --repair-iterations 3 --use-stable-prompt --rollback-harmful-memory --max-real-calls 3 --json`
+- Test result:
+  - `python -m pytest tests/test_mvp5b_learning.py -q` -> 8 passed.
+  - `python -m pytest` -> 110 passed.
+- Mock loop result:
+  - Output folder: `workspace_mvp5b_smoke_20260525202236/artifacts/learning/han-jue_learning_1779715358131`
+  - Baseline score: 24.33.
+  - Final/best score: 27.33.
+  - Score delta: +3.0.
+  - Candidate count: 8.
+  - Useful/harmful/pending: 8/0/8.
+  - Rollbacks: 0.
+  - Fallback model used: false.
+- Real loop result:
+  - Uncapped command started and completed baseline but exceeded the 15-minute command window during later cycles, so the lingering process was stopped.
+  - Partial uncapped baseline: output folder `workspace_mvp5b_smoke_20260525202236/artifacts/learning/han-jue_learning_1779715401516`, gpt-5.4 average 91.0, sample 2 failed terminology consistency.
+  - Capped command (`--max-real-calls 3`) completed cleanly:
+    - Output folder: `workspace_mvp5b_smoke_20260525202236/artifacts/learning/han-jue_learning_1779716373552`
+    - Baseline/final/best score: 89.0.
+    - Score delta: 0.0.
+    - Candidate count: 4.
+    - Useful/harmful/pending: 4/0/4.
+    - Rollbacks: 0.
+    - Fallback model used: false.
+    - Stop reason: max cycles exhausted due safety cap.
+- Known limitations:
+  - The real uncapped loop is too slow for the current command execution window and should be run with an explicit API/call cap until the loop has better async/resume controls.
+  - Mock loop score improvement is deterministic and intended for regression testing, not proof of real translation quality.
+  - Candidate extraction is deterministic pattern-based; LLM-assisted candidate extraction remains deferred.
+  - Temporary test memory is prompt-injected for learning runs only and is not production active memory.
+- Next recommended phase:
+  - MVP5C: resumable real learning jobs with per-iteration checkpointing, stronger candidate ablation, and operator approval UI/CLI for promoting useful pending memories after human review.
+
+## 2026-05-25T21:14:47+07:00
+
+- Completed: MVP5C resumable real learning jobs only.
+- Implemented:
+  - Checkpointed `nts learn loop --resumable` job state with stage status, checkpoint log, resume plan, API call log, provider error log, and resumable job summary artifacts.
+  - Resume/status/job-list CLI:
+    - `nts learn resume`
+    - `nts learn status`
+    - `nts learn jobs`
+    - `nts learn ablate-candidates`
+  - Required MVP5C stages are recorded:
+    - prepare dataset
+    - baseline translate/evaluate
+    - extract candidates
+    - build test memory bundle
+    - iteration translate/evaluate
+    - score delta
+    - harmful candidate detection
+    - rollback/keep candidates
+    - final summary
+  - Bounded per-invocation API call cap pauses jobs cleanly and writes the exact resume command.
+  - Resume skips completed successful stages unless `--force-stage` or `--from-stage` is supplied.
+  - Provider/model failure handling records retryable/non-retryable provider errors and switches to fallback after repeated provider/model failures.
+  - Baseline-only jobs are not considered complete learning; `reached_iteration_1_evaluate` is explicit in state and summaries.
+  - Candidate ablation report files are generated without activating memory.
+  - Pending learning memory remains pending; no production memory is activated without explicit approval.
+- Commands run:
+  - `python -m pytest tests/test_mvp5c_resumable_learning.py -q`
+  - `python -m pytest`
+  - `python -m nts_cli.main learn loop --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider mock --model mock-eval --fallback-model mock-eval --chapters 1-3 --global-cycles 2 --iterations 2 --repair-iterations 2 --use-stable-prompt --rollback-harmful-memory --resumable --json`
+  - `python -m nts_cli.main learn loop --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 1-3 --global-cycles 3 --iterations 3 --repair-iterations 3 --use-stable-prompt --rollback-harmful-memory --resumable --max-real-calls 8 --json`
+  - `python -m nts_cli.main learn status --workspace workspace_mvp5c_smoke_20260525210758 --run workspace_mvp5c_smoke_20260525210758/artifacts/learning/han-jue_learning_job_1779718101551 --json`
+  - `python -m nts_cli.main learn jobs --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --json`
+- Test result:
+  - `python -m pytest tests/test_mvp5c_resumable_learning.py -q` -> 5 passed.
+  - `python -m pytest` -> 115 passed.
+- Mock resumable loop result:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/learning/han-jue_learning_job_1779718087639`
+  - Final decision: PASS.
+  - Baseline score: 24.33.
+  - Iteration/final/best score: 27.33.
+  - Score delta: +3.0.
+  - Reached `iteration_1_evaluate`: true.
+  - Candidate count: 8.
+  - Useful/harmful/pending: 8/0/8.
+  - Rollbacks: 0.
+  - Fallback model used: false.
+- Real resumable loop result:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/learning/han-jue_learning_job_1779718101551`
+  - Final decision: PASS.
+  - Baseline score: 88.33.
+  - Iteration/final/best score: 90.33.
+  - Score delta: +2.0.
+  - Reached `iteration_1_evaluate`: true.
+  - Candidate count: 5.
+  - Candidate count by type:
+    - correction_rule_memory: 1
+    - formatting_rule_memory: 1
+    - name_memory: 1
+    - phrase_preference_memory: 1
+    - term_memory: 1
+  - Useful/harmful/pending: 5/0/5.
+  - Rollbacks: 0.
+  - Fallback model used: false.
+  - Automatic resume was not needed because the capped run completed within 6 estimated API calls.
+  - Stop reason: minimum improvement reached.
+- Known limitations:
+  - Candidate extraction remains deterministic and pattern-based.
+  - Candidate ablation is artifact-level and deterministic in MVP5C; deeper real ablation can be added when API budget and runtime are explicitly allocated.
+  - Useful candidates remain pending/test-only until explicit human approval.
+- Next recommended phase:
+  - Human review and selective approval of useful MVP5C candidates, then a controlled production retranslation smoke using approved memory only.
