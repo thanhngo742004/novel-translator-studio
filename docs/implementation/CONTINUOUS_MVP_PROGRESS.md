@@ -398,3 +398,45 @@
   - Cached sample-level pass flags may differ from the MVP4.8 stable gate because stable validation used aggregate stable-gate rules.
 - Next recommended phase:
   - Add an explicit human review step using `nts eval replay`, inspect the Markdown reports, then approve or reject the stable prompt before any production translation workflow.
+
+## 2026-05-25T09:41:06+07:00
+
+- Completed: MVP4.8.6 strict stable prompt validation safety fixes only.
+- Implemented:
+  - Deterministic `detect_truncated_vietnamese(...)` helper for broken endings, unmatched brackets, dangling glossary labels, suspicious final fragments, and hard budget-boundary cuts.
+  - Safe complete-sentence trimming helper for mock compression only; deterministic compression no longer hard-cuts text to fit a character budget.
+  - Compression validation that marks over-budget or truncated rewrite output as unsafe instead of forcing pass.
+  - Disabled unsafe fixed-term prefix repair that previously could inject labels like `linh căn:`.
+  - Alignment quality scoring and stable-validation eligibility fields:
+    - `alignment_quality`
+    - `alignment_warnings`
+    - `accepted_for_stable_validation`
+  - Stable validation early-fails when selected samples do not meet the alignment-quality threshold.
+  - Stable gate now requires selected model pass, all samples pass, no truncation, no unsafe compression, and acceptable alignment.
+  - Cached replay now re-runs truncation detection, re-checks sample pass flags, flags low alignment quality, and writes `stable_prompt_invalidated.json` for unsafe existing stable prompts.
+  - Human review exports now include truncation and alignment diagnostics.
+- Commands run:
+  - `python -m pytest`
+  - `python -m nts_cli.main eval replay --run artifacts/evaluations/han-jue_stable_1779650612543 --json`
+  - `python -m nts_cli.main eval validate-stable-prompt --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4-mini --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --enable-paragraph-alignment --enable-compression-pass --stable-run-count 3 --json`
+- Test result:
+  - `python -m pytest` -> 60 passed.
+- Old flawed stable run replay result:
+  - Run: `artifacts/evaluations/han-jue_stable_1779650612543`
+  - Strict replay pass: false.
+  - All samples pass: false.
+  - Truncated paragraphs detected: 76.
+  - Low-alignment samples: 9.
+  - Invalidation written: `stable_prompt_invalidated.json`.
+- New strict validation result:
+  - Output folder: `artifacts/evaluations/han-jue_stable_1779676830854`
+  - Quality gate: fail.
+  - Stable prompt created: false.
+  - Reason: insufficient reliable paragraph alignment in all validation runs.
+  - Provider/API was not reached because validation failed before translation.
+- Known limitations:
+  - Alignment quality is still deterministic and conservative; it rejects the current Han Jue samples rather than trying semantic alignment.
+  - Empty outputs from alignment-gated runs are counted as truncated by replay diagnostics; the primary failure reason is still low alignment quality.
+  - No production translation workflow is enabled.
+- Next recommended phase:
+  - Build a stronger local paragraph/scene alignment step before attempting another stable-prompt validation run.

@@ -14,6 +14,8 @@ from nts_core.eval_harness import (
     add_paragraph_alignment,
     compress_offending_paragraphs,
     create_paragraph_alignment,
+    detect_truncated_vietnamese,
+    evaluate_alignment_quality,
     freeze_stable_candidate,
     limited_style_prompt,
     load_eval_provider,
@@ -27,6 +29,7 @@ from nts_core.eval_harness import (
     translation_system_prompt,
     validate_paragraph_translation,
     validate_eval_provider,
+    verify_paragraph_output,
     write_cached_eval_exports,
     write_stable_decision_outputs,
 )
@@ -169,6 +172,41 @@ def test_paragraph_alignment_pairs_and_mismatch_warning() -> None:
     assert alignment["warnings"] == ["paragraph_count_mismatch:source=3,target=2"]
 
 
+def test_truncation_detector_catches_broken_endings_and_brackets() -> None:
+    examples = [
+        "【Linh căn:",
+        "Click bắt đ",
+        "sao có thể phà",
+        "vẫn không lắ",
+        "hắn lại có thể tu tiê",
+        "chẳng có m",
+        "Một câu (chưa đóng.",
+    ]
+
+    for text in examples:
+        result = detect_truncated_vietnamese(text)
+        assert result["is_truncated"] is True, text
+
+
+def test_truncation_detector_warns_on_glossary_prefix_injection() -> None:
+    result = detect_truncated_vietnamese("linh căn: Ngọc Thanh Tông: Hắn tiếp tục tu luyện.")
+
+    assert result["is_truncated"] is True
+    assert "glossary_label_prefix_injection" in result["reasons"]
+
+
+def test_alignment_quality_below_threshold_excludes_sample() -> None:
+    alignment = create_paragraph_alignment(
+        "甲。\n\n乙。\n\n丙。\n\n丁。\n\n戊。",
+        "Một đoạn tham chiếu duy nhất rất ngắn.",
+    )
+
+    quality = evaluate_alignment_quality(alignment)
+
+    assert quality["alignment_quality"] < 0.70
+    assert quality["accepted_for_stable_validation"] is False
+
+
 def test_paragraph_validation_and_rendering_preserves_ids_and_count() -> None:
     sample = add_paragraph_alignment(
         {
@@ -203,12 +241,12 @@ def test_compression_only_rewrites_offending_paragraph_once() -> None:
             "sample_id": "sample_1",
             "chapter_id": 1,
             "source_text": "甲。\n\n乙。",
-            "target_text": "Một câu rất ngắn.\n\nHai.",
-            "target_char_count": len("Một câu rất ngắn.\n\nHai."),
+            "target_text": "Một câu hoàn chỉnh và vừa đủ dài.\n\nHai.",
+            "target_char_count": len("Một câu hoàn chỉnh và vừa đủ dài.\n\nHai."),
         }
     )
     pair = sample["paragraph_pairs"][0]
-    overlong = "a" * (pair["strict_max"] + 20)
+    overlong = "Một câu hoàn chỉnh. " * 8
     paragraphs = [
         {"paragraph_id": "p001", "text": overlong},
         {"paragraph_id": "p002", "text": "Hai."},
@@ -233,7 +271,34 @@ def test_compression_only_rewrites_offending_paragraph_once() -> None:
     assert len(log["entries"]) == 1
     assert compressed[0]["paragraph_id"] == "p001"
     assert len(compressed[0]["text"]) <= pair["target_max"]
+    assert compressed[0]["text"].endswith(".")
+    assert log["entries"][0]["deterministic_clip_applied"] is False
     assert compressed[1] == paragraphs[1]
+
+
+def test_unsafe_compression_does_not_force_pass() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "甲。\n\n乙。",
+            "target_text": "Một câu hoàn chỉnh và vừa đủ dài.\n\nHai.",
+            "target_char_count": len("Một câu hoàn chỉnh và vừa đủ dài.\n\nHai."),
+        }
+    )
+    pair = sample["paragraph_pairs"][0]
+    paragraphs = [
+        {"paragraph_id": "p001", "text": "bắt đ"},
+        {"paragraph_id": "p002", "text": "Hai."},
+    ]
+
+    verification = validate_paragraph_translation(sample, paragraphs)
+    assert verification["valid"] is True
+    output = verify_paragraph_output(sample, paragraphs, glossary={"fixed_terms": []})
+
+    assert output["pass"] is False
+    assert "paragraph_truncation_detected" in output["reasons"]
+    assert output["truncated_paragraphs"][0]["paragraph_id"] == pair["paragraph_id"]
 
 
 def test_learn_style_translate_compare_mock_outputs_and_score_schema(
@@ -653,6 +718,48 @@ def test_stable_gate_requires_unchanged_prompt_and_ignores_unselected_model() ->
     assert "candidate_prompt_changed_across_runs" in changed_gate["reasons"]
 
 
+def test_stable_gate_rejects_false_sample_pass_and_truncation() -> None:
+    prompt_hash = "sha256:" + "a" * 64
+    false_pass_run = stable_validation_run(1, prompt_hash)
+    false_pass_run["report"]["models"]["gpt-5.4-mini"]["pass"] = False
+    false_pass_run["report"]["models"]["gpt-5.4-mini"]["samples"][0]["pass"] = False
+    false_pass_run["report"]["models"]["gpt-5.4-mini"]["samples"][0][
+        "final_pass_fail_reason"
+    ] = "meaning_accuracy_below_threshold"
+
+    gate = stable_gate_result(
+        validation_runs=[false_pass_run],
+        selected_model="gpt-5.4-mini",
+        expected_prompt_sha256=prompt_hash,
+    )
+
+    assert gate["pass"] is False
+    assert any("model_report_not_pass" in reason for reason in gate["reasons"])
+    assert any(
+        score["sample_id"] == "sample_1" and "evaluator_sample_not_pass" in score["reasons"]
+        for score in gate["per_sample_scores"]
+    )
+
+    trunc_run = stable_validation_run(1, prompt_hash)
+    trunc_run["report"]["models"]["gpt-5.4-mini"]["samples"][0][
+        "verification_reasons"
+    ] = ["paragraph_truncation_detected"]
+    trunc_run["report"]["models"]["gpt-5.4-mini"]["samples"][0][
+        "truncated_paragraphs"
+    ] = [{"paragraph_id": "p001", "reasons": ["missing_terminal_punctuation"]}]
+    trunc_gate = stable_gate_result(
+        validation_runs=[trunc_run],
+        selected_model="gpt-5.4-mini",
+        expected_prompt_sha256=prompt_hash,
+    )
+
+    assert trunc_gate["pass"] is False
+    assert any(
+        "paragraph_truncation_detected" in score["reasons"]
+        for score in trunc_gate["per_sample_scores"]
+    )
+
+
 def test_stable_decision_outputs_success_and_failure(tmp_path: Path) -> None:
     root = tmp_path / "stable-pass"
     root.mkdir()
@@ -711,6 +818,36 @@ def test_stable_decision_outputs_success_and_failure(tmp_path: Path) -> None:
     assert fail_result["stable_prompt_created"] is False
     assert not (fail_root / "stable_prompt.md").exists()
     assert (fail_root / "stable_candidate_failure_report.md").exists()
+
+    trunc_root = tmp_path / "stable-trunc-fail"
+    trunc_root.mkdir()
+    trunc_candidate = freeze_stable_candidate(
+        validation_root=trunc_root,
+        project="han-jue",
+        provider_key="mock",
+        model="gpt-5.4-mini",
+        source_eval_run=None,
+        settings={"enable_paragraph_alignment": True, "enable_compression_pass": True},
+    )
+    trunc_run = stable_validation_run(1, trunc_candidate["metadata"]["prompt_sha256"])
+    trunc_run["report"]["models"]["gpt-5.4-mini"]["samples"][0][
+        "verification_reasons"
+    ] = ["paragraph_truncation_detected"]
+    trunc_gate = stable_gate_result(
+        validation_runs=[trunc_run],
+        selected_model="gpt-5.4-mini",
+        expected_prompt_sha256=trunc_candidate["metadata"]["prompt_sha256"],
+    )
+    trunc_result = write_stable_decision_outputs(
+        validation_root=trunc_root,
+        candidate=trunc_candidate,
+        validation_runs=[trunc_run],
+        gate=trunc_gate,
+        provider_key="mock",
+        model="gpt-5.4-mini",
+    )
+    assert trunc_result["stable_prompt_created"] is False
+    assert not (trunc_root / "stable_prompt.md").exists()
 
 
 def test_cached_replay_and_human_review_exports_created(tmp_path: Path) -> None:
@@ -855,6 +992,71 @@ def write_stable_review_fixture(tmp_path: Path) -> Path:
     return validation_root
 
 
+def write_truncated_stable_fixture(tmp_path: Path) -> Path:
+    validation_root = tmp_path / "han-jue_stable_truncated"
+    validation_root.mkdir(parents=True)
+    run_dir = tmp_path / "eval_run_truncated"
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝继续修炼。",
+            "target_text": "Hàn Tuyệt tiếp tục tu luyện.",
+            "target_char_count": len("Hàn Tuyệt tiếp tục tu luyện."),
+        }
+    )
+    (run_dir / "translation_outputs" / "sample_1").mkdir(parents=True)
+    (run_dir / "selected_samples.json").write_text(
+        json.dumps({"samples": [sample]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    initial = {"paragraphs": [{"paragraph_id": "p001", "text": "Hàn Tuyệt tiếp tục tu luyện."}]}
+    final = {"paragraphs": [{"paragraph_id": "p001", "text": "Hàn Tuyệt tiếp tục tu luyệ"}]}
+    sample_dir = run_dir / "translation_outputs" / "sample_1"
+    (sample_dir / "gpt-5.4-mini_structured_initial.json").write_text(
+        json.dumps(initial, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (sample_dir / "gpt-5.4-mini_structured_final.json").write_text(
+        json.dumps(final, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    write_cached_eval_exports(
+        validation_root=validation_root,
+        validation_runs=[
+            {
+                "validation_index": 1,
+                "run_dir": str(run_dir),
+                "report": {
+                    "models": {
+                        "gpt-5.4-mini": {
+                            "samples": [stable_sample_score("sample_1", total_score=90)],
+                        }
+                    }
+                },
+            }
+        ],
+        selected_model="gpt-5.4-mini",
+    )
+    (validation_root / "stable_prompt.md").write_text("Unsafe prompt\n", encoding="utf-8")
+    (validation_root / "stable_prompt_metadata.json").write_text(
+        json.dumps(
+            {
+                "model": "gpt-5.4-mini",
+                "provider": "mock",
+                "validation_runs": [{"validation_index": 1}],
+                "average_score": 90,
+                "compression_counts": [1],
+                "ratio_summary": {"min": 1.0, "max": 1.0, "average": 1.0},
+                "quality_gate": "pass",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return validation_root
+
+
 def test_eval_replay_regenerates_reports_without_api_calls(tmp_path: Path) -> None:
     validation_root = write_stable_review_fixture(tmp_path)
 
@@ -879,6 +1081,21 @@ def test_eval_replay_command_outputs_machine_readable_json(tmp_path: Path) -> No
     data = parse_json(result.output)["data"]
     assert data["quality_summary"]["selected_model"] == "gpt-5.4-mini"
     assert Path(data["replay_report"]).exists()
+
+
+def test_replay_marks_cached_run_fail_when_truncation_exists(tmp_path: Path) -> None:
+    validation_root = write_truncated_stable_fixture(tmp_path)
+
+    result = replay_cached_eval(validation_root)
+
+    assert result["quality_summary"]["strict_replay_pass"] is False
+    assert result["quality_summary"]["truncated_paragraph_count"] == 1
+    assert result["stable_prompt_invalidated"] is True
+    invalidation = json.loads(
+        Path(result["stable_prompt_invalidated_path"]).read_text(encoding="utf-8")
+    )
+    assert invalidation["reason"] == "strict_cached_replay_failed"
+    assert "WARNING" in Path(result["replay_report_md"]).read_text(encoding="utf-8")
 
 
 def test_eval_replay_accepts_run_id_from_eval_artifacts(
@@ -915,6 +1132,20 @@ def test_review_stable_approve_creates_approval_without_modifying_prompt(tmp_pat
     assert approval["reviewer"] == "unit-test"
     assert approval["quality_summary"]["average_score"] == 88
     assert (validation_root / "stable_prompt.md").read_text(encoding="utf-8") == before
+
+
+def test_review_stable_cannot_approve_strict_replay_failure(tmp_path: Path) -> None:
+    validation_root = write_truncated_stable_fixture(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["eval", "review-stable", "--run", str(validation_root), "--approve", "--json"],
+    )
+
+    assert result.exit_code == 4
+    payload = parse_json(result.output)
+    assert payload["status"] == "error"
+    assert "strict cached replay failed" in payload["error"]["message"]
 
 
 def test_review_stable_reject_creates_rejection_with_reason(tmp_path: Path) -> None:

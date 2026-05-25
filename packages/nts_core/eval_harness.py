@@ -41,6 +41,7 @@ PARAGRAPH_TARGET_MIN_RATIO = 0.80
 PARAGRAPH_TARGET_MAX_RATIO = 1.15
 PARAGRAPH_STRICT_MAX_RATIO = 1.25
 PARAGRAPH_BATCH_SIZE = 12
+ALIGNMENT_QUALITY_THRESHOLD = 0.70
 
 SCORE_WEIGHTS = {
     "meaning_accuracy": 25,
@@ -95,6 +96,24 @@ FIXED_GLOSSARY = {
     "修为": "tu vi",
     "先天气运": "tiên thiên khí vận",
 }
+
+TERMINAL_PUNCTUATION = set(".!?…。！？】)]}\"”'")
+OPEN_CLOSE_PAIRS = {"【": "】", "(": ")", "[": "]", "“": "”", '"': '"'}
+SUSPICIOUS_FINAL_FRAGMENTS = {
+    "bắt đ",
+    "phà",
+    "không lắ",
+    "vẫn không lắ",
+    "tu tiê",
+    "chẳng có m",
+    "linh căn:",
+    "hàn tuyệt:",
+    "ngọc thanh tông:",
+    "tiên thiên khí vận:",
+}
+GLOSSARY_LABEL_PREFIXES = tuple(
+    sorted({target.lower() for target in FIXED_GLOSSARY.values()}, key=len, reverse=True)
+)
 
 
 @dataclass(frozen=True)
@@ -153,6 +172,96 @@ def safe_model_name(model: str) -> str:
 
 def sha256_text(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _last_nonspace(text: str) -> str:
+    stripped = text.rstrip()
+    return stripped[-1] if stripped else ""
+
+
+def _balanced_delimiters(text: str) -> list[str]:
+    reasons = []
+    if text.count("【") != text.count("】"):
+        reasons.append("unmatched_system_panel_bracket")
+    if text.count("(") != text.count(")"):
+        reasons.append("unmatched_parenthesis")
+    if text.count("[") != text.count("]"):
+        reasons.append("unmatched_square_bracket")
+    if text.count("“") != text.count("”"):
+        reasons.append("unmatched_curly_quote")
+    if text.count('"') % 2:
+        reasons.append("unmatched_straight_quote")
+    return reasons
+
+
+def _starts_with_injected_glossary_label(text: str) -> bool:
+    lowered = text.strip().lower()
+    matched_prefixes = [
+        prefix for prefix in GLOSSARY_LABEL_PREFIXES if lowered.startswith(prefix + ":")
+    ]
+    if not matched_prefixes:
+        return False
+    label_count = sum(1 for prefix in GLOSSARY_LABEL_PREFIXES if f"{prefix}:" in lowered[:80])
+    return label_count >= 2 or matched_prefixes[0] not in {"hàn tuyệt"}
+
+
+def detect_truncated_vietnamese(
+    text: str,
+    *,
+    source_text: str | None = None,
+    strict_max: int | None = None,
+) -> dict[str, Any]:
+    stripped = re.sub(r"\s+", " ", text or "").strip()
+    reasons: list[str] = []
+    if not stripped:
+        return {"is_truncated": True, "reasons": ["empty_output"]}
+
+    reasons.extend(_balanced_delimiters(stripped))
+    lowered = stripped.lower()
+    if any(lowered.endswith(fragment) for fragment in SUSPICIOUS_FINAL_FRAGMENTS):
+        reasons.append("suspicious_fragment_ending")
+    if re.search(r"(?:^|\s)(?:linh căn|hàn tuyệt|ngọc thanh tông|tiên thiên khí vận)\s*:\s*$", lowered):
+        reasons.append("dangling_glossary_label")
+    if _starts_with_injected_glossary_label(stripped):
+        reasons.append("glossary_label_prefix_injection")
+
+    final = _last_nonspace(stripped)
+    source_sentence_like = bool(
+        not source_text
+        or re.search(r"[。.!?！？…]|\n", source_text)
+        or len(stripped) >= 24
+    )
+    if source_sentence_like and final and final not in TERMINAL_PUNCTUATION:
+        reasons.append("missing_terminal_punctuation")
+    final_token_match = re.search(r"([\wÀ-ỹĐđ]+)$", stripped, re.UNICODE)
+    final_token = final_token_match.group(1).lower() if final_token_match else ""
+    if final_token and (len(final_token) <= 1 or final_token in {"đ", "m", "lắ", "tiê", "phà"}):
+        reasons.append("suspicious_incomplete_final_token")
+    if strict_max is not None and len(text or "") == strict_max and final not in TERMINAL_PUNCTUATION:
+        reasons.append("hard_budget_boundary_without_sentence_end")
+
+    return {"is_truncated": bool(reasons), "reasons": sorted(set(reasons))}
+
+
+def safe_trim_complete_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text.strip()
+    if max_chars <= 0:
+        return text
+    candidate = text[:max_chars].rstrip()
+    sentence_end_positions = [
+        index + 1
+        for index, char in enumerate(candidate)
+        if char in TERMINAL_PUNCTUATION
+        and (index == len(candidate) - 1 or candidate[index + 1].isspace())
+    ]
+    if not sentence_end_positions:
+        return text
+    trimmed = candidate[: sentence_end_positions[-1]].strip()
+    if not trimmed:
+        return text
+    detection = detect_truncated_vietnamese(trimmed, strict_max=max_chars)
+    return text if detection["is_truncated"] else trimmed
 
 
 def paragraph_count(text: str) -> int:
@@ -447,10 +556,70 @@ def create_paragraph_alignment(source_text: str, target_text: str) -> dict[str, 
     }
 
 
+def evaluate_alignment_quality(alignment: dict[str, Any]) -> dict[str, Any]:
+    source_count = len(alignment.get("source_paragraphs", []))
+    target_count = len(alignment.get("target_paragraphs", []))
+    pair_count = len(alignment.get("paragraph_pairs", []))
+    warnings = list(alignment.get("warnings", []))
+    score = 1.0
+    reasons: list[str] = []
+    if not source_count or not target_count or not pair_count:
+        return {
+            "alignment_quality": 0.0,
+            "alignment_warnings": sorted(set(warnings + ["missing_alignment_paragraphs"])),
+            "accepted_for_stable_validation": False,
+        }
+
+    count_delta = abs(source_count - target_count) / max(source_count, target_count, 1)
+    if count_delta > 0:
+        score -= min(0.50, count_delta)
+        reasons.append(f"paragraph_count_delta={count_delta:.3f}")
+    initial_pair_count = min(source_count, target_count)
+    if pair_count < initial_pair_count:
+        merged_ratio = 1 - (pair_count / max(initial_pair_count, 1))
+        score -= min(0.30, merged_ratio)
+        reasons.append(f"merged_pair_ratio={merged_ratio:.3f}")
+    for warning in warnings:
+        if warning.startswith("paragraph_count_mismatch"):
+            score -= 0.10
+        elif warning.startswith("paragraph_pairs_merged"):
+            score -= 0.10
+        else:
+            score -= 0.05
+
+    pair_ratios = [
+        float(pair.get("target_source_ratio", 0))
+        for pair in alignment.get("paragraph_pairs", [])
+        if pair.get("source_char_count")
+    ]
+    outliers = [ratio for ratio in pair_ratios if ratio < 0.35 or ratio > 4.5]
+    if outliers:
+        score -= min(0.25, 0.05 * len(outliers))
+        reasons.append(f"length_ratio_outlier_count={len(outliers)}")
+
+    source_panel_count = sum(paragraph.get("text", "").count("【") for paragraph in alignment.get("source_paragraphs", []))
+    target_panel_count = sum(paragraph.get("text", "").count("【") for paragraph in alignment.get("target_paragraphs", []))
+    if source_panel_count or target_panel_count:
+        panel_delta = abs(source_panel_count - target_panel_count) / max(source_panel_count, target_panel_count, 1)
+        if panel_delta > 0.35:
+            score -= 0.15
+            reasons.append(f"system_panel_count_delta={panel_delta:.3f}")
+
+    score = max(0.0, round(score, 3))
+    alignment_warnings = sorted(set(warnings + reasons))
+    return {
+        "alignment_quality": score,
+        "alignment_warnings": alignment_warnings,
+        "accepted_for_stable_validation": score >= ALIGNMENT_QUALITY_THRESHOLD,
+    }
+
+
 def add_paragraph_alignment(sample: dict[str, Any]) -> dict[str, Any]:
     alignment = create_paragraph_alignment(sample["source_text"], sample["target_text"])
     sample.update(alignment)
     sample["paragraph_alignment_warnings"] = alignment["warnings"]
+    quality = evaluate_alignment_quality(alignment)
+    sample.update(quality)
     return sample
 
 
@@ -467,6 +636,9 @@ def paragraph_alignment_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 "paragraph_pair_count": len(sample.get("paragraph_pairs", [])),
                 "method": sample.get("method"),
                 "warnings": sample.get("paragraph_alignment_warnings", []),
+                "alignment_quality": sample.get("alignment_quality"),
+                "alignment_warnings": sample.get("alignment_warnings", []),
+                "accepted_for_stable_validation": sample.get("accepted_for_stable_validation"),
             }
             for sample in samples
         ],
@@ -572,18 +744,45 @@ def select_samples(
     if sample_count <= 0:
         raise ValueError("--sample-count must be greater than 0.")
 
+    def choose_sample(
+        source: str,
+        target: str,
+        *,
+        chapter_id: int,
+        sample_id: str,
+        selection_reason: str,
+    ) -> dict[str, Any]:
+        ratios = []
+        for ratio in [sample_start_ratio, 0.0, 0.25, 0.5, 0.75]:
+            if ratio not in ratios:
+                ratios.append(ratio)
+        candidates = [
+            select_sample(
+                source,
+                target,
+                chapter_id=chapter_id,
+                max_source_chars=max_source_chars,
+                max_target_chars=max_target_chars,
+                sample_start_ratio=ratio,
+                sample_id=sample_id,
+                selection_reason=selection_reason,
+            )
+            for ratio in ratios
+        ]
+        accepted = [
+            sample for sample in candidates if sample.get("accepted_for_stable_validation")
+        ]
+        return max(accepted or candidates, key=lambda sample: sample.get("alignment_quality", 0))
+
     samples: list[dict[str, Any]] = []
     if aligned_count >= sample_count:
         for index in range(sample_count):
             chapter_id = index + 1
             samples.append(
-                select_sample(
+                choose_sample(
                     raw_chapters[index]["text"],
                     target_chapters[index]["text"],
                     chapter_id=chapter_id,
-                    max_source_chars=max_source_chars,
-                    max_target_chars=max_target_chars,
-                    sample_start_ratio=sample_start_ratio,
                     sample_id=f"sample_{chapter_id}",
                     selection_reason="chapter_aligned_sample_preserving_paragraph_boundaries",
                 )
@@ -890,7 +1089,7 @@ def _mock_chat_completion(model: str, messages: list[dict[str, str]]) -> str:
         for paragraph in payload.get("paragraphs", []):
             target_max = int(paragraph.get("target_max") or paragraph.get("strict_max") or 80)
             current = str(paragraph.get("current_translation", ""))
-            text = current[:target_max].rstrip()
+            text = safe_trim_complete_text(current, target_max)
             compressed.append({"paragraph_id": paragraph["paragraph_id"], "text": text})
         return json_dumps({"paragraphs": compressed})
     source = content[:240].replace("\n", " ")
@@ -1115,6 +1314,11 @@ def per_paragraph_length_table(
     for pair in sample.get("paragraph_pairs", []):
         output_text = lookup.get(pair["paragraph_id"], "")
         output_count = len(output_text)
+        truncation = detect_truncated_vietnamese(
+            output_text,
+            source_text=pair.get("source_text"),
+            strict_max=pair.get("strict_max"),
+        )
         rows.append(
             {
                 "paragraph_id": pair["paragraph_id"],
@@ -1126,6 +1330,8 @@ def per_paragraph_length_table(
                 "output_char_count": output_count,
                 "output_reference_ratio": round(output_count / max(pair["target_char_count"], 1), 3),
                 "over_strict_max": output_count > pair["strict_max"],
+                "truncation_detected": truncation["is_truncated"],
+                "truncation_reasons": truncation["reasons"],
             }
         )
     return rows
@@ -1141,11 +1347,7 @@ def max_tokens_for_paragraph_pairs(pairs: list[dict[str, Any]]) -> int:
 
 
 def clip_to_char_budget(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 0:
-        return ""
-    return text[:max_chars].rstrip()
+    return safe_trim_complete_text(text, max_chars)
 
 
 def enforce_fixed_terms_in_paragraphs(
@@ -1175,19 +1377,17 @@ def enforce_fixed_terms_in_paragraphs(
                 and source_term in source_text
                 and target_term.lower() not in text.lower()
             ):
-                text = f"{target_term}: {text}".strip()
                 applied_terms.append({"source": source_term, "target": target_term})
         if applied_terms:
-            strict_max = int(pair.get("strict_max") or len(text))
-            before_clip = text
-            text = clip_to_char_budget(text, strict_max)
             repairs.append(
                 {
                     "paragraph_id": paragraph_id,
                     "terms": applied_terms,
-                    "before_clip_char_count": len(before_clip),
+                    "before_clip_char_count": len(text),
                     "after_char_count": len(text),
-                    "strict_max": strict_max,
+                    "strict_max": int(pair.get("strict_max") or len(text)),
+                    "skipped": True,
+                    "reason": "unsafe_prefix_term_repair_disabled",
                 }
             )
         repaired.append({"paragraph_id": paragraph_id, "text": text})
@@ -1214,7 +1414,7 @@ def enforce_global_length_floor(
         if not pair or len(before) <= len(paragraph["text"]):
             continue
         candidate = clip_to_char_budget(before, pair["strict_max"])
-        if len(candidate) <= len(paragraph["text"]):
+        if len(candidate) > pair["strict_max"] or len(candidate) <= len(paragraph["text"]):
             continue
         before_count = len(paragraph["text"])
         paragraph["text"] = candidate
@@ -1243,6 +1443,14 @@ def verify_paragraph_output(
     ratio = len(rendered) / max(sample["target_char_count"], 1)
     table = per_paragraph_length_table(sample, paragraphs)
     overlong = [row["paragraph_id"] for row in table if row["over_strict_max"]]
+    truncated = [
+        {
+            "paragraph_id": row["paragraph_id"],
+            "reasons": row["truncation_reasons"],
+        }
+        for row in table
+        if row["truncation_detected"]
+    ]
     terminology_mismatches = terminology_mismatches_for(
         sample["source_text"],
         rendered,
@@ -1253,16 +1461,24 @@ def verify_paragraph_output(
         reasons.append("global_ratio_outside_range")
     if overlong:
         reasons.append("paragraph_exceeds_strict_max")
+    if truncated:
+        reasons.append("paragraph_truncation_detected")
     if terminology_mismatches:
         reasons.append("terminology_mismatch")
+    if sample.get("accepted_for_stable_validation") is False:
+        reasons.append("alignment_quality_below_threshold")
     return {
         "pass": not reasons,
         "reasons": reasons,
         "paragraph_validation": validation,
         "global_ratio": round(ratio, 3),
         "overlong_paragraph_ids": overlong,
+        "truncated_paragraphs": truncated,
         "terminology_mismatches": terminology_mismatches,
         "per_paragraph_length_table": table,
+        "alignment_quality": sample.get("alignment_quality"),
+        "alignment_warnings": sample.get("alignment_warnings", []),
+        "accepted_for_stable_validation": sample.get("accepted_for_stable_validation"),
     }
 
 
@@ -1288,14 +1504,23 @@ def compression_user_prompt(
                     "current_translation": current,
                     "target_max": pair["target_max"],
                     "strict_max": pair["strict_max"],
+                    "requirements": [
+                        "Preserve all source meaning, names, terms, numbers, and system panels.",
+                        "Return one complete Vietnamese paragraph.",
+                        "Do not cut words or phrases.",
+                        "Do not add glossary labels at the beginning unless the source starts with that label.",
+                        "No dangling brackets or unfinished sentences.",
+                    ],
                 }
             )
     return json_dumps(
         {
             "task": "compress_paragraphs",
             "instructions": (
-                "Compress without losing meaning. Do not add new details. Keep Vietnamese "
-                "webnovel style. Return only revised paragraphs in JSON."
+                "Rewrite-compress without losing meaning. Preserve names, fixed terms, numbers, "
+                "system panels, and complete Vietnamese sentences. Do not hard truncate. Do not add "
+                "new details, translator notes, or glossary labels at the beginning. Return only "
+                "revised paragraphs in JSON."
             ),
             "fixed_glossary": glossary.get("fixed_terms", []),
             "paragraphs": offenders,
@@ -1348,8 +1573,9 @@ def compress_offending_paragraphs(
                         "role": "system",
                         "content": (
                             "You compress overlong Vietnamese translation paragraphs. "
-                            "Return JSON only. Compress without losing meaning. Do not add new details. "
-                            "Keep Vietnamese webnovel style. Return only the revised paragraph text."
+                            "Return JSON only. Rewrite-compress without losing meaning. Preserve names, "
+                            "terms, numbers, and system panels. Do not hard truncate, do not leave dangling "
+                            "brackets, and do not return unfinished Vietnamese words or sentences."
                         ),
                     },
                     {"role": "user", "content": prompt},
@@ -1384,12 +1610,16 @@ def compress_offending_paragraphs(
             model_after = after
             deterministic_clip_applied = False
             deterministic_min_restore_applied = False
-            if len(after) < pair["target_min"] and len(before) >= pair["target_min"]:
-                after = clip_to_char_budget(before, pair["strict_max"])
-                deterministic_min_restore_applied = True
+            unsafe_compression = False
+            truncation = detect_truncated_vietnamese(
+                after,
+                source_text=pair.get("source_text"),
+                strict_max=pair.get("strict_max"),
+            )
             if len(after) > pair["strict_max"]:
-                after = clip_to_char_budget(after, pair["strict_max"])
-                deterministic_clip_applied = True
+                unsafe_compression = True
+            if truncation["is_truncated"]:
+                unsafe_compression = True
             entries.append(
                 {
                     "paragraph_id": paragraph_id,
@@ -1401,6 +1631,9 @@ def compress_offending_paragraphs(
                     "still_over_strict_max": len(after) > pair["strict_max"],
                     "deterministic_clip_applied": deterministic_clip_applied,
                     "deterministic_min_restore_applied": deterministic_min_restore_applied,
+                    "unsafe_compression": unsafe_compression,
+                    "truncation_detected": truncation["is_truncated"],
+                    "truncation_reasons": truncation["reasons"],
                     "before_text": before,
                     "model_after_text": model_after,
                     "after_text": after,
@@ -1641,6 +1874,21 @@ def translate_samples(
                     final_paragraphs,
                     glossary=glossary,
                 )
+                unsafe_entries = [
+                    entry
+                    for entry in compression_result.get("entries", [])
+                    if entry.get("unsafe_compression")
+                ]
+                if unsafe_entries:
+                    verification_after["pass"] = False
+                    verification_after["reasons"].append("unsafe_compression")
+                    verification_after["unsafe_compression_paragraphs"] = [
+                        {
+                            "paragraph_id": entry.get("paragraph_id"),
+                            "truncation_reasons": entry.get("truncation_reasons", []),
+                        }
+                        for entry in unsafe_entries
+                    ]
                 if best_effort_used:
                     verification_after["pass"] = False
                     verification_after["reasons"].append("model_output_failed_paragraph_json_validation")
@@ -2022,6 +2270,11 @@ def _score_translation(
         "paragraph_validation": verification.get("paragraph_validation") if verification else None,
         "verification_reasons": verification.get("reasons", []) if verification else [],
         "overlong_paragraph_ids": verification.get("overlong_paragraph_ids", []) if verification else [],
+        "truncated_paragraphs": verification.get("truncated_paragraphs", []) if verification else [],
+        "alignment_quality": verification.get("alignment_quality") if verification else None,
+        "accepted_for_stable_validation": verification.get("accepted_for_stable_validation")
+        if verification
+        else None,
         "length_penalty_reason": length_warning,
         "terminology_mismatches": terminology_mismatches,
         "final_pass_fail_reason": "pass" if pass_fail else ", ".join(fail_reasons),
@@ -2218,6 +2471,9 @@ def compare_multi_sample_outputs(
                 "target_length_max": sample["target_length_max"],
                 "paragraph_count_source": sample["paragraph_count_source"],
                 "paragraph_count_target": sample["paragraph_count_target"],
+                "alignment_quality": sample.get("alignment_quality"),
+                "alignment_warnings": sample.get("alignment_warnings", []),
+                "accepted_for_stable_validation": sample.get("accepted_for_stable_validation"),
             }
             for sample in samples
         ],
@@ -2438,7 +2694,8 @@ def stable_base_prompt_text() -> str:
             "Keep paragraph order exactly as provided.",
             "Each returned text field must be one compact Vietnamese paragraph.",
             "Use the per-paragraph target_max and strict_max values from the user JSON.",
-            "Each paragraph fails validation if it exceeds strict_max after compression.",
+            "Compression must rewrite complete Vietnamese sentences; never cut words to fit budget.",
+            "Each paragraph fails validation if it exceeds strict_max after compression, has dangling brackets, or looks truncated.",
             "Required glossary mappings when the source term appears: "
             + json_dumps(
                 [
@@ -2496,7 +2753,7 @@ def freeze_stable_candidate(
     prompt_hash = sha256_text(prompt_text)
     metadata = {
         "prompt_id": f"{project}_mvp48_candidate",
-        "prompt_version": "mvp4.8-stable-candidate-v1",
+        "prompt_version": "mvp4.8.6-stable-candidate-v1",
         "source_eval_run_id": source_eval_run_id or "generated_without_prior_eval",
         "project": project,
         "model": model,
@@ -2517,14 +2774,18 @@ def freeze_stable_candidate(
         "compression_settings": {
             "enabled": settings.get("enable_compression_pass"),
             "one_model_compression_pass": True,
-            "deterministic_budget_enforcement": True,
+            "deterministic_budget_enforcement": False,
             "fixed_term_repair": True,
+            "truncation_detection": True,
+            "unsafe_hard_cut_rejected": True,
         },
         "evaluation_thresholds": {
             "pass_thresholds": PASS_THRESHOLDS,
             "sample_min_total_score": 75,
             "average_min_score": 80,
             "output_reference_ratio": [EVAL_LENGTH_RATIO_MIN, EVAL_LENGTH_RATIO_MAX],
+            "alignment_quality_min": ALIGNMENT_QUALITY_THRESHOLD,
+            "truncation_allowed": False,
         },
         "settings": settings,
         "created_at": utc_now(),
@@ -2552,6 +2813,98 @@ def stable_sample_offsets(stable_run_count: int) -> list[float]:
     if stable_run_count <= 1:
         return [0.0]
     return [round(index / (stable_run_count + 1), 3) for index in range(stable_run_count)]
+
+
+def stable_alignment_failure_report(
+    *,
+    project: str,
+    model: str,
+    samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    per_sample = []
+    for sample in samples:
+        per_sample.append(
+            {
+                "sample_id": sample["sample_id"],
+                "chapter_id": sample["chapter_id"],
+                "total_score": 0,
+                "meaning_accuracy": 0,
+                "omission_addition": 0,
+                "terminology_consistency": 0,
+                "pronoun_name_consistency": 0,
+                "vietnamese_fluency": 0,
+                "style_match": 0,
+                "formatting_preservation": 0,
+                "pass": False,
+                "output_char_count": 0,
+                "reference_char_count": sample["target_char_count"],
+                "output_reference_ratio": 0,
+                "paragraph_count_output": 0,
+                "paragraph_count_reference": sample["paragraph_count_target"],
+                "paragraph_count_source": sample["paragraph_count_source"],
+                "retry_triggered": False,
+                "compression_count": 0,
+                "global_ratio_before_compression": None,
+                "global_ratio_after_compression": 0,
+                "per_paragraph_length_table": [],
+                "paragraph_validation": None,
+                "overlong_paragraph_ids": [],
+                "truncated_paragraphs": [],
+                "length_penalty_reason": "alignment_quality_below_threshold",
+                "terminology_mismatches": [],
+                "gates": {
+                    "severe_hallucination": False,
+                    "wrong_main_character_name": False,
+                    "major_skipped_passage": False,
+                    "length_in_range": False,
+                },
+                "alignment_quality": sample.get("alignment_quality"),
+                "accepted_for_stable_validation": sample.get("accepted_for_stable_validation"),
+                "verification_reasons": ["alignment_quality_below_threshold"],
+                "final_pass_fail_reason": "insufficient_reliable_alignment",
+                "notes": {
+                    "heuristic_only": True,
+                    "alignment_warnings": sample.get("alignment_warnings", []),
+                },
+            }
+        )
+    return {
+        "project": project,
+        "chapter": 1,
+        "sample_count": len(samples),
+        "samples": [
+            {
+                "sample_id": sample["sample_id"],
+                "chapter_id": sample["chapter_id"],
+                "source_char_count": sample["source_char_count"],
+                "target_char_count": sample["target_char_count"],
+                "alignment_quality": sample.get("alignment_quality"),
+                "alignment_warnings": sample.get("alignment_warnings", []),
+                "accepted_for_stable_validation": sample.get("accepted_for_stable_validation"),
+            }
+            for sample in samples
+        ],
+        "score_weights": SCORE_WEIGHTS,
+        "pass_thresholds": PASS_THRESHOLDS,
+        "models": {
+            model: {
+                "average_score": 0,
+                "sample_count": len(per_sample),
+                "pass": False,
+                "ratio_compliant_samples": 0,
+                "compression_count": 0,
+                "retry_triggered": False,
+                "samples": per_sample,
+                "final_pass_fail_reason": "insufficient_reliable_alignment",
+            }
+        },
+        "best_model": model,
+        "pass": False,
+        "prompt_iteration": ACTIVE_PROMPT_ITERATION,
+        "enable_paragraph_alignment": True,
+        "enable_compression_pass": False,
+        "compression_count": 0,
+    }
 
 
 def run_candidate_validation_once(
@@ -2582,6 +2935,56 @@ def run_candidate_validation_once(
         sample_count=sample_count,
     )
     run_dir = Path(prepared["run_dir"])
+    if any(
+        sample.get("accepted_for_stable_validation") is False
+        for sample in prepared["selected_samples"]
+    ):
+        style = build_style_profile(
+            run_dir,
+            chapters=1,
+            max_source_chars=min(DEFAULT_LIMITS["style_learning_max_source_chars"], max_source_chars),
+            max_target_chars=min(DEFAULT_LIMITS["style_learning_max_target_chars"], max_target_chars),
+        )
+        report = stable_alignment_failure_report(
+            project=project,
+            model=model,
+            samples=prepared["selected_samples"],
+        )
+        write_json(run_dir / "evaluation_report.json", report)
+        _write_eval_markdown(run_dir, report)
+        write_prompt_iteration_log(
+            run_dir,
+            iteration=ACTIVE_PROMPT_ITERATION,
+            change="MVP4.8.6 strict stable validation rejected unreliable paragraph alignment.",
+            why="Stable prompt validation cannot use samples with low source/reference alignment quality.",
+            report=report,
+        )
+        return {
+            "validation_index": validation_index,
+            "run_dir": str(run_dir),
+            "sample_start_ratio": sample_start_ratio,
+            "selected_samples": [
+                {
+                    "sample_id": sample["sample_id"],
+                    "chapter_id": sample["chapter_id"],
+                    "source_char_count": sample["source_char_count"],
+                    "target_char_count": sample["target_char_count"],
+                    "paragraph_pair_count": len(sample.get("paragraph_pairs", [])),
+                    "warnings": sample.get("paragraph_alignment_warnings", []),
+                    "alignment_quality": sample.get("alignment_quality"),
+                    "alignment_warnings": sample.get("alignment_warnings", []),
+                    "accepted_for_stable_validation": sample.get(
+                        "accepted_for_stable_validation"
+                    ),
+                }
+                for sample in prepared["selected_samples"]
+            ],
+            "style_profile": style["style_profile"],
+            "translations": {},
+            "report": report,
+            "candidate_prompt_sha256": sha256_text(stable_prompt_text),
+            "alignment_gate_failed": True,
+        }
     style = build_style_profile(
         run_dir,
         chapters=1,
@@ -2625,6 +3028,9 @@ def run_candidate_validation_once(
                 "target_char_count": sample["target_char_count"],
                 "paragraph_pair_count": len(sample.get("paragraph_pairs", [])),
                 "warnings": sample.get("paragraph_alignment_warnings", []),
+                "alignment_quality": sample.get("alignment_quality"),
+                "alignment_warnings": sample.get("alignment_warnings", []),
+                "accepted_for_stable_validation": sample.get("accepted_for_stable_validation"),
             }
             for sample in prepared["selected_samples"]
         ],
@@ -2660,6 +3066,15 @@ def stable_gate_result(
         total_scores.append(average_score)
         compression_counts.append(int(model_report.get("compression_count") or 0))
         run_reasons = []
+        if run.get("alignment_gate_failed"):
+            run_reasons.append("insufficient_reliable_alignment")
+        for selected_sample in run.get("selected_samples", []):
+            if selected_sample.get("accepted_for_stable_validation") is False:
+                run_reasons.append(
+                    f"{selected_sample.get('sample_id')}:alignment_quality_below_threshold"
+                )
+        if model_report.get("pass") is not True:
+            run_reasons.append("model_report_not_pass")
         if average_score < 80:
             run_reasons.append("average_score_below_80")
         for sample in model_report.get("samples", []):
@@ -2667,8 +3082,23 @@ def stable_gate_result(
             ratios.append(ratio)
             sample_reasons = []
             ratio_justification = None
+            if sample.get("pass") is not True:
+                sample_reasons.append("evaluator_sample_not_pass")
             if sample.get("total_score", 0) < 75:
                 sample_reasons.append("sample_score_below_75")
+            if sample.get("accepted_for_stable_validation") is False:
+                sample_reasons.append("alignment_quality_below_threshold")
+            verification_reasons = sample.get("verification_reasons", []) or []
+            if "meaning_accuracy_below_threshold" in sample.get("final_pass_fail_reason", ""):
+                sample_reasons.append("meaning_accuracy_below_threshold")
+            if "paragraph_truncation_detected" in verification_reasons or sample.get(
+                "truncated_paragraphs"
+            ):
+                sample_reasons.append("paragraph_truncation_detected")
+            if "unsafe_compression" in verification_reasons:
+                sample_reasons.append("unsafe_compression")
+            if "alignment_quality_below_threshold" in verification_reasons:
+                sample_reasons.append("alignment_quality_below_threshold")
             gates = sample.get("gates", {})
             if gates.get("severe_hallucination"):
                 sample_reasons.append("severe_hallucination")
@@ -2704,6 +3134,12 @@ def stable_gate_result(
                     "output_reference_ratio": ratio,
                     "compression_count": sample.get("compression_count", 0),
                     "ratio_justification": ratio_justification,
+                    "verification_reasons": verification_reasons,
+                    "truncated_paragraphs": sample.get("truncated_paragraphs", []),
+                    "alignment_quality": sample.get("alignment_quality"),
+                    "accepted_for_stable_validation": sample.get(
+                        "accepted_for_stable_validation"
+                    ),
                     "reasons": sorted(set(sample_reasons)),
                 }
             )
@@ -2789,6 +3225,11 @@ def write_cached_eval_exports(
                 paragraph_id = pair["paragraph_id"]
                 before = initial_lookup.get(paragraph_id, "")
                 after = final_lookup.get(paragraph_id, "")
+                truncation = detect_truncated_vietnamese(
+                    after,
+                    source_text=pair.get("source_text"),
+                    strict_max=pair.get("strict_max"),
+                )
                 replay_rows.append(
                     {
                         "validation_index": run["validation_index"],
@@ -2807,6 +3248,14 @@ def write_cached_eval_exports(
                         "after_char_count": len(after),
                         "ratio_before": round(len(before) / max(pair.get("target_char_count", 0), 1), 3),
                         "ratio_after": round(len(after) / max(pair.get("target_char_count", 0), 1), 3),
+                        "strict_max": pair.get("strict_max"),
+                        "truncation_detected": truncation["is_truncated"],
+                        "truncation_reasons": truncation["reasons"],
+                        "alignment_quality": sample.get("alignment_quality"),
+                        "alignment_warnings": sample.get("alignment_warnings", []),
+                        "accepted_for_stable_validation": sample.get(
+                            "accepted_for_stable_validation"
+                        ),
                         "score_notes": score_notes,
                         "sample_score": {
                             "total_score": sample_score.get("total_score"),
@@ -2833,6 +3282,10 @@ def write_cached_eval_exports(
                 f"- Ratio before: `{row['ratio_before']}`",
                 f"- Ratio after: `{row['ratio_after']}`",
                 f"- Score reason: `{row['sample_score'].get('reason')}`",
+                f"- Truncation detected: `{row['truncation_detected']}`",
+                f"- Truncation reasons: `{json_dumps(row['truncation_reasons'])}`",
+                f"- Alignment quality: `{row.get('alignment_quality')}`",
+                f"- Eligible for stable validation: `{row.get('accepted_for_stable_validation')}`",
                 "",
                 "Source:",
                 "",
@@ -2860,8 +3313,8 @@ def write_cached_eval_exports(
     table_lines = [
         "# Paragraph Review Table",
         "",
-        "| Run | Sample | Paragraph | Ref Chars | Before | After | Ratio Before | Ratio After | Warnings | Source | Reference | After |",
-        "|---:|---|---|---:|---:|---:|---:|---:|---|---|---|---|",
+        "| Run | Sample | Paragraph | Ref Chars | Before | After | Ratio Before | Ratio After | Truncated | Reasons | Align Quality | Eligible | Warnings | Source | Reference | After |",
+        "|---:|---|---|---:|---:|---:|---:|---:|---|---|---:|---|---|---|---|---|",
     ]
     for row in replay_rows:
         table_lines.append(
@@ -2876,6 +3329,10 @@ def write_cached_eval_exports(
                     str(row["after_char_count"]),
                     str(row["ratio_before"]),
                     str(row["ratio_after"]),
+                    str(row["truncation_detected"]),
+                    _snippet("; ".join(row["truncation_reasons"]), 80).replace("|", "\\|"),
+                    str(row.get("alignment_quality")),
+                    str(row.get("accepted_for_stable_validation")),
                     _snippet("; ".join(row["warnings"]), 80).replace("|", "\\|"),
                     _snippet(row["source_paragraph"], 120).replace("|", "\\|"),
                     _snippet(row["human_reference_paragraph"], 120).replace("|", "\\|"),
@@ -3037,6 +3494,16 @@ def validate_stable_prompt(
         validation_runs=validation_runs,
         selected_model=model,
     )
+    strict_replay = replay_cached_eval(validation_root)
+    if not strict_replay["quality_summary"].get("strict_replay_pass"):
+        gate = {
+            **gate,
+            "pass": False,
+            "reasons": sorted(
+                set(gate.get("reasons", []) + ["cached_replay_strict_gate_failed"])
+            ),
+            "strict_replay_quality_summary": strict_replay["quality_summary"],
+        }
     decision_outputs = write_stable_decision_outputs(
         validation_root=validation_root,
         candidate=candidate,
@@ -3055,6 +3522,8 @@ def validate_stable_prompt(
         "stable_run_count": stable_run_count,
         "validation_runs": validation_runs,
         "gate": gate,
+        "quality_gate": "pass" if gate["pass"] else "fail",
+        "strict_replay": strict_replay,
         "replay_exports": replay_exports,
         "decision_outputs": decision_outputs,
         "pass": gate["pass"],
@@ -3130,6 +3599,13 @@ def _replay_quality_summary(report: dict[str, Any]) -> dict[str, Any]:
         "paragraph_count": len(report.get("paragraph_diagnostics", [])),
         "ratio_summary": report.get("overall", {}).get("ratio_after_summary"),
         "all_samples_pass": report.get("overall", {}).get("all_samples_pass"),
+        "strict_replay_pass": report.get("overall", {}).get("strict_replay_pass"),
+        "truncated_paragraph_count": report.get("overall", {}).get(
+            "truncated_paragraph_count"
+        ),
+        "low_alignment_quality_sample_count": len(
+            report.get("overall", {}).get("low_alignment_quality_samples", [])
+        ),
     }
 
 
@@ -3148,6 +3624,24 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
         paragraph_id = str(row.get("paragraph_id") or "")
         ratio_before = _float_or_none(row.get("ratio_before"))
         ratio_after = _float_or_none(row.get("ratio_after"))
+        after_text = row.get("model_paragraph_after_compression", "")
+        truncation = {
+            "is_truncated": bool(row.get("truncation_detected")),
+            "reasons": row.get("truncation_reasons", []) or [],
+        }
+        if "truncation_detected" not in row:
+            truncation = detect_truncated_vietnamese(
+                str(after_text),
+                source_text=str(row.get("source_paragraph", "")),
+                strict_max=row.get("strict_max"),
+            )
+        alignment_quality = row.get("alignment_quality")
+        if alignment_quality is None:
+            warnings = row.get("warnings", []) or []
+            alignment_quality = 0.2 if any("paragraph_count_mismatch" in item or "merged" in item for item in warnings) else 1.0
+        accepted_for_stable = row.get("accepted_for_stable_validation")
+        if accepted_for_stable is None:
+            accepted_for_stable = float(alignment_quality) >= ALIGNMENT_QUALITY_THRESHOLD
         sample_score = row.get("sample_score") if isinstance(row.get("sample_score"), dict) else {}
         key = (validation_index, sample_id)
         sample_summary = sample_map.setdefault(
@@ -3161,6 +3655,9 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 "pass": sample_score.get("pass"),
                 "reason": sample_score.get("reason"),
                 "warnings": [],
+                "alignment_quality": alignment_quality,
+                "accepted_for_stable_validation": accepted_for_stable,
+                "truncated_paragraphs": [],
                 "ratio_before_values": [],
                 "ratio_after_values": [],
             },
@@ -3173,6 +3670,13 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
         for warning in row.get("warnings", []) or []:
             if warning not in sample_summary["warnings"]:
                 sample_summary["warnings"].append(warning)
+        for warning in row.get("alignment_warnings", []) or []:
+            if warning not in sample_summary["warnings"]:
+                sample_summary["warnings"].append(warning)
+        if truncation["is_truncated"]:
+            sample_summary["truncated_paragraphs"].append(
+                {"paragraph_id": paragraph_id, "reasons": truncation["reasons"]}
+            )
         paragraph_diagnostics.append(
             {
                 "validation_index": validation_index,
@@ -3186,6 +3690,10 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 "ratio_after": ratio_after,
                 "score_notes": row.get("score_notes", {}),
                 "warnings": row.get("warnings", []),
+                "alignment_quality": alignment_quality,
+                "accepted_for_stable_validation": accepted_for_stable,
+                "truncation_detected": truncation["is_truncated"],
+                "truncation_reasons": truncation["reasons"],
                 "source_paragraph": row.get("source_paragraph", ""),
                 "human_reference_paragraph": row.get("human_reference_paragraph", ""),
                 "model_paragraph_before_compression": row.get(
@@ -3211,6 +3719,22 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
             "max": max(after_values) if after_values else None,
             "average": _mean(after_values),
         }
+        if sample["truncated_paragraphs"]:
+            sample["pass"] = False
+            reason = sample.get("reason")
+            sample["reason"] = (
+                f"{reason}, paragraph_truncation_detected"
+                if reason and reason != "pass"
+                else "paragraph_truncation_detected"
+            )
+        if sample.get("accepted_for_stable_validation") is False:
+            sample["pass"] = False
+            reason = sample.get("reason")
+            sample["reason"] = (
+                f"{reason}, alignment_quality_below_threshold"
+                if reason and reason != "pass"
+                else "alignment_quality_below_threshold"
+            )
         per_sample.append(sample)
     per_sample.sort(key=lambda item: (item["validation_index"], item["sample_id"]))
 
@@ -3264,9 +3788,35 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
         for diagnostic in paragraph_diagnostics
         if diagnostic.get("ratio_after") is not None
     ]
+    truncated_paragraphs = [
+        {
+            "validation_index": diagnostic["validation_index"],
+            "sample_id": diagnostic["sample_id"],
+            "paragraph_id": diagnostic["paragraph_id"],
+            "reasons": diagnostic["truncation_reasons"],
+        }
+        for diagnostic in paragraph_diagnostics
+        if diagnostic.get("truncation_detected")
+    ]
+    low_quality_samples = [
+        {
+            "validation_index": sample["validation_index"],
+            "sample_id": sample["sample_id"],
+            "alignment_quality": sample.get("alignment_quality"),
+            "warnings": sample.get("warnings", []),
+        }
+        for sample in per_sample
+        if sample.get("accepted_for_stable_validation") is False
+    ]
+    all_samples_pass = bool(per_sample) and all(sample.get("pass") is True for sample in per_sample)
+    strict_replay_pass = all_samples_pass and not truncated_paragraphs and not low_quality_samples
     overall = {
         "average_score": round(sum(all_scores) / len(all_scores), 2) if all_scores else None,
-        "all_samples_pass": all(sample.get("pass") is not False for sample in per_sample),
+        "all_samples_pass": all_samples_pass,
+        "strict_replay_pass": strict_replay_pass,
+        "truncated_paragraph_count": len(truncated_paragraphs),
+        "truncated_paragraphs": truncated_paragraphs,
+        "low_alignment_quality_samples": low_quality_samples,
         "ratio_after_summary": {
             "min": min(all_after_ratios) if all_after_ratios else None,
             "max": max(all_after_ratios) if all_after_ratios else None,
@@ -3296,13 +3846,27 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
         f"- Selected model: `{report.get('selected_model')}`",
         f"- Average score: `{overall.get('average_score')}`",
         f"- All samples pass: `{overall.get('all_samples_pass')}`",
+        f"- Strict replay pass: `{overall.get('strict_replay_pass')}`",
+        f"- Truncated paragraphs: `{overall.get('truncated_paragraph_count')}`",
         f"- Paragraph rows: `{report.get('row_count')}`",
         "",
+    ]
+    if not overall.get("strict_replay_pass"):
+        lines.extend(
+            [
+                "> WARNING: This cached run fails the strict MVP4.8.6 replay gate. "
+                "Do not approve or use its stable prompt for production.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
         "## Runs",
         "",
         "| Run | Samples | Average Score | Ratio Min | Ratio Avg | Ratio Max | Pass |",
         "|---:|---:|---:|---:|---:|---:|---|",
-    ]
+        ]
+    )
     for run in report["per_run"]:
         ratios = run["ratio_after_summary"]
         lines.append(
@@ -3325,8 +3889,8 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
             "",
             "## Samples",
             "",
-            "| Run | Sample | Chapter | Score | Pass | Ratio Avg | Paragraphs | Reason |",
-            "|---:|---|---:|---:|---|---:|---:|---|",
+            "| Run | Sample | Chapter | Score | Pass | Ratio Avg | Paragraphs | Alignment | Truncated | Reason |",
+            "|---:|---|---:|---:|---|---:|---:|---:|---:|---|",
         ]
     )
     for sample in report["per_sample"]:
@@ -3341,6 +3905,8 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
                     str(sample.get("pass")),
                     str(sample["ratio_after_summary"]["average"]),
                     str(sample["paragraph_count"]),
+                    str(sample.get("alignment_quality")),
+                    str(len(sample.get("truncated_paragraphs", []))),
                     _md_cell(sample.get("reason"), 90),
                 ]
             )
@@ -3351,8 +3917,8 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
             "",
             "## Paragraph Diagnostics",
             "",
-            "| Run | Sample | Paragraph | Ref Chars | Before | After | Ratio Before | Ratio After | Source | Reference | Final |",
-            "|---:|---|---|---:|---:|---:|---:|---:|---|---|---|",
+            "| Run | Sample | Paragraph | Ref Chars | Before | After | Ratio Before | Ratio After | Truncated | Reasons | Alignment | Eligible | Source | Reference | Final |",
+            "|---:|---|---|---:|---:|---:|---:|---:|---|---|---:|---|---|---|---|",
         ]
     )
     for diagnostic in report["paragraph_diagnostics"]:
@@ -3368,6 +3934,10 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
                     str(diagnostic.get("after_char_count")),
                     str(diagnostic.get("ratio_before")),
                     str(diagnostic.get("ratio_after")),
+                    str(diagnostic.get("truncation_detected")),
+                    _md_cell("; ".join(diagnostic.get("truncation_reasons", [])), 80),
+                    str(diagnostic.get("alignment_quality")),
+                    str(diagnostic.get("accepted_for_stable_validation")),
                     _md_cell(diagnostic.get("source_paragraph"), 100),
                     _md_cell(diagnostic.get("human_reference_paragraph"), 100),
                     _md_cell(diagnostic.get("model_paragraph_after_compression"), 100),
@@ -3376,6 +3946,85 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
             + " |"
         )
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def write_replay_human_review_exports(run_dir: Path, report: dict[str, Any]) -> None:
+    review_lines = ["# Human Review Samples", ""]
+    for diagnostic in report["paragraph_diagnostics"]:
+        review_lines.extend(
+            [
+                (
+                    f"## Run {diagnostic['validation_index']} / "
+                    f"{diagnostic['sample_id']} / {diagnostic['paragraph_id']}"
+                ),
+                "",
+                f"- Truncation detected: `{diagnostic.get('truncation_detected')}`",
+                f"- Truncation reasons: `{json_dumps(diagnostic.get('truncation_reasons', []))}`",
+                f"- Alignment quality: `{diagnostic.get('alignment_quality')}`",
+                (
+                    "- Eligible for stable validation: "
+                    f"`{diagnostic.get('accepted_for_stable_validation')}`"
+                ),
+                f"- Ratio before: `{diagnostic.get('ratio_before')}`",
+                f"- Ratio after: `{diagnostic.get('ratio_after')}`",
+                "",
+                "Source:",
+                "",
+                diagnostic.get("source_paragraph", ""),
+                "",
+                "Human reference:",
+                "",
+                diagnostic.get("human_reference_paragraph", ""),
+                "",
+                "Model before compression:",
+                "",
+                diagnostic.get("model_paragraph_before_compression", ""),
+                "",
+                "Model after compression:",
+                "",
+                diagnostic.get("model_paragraph_after_compression", ""),
+                "",
+            ]
+        )
+    (run_dir / "human_review_samples.md").write_text(
+        "\n".join(review_lines).rstrip() + "\n",
+        encoding="utf-8",
+    )
+
+    table_lines = [
+        "# Paragraph Review Table",
+        "",
+        "| Run | Sample | Paragraph | Ref Chars | Before | After | Ratio Before | Ratio After | Truncated | Reasons | Alignment | Eligible | Source | Reference | After |",
+        "|---:|---|---|---:|---:|---:|---:|---:|---|---|---:|---|---|---|---|",
+    ]
+    for diagnostic in report["paragraph_diagnostics"]:
+        table_lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(diagnostic["validation_index"]),
+                    _md_cell(diagnostic["sample_id"], 50),
+                    _md_cell(diagnostic["paragraph_id"], 30),
+                    str(diagnostic.get("reference_char_count")),
+                    str(diagnostic.get("before_char_count")),
+                    str(diagnostic.get("after_char_count")),
+                    str(diagnostic.get("ratio_before")),
+                    str(diagnostic.get("ratio_after")),
+                    str(diagnostic.get("truncation_detected")),
+                    _md_cell("; ".join(diagnostic.get("truncation_reasons", [])), 80),
+                    str(diagnostic.get("alignment_quality")),
+                    str(diagnostic.get("accepted_for_stable_validation")),
+                    _md_cell(diagnostic.get("source_paragraph"), 100),
+                    _md_cell(diagnostic.get("human_reference_paragraph"), 100),
+                    _md_cell(diagnostic.get("model_paragraph_after_compression"), 100),
+                ]
+            )
+            + " |"
+        )
+    (run_dir / "paragraph_review_table.md").write_text(
+        "\n".join(table_lines) + "\n",
+        encoding="utf-8",
+    )
 
 
 def replay_cached_eval(run: str | Path) -> dict[str, Any]:
@@ -3391,10 +4040,29 @@ def replay_cached_eval(run: str | Path) -> dict[str, Any]:
     report_md_path = run_dir / "replay_report.md"
     write_json(report_json_path, report)
     write_replay_report_md(report_md_path, report)
+    write_replay_human_review_exports(run_dir, report)
+    invalidation_path = None
+    if (run_dir / "stable_prompt.md").exists() and not report["overall"].get("strict_replay_pass"):
+        invalidation = {
+            "schema_version": "stable_prompt_invalidated_v1",
+            "reason": "strict_cached_replay_failed",
+            "created_at": utc_now(),
+            "stable_prompt_path": str(run_dir / "stable_prompt.md"),
+            "stable_prompt_metadata_path": str(run_dir / "stable_prompt_metadata.json"),
+            "quality_summary": _replay_quality_summary(report),
+            "truncated_paragraphs": report["overall"].get("truncated_paragraphs", []),
+            "low_alignment_quality_samples": report["overall"].get(
+                "low_alignment_quality_samples", []
+            ),
+        }
+        invalidation_path = run_dir / "stable_prompt_invalidated.json"
+        write_json(invalidation_path, invalidation)
     return {
         "run_dir": str(run_dir),
         "replay_report": str(report_json_path),
         "replay_report_md": str(report_md_path),
+        "stable_prompt_invalidated": bool(invalidation_path),
+        "stable_prompt_invalidated_path": str(invalidation_path) if invalidation_path else None,
         "quality_summary": _replay_quality_summary(report),
         "per_run": report["per_run"],
         "per_sample": report["per_sample"],
@@ -3447,6 +4115,10 @@ def stable_prompt_review(
         "stable_prompt_modified": False,
     }
     if approve:
+        if not replay_result["quality_summary"].get("strict_replay_pass"):
+            raise ValueError(
+                "Stable prompt cannot be approved because strict cached replay failed."
+            )
         payload = {**base_payload, "decision": "approved"}
         output_path = run_dir / "stable_prompt_approval.json"
         write_json(output_path, payload)
