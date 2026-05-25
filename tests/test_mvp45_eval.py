@@ -14,15 +14,19 @@ from nts_core.eval_harness import (
     add_paragraph_alignment,
     compress_offending_paragraphs,
     create_paragraph_alignment,
+    freeze_stable_candidate,
     limited_style_prompt,
     load_eval_provider,
     mask_api_key,
     normalize_provider_type,
     render_paragraph_translation,
     split_text_paragraphs,
+    stable_gate_result,
     translation_system_prompt,
     validate_paragraph_translation,
     validate_eval_provider,
+    write_cached_eval_exports,
+    write_stable_decision_outputs,
 )
 
 
@@ -536,3 +540,277 @@ def test_translation_prompt_includes_length_and_fixed_glossary(
     assert "Return JSON only" in paragraph_prompt
     assert "Per-paragraph length budgets" in paragraph_prompt
     assert "target_max" in paragraph_prompt
+
+
+def stable_sample_score(sample_id: str, total_score: int = 86, ratio: float = 1.0) -> dict:
+    return {
+        "sample_id": sample_id,
+        "total_score": total_score,
+        "pass": True,
+        "output_reference_ratio": ratio,
+        "compression_count": 1,
+        "terminology_mismatches": [],
+        "gates": {
+            "severe_hallucination": False,
+            "wrong_main_character_name": False,
+            "major_skipped_passage": False,
+            "length_in_range": True,
+        },
+        "notes": {"heuristic_only": True},
+        "final_pass_fail_reason": "pass",
+    }
+
+
+def stable_validation_run(index: int, prompt_hash: str, *, include_failing_gpt55: bool = False) -> dict:
+    models = {
+        "gpt-5.4-mini": {
+            "average_score": 86,
+            "pass": True,
+            "compression_count": 3,
+            "samples": [
+                stable_sample_score("sample_1", 87, 1.0),
+                stable_sample_score("sample_2", 86, 1.1),
+                stable_sample_score("sample_3", 85, 0.95),
+            ],
+        }
+    }
+    if include_failing_gpt55:
+        models["gpt-5.5"] = {
+            "average_score": 10,
+            "pass": False,
+            "compression_count": 0,
+            "samples": [
+                {
+                    **stable_sample_score("sample_1", 10, 0.1),
+                    "pass": False,
+                    "gates": {
+                        "severe_hallucination": True,
+                        "wrong_main_character_name": False,
+                        "major_skipped_passage": True,
+                        "length_in_range": False,
+                    },
+                }
+            ],
+        }
+    return {
+        "validation_index": index,
+        "run_dir": f"run_{index}",
+        "sample_start_ratio": 0.0,
+        "candidate_prompt_sha256": prompt_hash,
+        "report": {"models": models},
+    }
+
+
+def test_stable_candidate_freeze_and_prompt_hash(tmp_path: Path) -> None:
+    root = tmp_path / "stable"
+    root.mkdir()
+    candidate = freeze_stable_candidate(
+        validation_root=root,
+        project="han-jue",
+        provider_key="mock",
+        model="gpt-5.4-mini",
+        source_eval_run=None,
+        settings={
+            "enable_paragraph_alignment": True,
+            "enable_compression_pass": True,
+            "stable_run_count": 3,
+        },
+    )
+
+    assert (root / "candidate_prompt.md").exists()
+    assert (root / "candidate_prompt_metadata.json").exists()
+    metadata = json.loads((root / "candidate_prompt_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["prompt_sha256"] == candidate["metadata"]["prompt_sha256"]
+    assert metadata["model"] == "gpt-5.4-mini"
+    assert "Return JSON only" in candidate["prompt_text"]
+
+
+def test_stable_gate_requires_unchanged_prompt_and_ignores_unselected_model() -> None:
+    prompt_hash = "sha256:" + "a" * 64
+    runs = [
+        stable_validation_run(1, prompt_hash, include_failing_gpt55=True),
+        stable_validation_run(2, prompt_hash, include_failing_gpt55=True),
+        stable_validation_run(3, prompt_hash, include_failing_gpt55=True),
+    ]
+
+    gate = stable_gate_result(
+        validation_runs=runs,
+        selected_model="gpt-5.4-mini",
+        expected_prompt_sha256=prompt_hash,
+    )
+    assert gate["pass"] is True
+
+    changed = [*runs]
+    changed[2] = {**changed[2], "candidate_prompt_sha256": "sha256:" + "b" * 64}
+    changed_gate = stable_gate_result(
+        validation_runs=changed,
+        selected_model="gpt-5.4-mini",
+        expected_prompt_sha256=prompt_hash,
+    )
+    assert changed_gate["pass"] is False
+    assert "candidate_prompt_changed_across_runs" in changed_gate["reasons"]
+
+
+def test_stable_decision_outputs_success_and_failure(tmp_path: Path) -> None:
+    root = tmp_path / "stable-pass"
+    root.mkdir()
+    candidate = freeze_stable_candidate(
+        validation_root=root,
+        project="han-jue",
+        provider_key="mock",
+        model="gpt-5.4-mini",
+        source_eval_run=None,
+        settings={"enable_paragraph_alignment": True, "enable_compression_pass": True},
+    )
+    prompt_hash = candidate["metadata"]["prompt_sha256"]
+    runs = [stable_validation_run(1, prompt_hash)]
+    gate = stable_gate_result(
+        validation_runs=runs,
+        selected_model="gpt-5.4-mini",
+        expected_prompt_sha256=prompt_hash,
+    )
+    result = write_stable_decision_outputs(
+        validation_root=root,
+        candidate=candidate,
+        validation_runs=runs,
+        gate=gate,
+        provider_key="mock",
+        model="gpt-5.4-mini",
+    )
+    assert result["stable_prompt_created"] is True
+    assert (root / "stable_prompt.md").exists()
+    assert (root / "stable_prompt_metadata.json").exists()
+
+    fail_root = tmp_path / "stable-fail"
+    fail_root.mkdir()
+    fail_candidate = freeze_stable_candidate(
+        validation_root=fail_root,
+        project="han-jue",
+        provider_key="mock",
+        model="gpt-5.4-mini",
+        source_eval_run=None,
+        settings={"enable_paragraph_alignment": True, "enable_compression_pass": True},
+    )
+    fail_run = stable_validation_run(1, fail_candidate["metadata"]["prompt_sha256"])
+    fail_run["report"]["models"]["gpt-5.4-mini"]["samples"][0]["total_score"] = 70
+    fail_gate = stable_gate_result(
+        validation_runs=[fail_run],
+        selected_model="gpt-5.4-mini",
+        expected_prompt_sha256=fail_candidate["metadata"]["prompt_sha256"],
+    )
+    fail_result = write_stable_decision_outputs(
+        validation_root=fail_root,
+        candidate=fail_candidate,
+        validation_runs=[fail_run],
+        gate=fail_gate,
+        provider_key="mock",
+        model="gpt-5.4-mini",
+    )
+    assert fail_result["stable_prompt_created"] is False
+    assert not (fail_root / "stable_prompt.md").exists()
+    assert (fail_root / "stable_candidate_failure_report.md").exists()
+
+
+def test_cached_replay_and_human_review_exports_created(tmp_path: Path) -> None:
+    validation_root = tmp_path / "stable"
+    validation_root.mkdir()
+    run_dir = tmp_path / "eval_run"
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "甲。\n\n乙。",
+            "target_text": "Một.\n\nHai.",
+            "target_char_count": len("Một.\n\nHai."),
+        }
+    )
+    (run_dir / "translation_outputs" / "sample_1").mkdir(parents=True)
+    (run_dir / "selected_samples.json").write_text(
+        json.dumps({"samples": [sample]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    structured = {
+        "paragraphs": [
+            {"paragraph_id": "p001", "text": "Một."},
+            {"paragraph_id": "p002", "text": "Hai."},
+        ]
+    }
+    for suffix in ["structured_initial", "structured_final"]:
+        (run_dir / "translation_outputs" / "sample_1" / f"gpt-5.4-mini_{suffix}.json").write_text(
+            json.dumps(structured, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    validation_runs = [
+        {
+            "validation_index": 1,
+            "run_dir": str(run_dir),
+            "report": {
+                "models": {
+                    "gpt-5.4-mini": {
+                        "samples": [stable_sample_score("sample_1")],
+                    }
+                }
+            },
+        }
+    ]
+
+    exports = write_cached_eval_exports(
+        validation_root=validation_root,
+        validation_runs=validation_runs,
+        selected_model="gpt-5.4-mini",
+    )
+
+    assert exports["row_count"] == 2
+    assert (validation_root / "cached_eval_replay.json").exists()
+    assert (validation_root / "human_review_samples.md").exists()
+    assert (validation_root / "paragraph_review_table.md").exists()
+
+
+def test_validate_stable_prompt_mock_command_creates_replay_and_failure_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    raw, epub = write_eval_inputs(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "validate-stable-prompt",
+            "--project",
+            "han-jue-stable-test",
+            "--raw",
+            str(raw),
+            "--translated",
+            str(epub),
+            "--provider",
+            "mock",
+            "--model",
+            "mock-stable",
+            "--max-chapters",
+            "1",
+            "--sample-count",
+            "1",
+            "--max-source-chars",
+            "80",
+            "--max-target-chars",
+            "140",
+            "--stable-run-count",
+            "1",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    root = Path(data["validation_root"])
+    assert (root / "candidate_prompt.md").exists()
+    assert (root / "candidate_prompt_metadata.json").exists()
+    assert (root / "cached_eval_replay.json").exists()
+    assert (root / "human_review_samples.md").exists()
+    assert (root / "paragraph_review_table.md").exists()
+    if data["pass"]:
+        assert (root / "stable_prompt.md").exists()
+    else:
+        assert not (root / "stable_prompt.md").exists()
+        assert (root / "stable_candidate_failure_report.md").exists()

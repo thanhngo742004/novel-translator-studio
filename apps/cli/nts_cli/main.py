@@ -20,6 +20,7 @@ from nts_core.eval_harness import (
     prepare_parallel,
     run_full,
     translate_sample,
+    validate_stable_prompt,
 )
 from nts_core.export_compiler import compile_export_bundle
 from nts_core.manga import (
@@ -784,6 +785,60 @@ def eval_run_full(
             target_length_tolerance=target_length_tolerance,
             enable_paragraph_alignment=enable_paragraph_alignment,
             enable_compression_pass=enable_compression_pass,
+        )
+    except ValueError as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@eval_app.command("validate-stable-prompt")
+def eval_validate_stable_prompt(
+    project: Annotated[str, typer.Option("--project", help="Eval project key.")],
+    raw: Annotated[Path, typer.Option("--raw", help="Chinese raw text file.")],
+    translated: Annotated[Path, typer.Option("--translated", help="Vietnamese translated EPUB.")],
+    provider: Annotated[str, typer.Option("--provider")] = "mock",
+    model: Annotated[str, typer.Option("--model")] = "mock-eval",
+    max_chapters: Annotated[int, typer.Option("--max-chapters")] = DEFAULT_LIMITS[
+        "alignment_max_chapters"
+    ],
+    sample_count: Annotated[int, typer.Option("--sample-count")] = 3,
+    max_source_chars: Annotated[int, typer.Option("--max-source-chars")] = DEFAULT_LIMITS[
+        "translation_sample_max_source_chars"
+    ],
+    max_target_chars: Annotated[int, typer.Option("--max-target-chars")] = DEFAULT_LIMITS[
+        "evaluation_max_target_chars"
+    ],
+    enable_paragraph_alignment: Annotated[
+        bool,
+        typer.Option(
+            "--enable-paragraph-alignment/--disable-paragraph-alignment",
+            help="Use paragraph-level eval alignment and structured output.",
+        ),
+    ] = True,
+    enable_compression_pass: Annotated[
+        bool,
+        typer.Option(
+            "--enable-compression-pass/--disable-compression-pass",
+            help="Compress overlong paragraph outputs once.",
+        ),
+    ] = True,
+    stable_run_count: Annotated[int, typer.Option("--stable-run-count")] = 3,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        result = validate_stable_prompt(
+            project=project,
+            raw_path=raw,
+            translated_path=translated,
+            provider_key=provider,
+            model=model,
+            max_chapters=max_chapters,
+            sample_count=sample_count,
+            max_source_chars=max_source_chars,
+            max_target_chars=max_target_chars,
+            enable_paragraph_alignment=enable_paragraph_alignment,
+            enable_compression_pass=enable_compression_pass,
+            stable_run_count=stable_run_count,
         )
     except ValueError as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)

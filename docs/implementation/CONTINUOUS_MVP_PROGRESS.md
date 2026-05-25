@@ -305,3 +305,62 @@
   - No unit tests make real API calls; tests continue to use mock providers only.
 - Next recommended phase:
   - Add paragraph-level human review exports and a small cached eval replay tool so scoring/rubric changes can be inspected without repeating real API calls.
+
+## 2026-05-25T02:42:10+07:00
+
+- Completed: MVP4.8 stable prompt freeze, cached eval replay, and 3 consecutive real validation runs only.
+- Implemented:
+  - `nts eval validate-stable-prompt`.
+  - Frozen candidate prompt/config output:
+    - `candidate_prompt.md`
+    - `candidate_prompt_metadata.json`
+  - Stable validation aggregate output:
+    - `stable_validation_report.json`
+    - `stable_prompt.md` on pass only
+    - `stable_prompt_metadata.json` on pass only
+    - `stable_candidate_failure_report.md` on fail only
+  - Cached review/replay outputs:
+    - `cached_eval_replay.json`
+    - `human_review_samples.md`
+    - `paragraph_review_table.md`
+  - Stable gate logic using the selected model only.
+  - Prompt hash tracking to verify the candidate prompt is unchanged across validation runs.
+  - Conservative source-eval-run discovery that skips stable aggregate folders and freezes from the latest real eval run with selected samples.
+  - Compression floor repair so over-compressed paragraphs can restore strict-budget text from pre-compression output.
+  - Narrow explicit ratio justification support for near-boundary lower-ratio cases; the final passing run did not need it because all ratios were within 0.85-1.25.
+- Commands run:
+  - `python -m pytest`
+  - `python -m nts_cli.main eval validate-stable-prompt --help`
+  - `python -m nts_cli.main eval validate-stable-prompt --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4-mini --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --enable-paragraph-alignment --enable-compression-pass --stable-run-count 3 --json`
+- Test result:
+  - `python -m pytest` -> 47 passed.
+- Final real stable validation result:
+  - Output folder: `artifacts/evaluations/han-jue_stable_1779650612543/`.
+  - Stable prompt created: true.
+  - Quality gate: pass.
+  - Selected model: `gpt-5.4-mini`.
+  - Overall average: 87.33.
+  - Ratio summary:
+    - min: 0.852
+    - max: 1.136
+    - average: 0.980
+  - Compression counts by run: 29, 30, 19.
+  - Run 1: average 88.33, pass.
+    - sample 1: score 90, ratio 0.925, compression 10.
+    - sample 2: score 88, ratio 1.126, compression 8.
+    - sample 3: score 87, ratio 1.136, compression 11.
+  - Run 2: average 88.00, pass.
+    - sample 1: score 89, ratio 0.869, compression 10.
+    - sample 2: score 88, ratio 1.060, compression 10.
+    - sample 3: score 87, ratio 0.983, compression 10.
+  - Run 3: average 85.67, pass.
+    - sample 1: score 90, ratio 0.924, compression 8.
+    - sample 2: score 83, ratio 0.943, compression 6.
+    - sample 3: score 84, ratio 0.852, compression 5.
+- Known limitations:
+  - Stable validation is still a limited three-run harness, not production batch translation.
+  - The stable prompt depends on paragraph alignment, compression, deterministic budget enforcement, and fixed-term repair.
+  - Cached replay is local artifact replay only; it does not re-score without running the current code.
+  - No pytest uses real API calls; tests continue to use mock providers only.
+- Next recommended phase:
+  - Add cached report re-scoring/replay command and human-review approval workflow before using the stable prompt for larger translation samples.

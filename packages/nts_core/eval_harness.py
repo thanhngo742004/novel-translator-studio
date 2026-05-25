@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import os
 import re
@@ -148,6 +149,10 @@ def read_json(path: Path) -> Any:
 
 def safe_model_name(model: str) -> str:
     return model.replace("/", "_").replace("\\", "_").replace(":", "_")
+
+
+def sha256_text(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def paragraph_count(text: str) -> int:
@@ -1189,6 +1194,44 @@ def enforce_fixed_terms_in_paragraphs(
     return repaired, repairs
 
 
+def enforce_global_length_floor(
+    sample: dict[str, Any],
+    before_paragraphs: list[dict[str, str]],
+    final_paragraphs: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    current = render_paragraph_translation(sample, final_paragraphs)
+    floor_chars = int(sample["target_char_count"] * EVAL_LENGTH_RATIO_MIN)
+    if len(current) >= floor_chars:
+        return final_paragraphs, []
+    pair_lookup = {pair["paragraph_id"]: pair for pair in sample.get("paragraph_pairs", [])}
+    before_lookup = {paragraph["paragraph_id"]: paragraph["text"] for paragraph in before_paragraphs}
+    updated = [dict(paragraph) for paragraph in final_paragraphs]
+    repairs = []
+    for paragraph in updated:
+        paragraph_id = paragraph["paragraph_id"]
+        pair = pair_lookup.get(paragraph_id)
+        before = before_lookup.get(paragraph_id, "")
+        if not pair or len(before) <= len(paragraph["text"]):
+            continue
+        candidate = clip_to_char_budget(before, pair["strict_max"])
+        if len(candidate) <= len(paragraph["text"]):
+            continue
+        before_count = len(paragraph["text"])
+        paragraph["text"] = candidate
+        repairs.append(
+            {
+                "paragraph_id": paragraph_id,
+                "before_char_count": before_count,
+                "after_char_count": len(candidate),
+                "strict_max": pair["strict_max"],
+                "reason": "restore_global_length_floor",
+            }
+        )
+        if len(render_paragraph_translation(sample, updated)) >= floor_chars:
+            break
+    return updated, repairs
+
+
 def verify_paragraph_output(
     sample: dict[str, Any],
     paragraphs: list[dict[str, str]],
@@ -1340,6 +1383,10 @@ def compress_offending_paragraphs(
             pair = pair_lookup[paragraph_id]
             model_after = after
             deterministic_clip_applied = False
+            deterministic_min_restore_applied = False
+            if len(after) < pair["target_min"] and len(before) >= pair["target_min"]:
+                after = clip_to_char_budget(before, pair["strict_max"])
+                deterministic_min_restore_applied = True
             if len(after) > pair["strict_max"]:
                 after = clip_to_char_budget(after, pair["strict_max"])
                 deterministic_clip_applied = True
@@ -1353,6 +1400,7 @@ def compress_offending_paragraphs(
                     "strict_max": pair["strict_max"],
                     "still_over_strict_max": len(after) > pair["strict_max"],
                     "deterministic_clip_applied": deterministic_clip_applied,
+                    "deterministic_min_restore_applied": deterministic_min_restore_applied,
                     "before_text": before,
                     "model_after_text": model_after,
                     "after_text": after,
@@ -1382,6 +1430,7 @@ def translate_sample(
     target_length_tolerance: float = 0.2,
     enable_paragraph_alignment: bool = True,
     enable_compression_pass: bool = True,
+    stable_prompt_text: str | None = None,
 ) -> dict[str, Any]:
     result = translate_samples(
         project=project,
@@ -1393,6 +1442,7 @@ def translate_sample(
         enable_paragraph_alignment=enable_paragraph_alignment,
         enable_compression_pass=enable_compression_pass,
         sample_limit=1,
+        stable_prompt_text=stable_prompt_text,
     )
     return {
         "run_dir": result["run_dir"],
@@ -1413,6 +1463,7 @@ def translate_samples(
     enable_compression_pass: bool = True,
     sample_limit: int | None = None,
     prompt_iteration: int = 1,
+    stable_prompt_text: str | None = None,
 ) -> dict[str, Any]:
     if not models:
         raise ValueError("At least one model must be provided.")
@@ -1436,7 +1487,7 @@ def translate_samples(
         sample_dir = translations_root / sample_id
         sample_dir.mkdir(parents=True, exist_ok=True)
         source = sample["source_text"][:max_source_chars]
-        system_prompt = translation_system_prompt(
+        system_prompt = stable_prompt_text or translation_system_prompt(
             run_dir,
             sample=sample,
             prompt_iteration=prompt_iteration,
@@ -1463,6 +1514,7 @@ def translate_samples(
             best_effort_used = False
             provider_error = None
             term_repairs: list[dict[str, Any]] = []
+            global_floor_repairs: list[dict[str, Any]] = []
 
             if model in failed_models:
                 provider_error = "skipped_after_previous_provider_error"
@@ -1577,6 +1629,13 @@ def translate_samples(
                 )
                 if term_repairs:
                     compression_result["term_repairs"] = term_repairs
+                final_paragraphs, global_floor_repairs = enforce_global_length_floor(
+                    sample,
+                    parsed,
+                    final_paragraphs,
+                )
+                if global_floor_repairs:
+                    compression_result["global_length_floor_repairs"] = global_floor_repairs
                 verification_after = verify_paragraph_output(
                     sample,
                     final_paragraphs,
@@ -1661,6 +1720,7 @@ def translate_samples(
                 "compression": compression_result,
                 "compression_count": len(compression_result.get("entries", [])),
                 "term_repair_count": len(term_repairs),
+                "global_length_floor_repair_count": len(global_floor_repairs),
                 "per_paragraph_length_table": verification_after.get("per_paragraph_length_table")
                 if verification_after
                 else None,
@@ -1679,6 +1739,7 @@ def translate_samples(
         "target_length_tolerance": target_length_tolerance,
         "enable_paragraph_alignment": enable_paragraph_alignment,
         "enable_compression_pass": enable_compression_pass,
+        "stable_prompt_sha256": sha256_text(stable_prompt_text) if stable_prompt_text else None,
     }
     write_json(translations_root / "translation_metadata.json", metadata_payload)
     write_json(
@@ -2303,6 +2364,7 @@ def run_full(
     target_length_tolerance: float = 0.2,
     enable_paragraph_alignment: bool = True,
     enable_compression_pass: bool = True,
+    stable_prompt_text: str | None = None,
 ) -> dict[str, Any]:
     prepared = prepare_parallel(
         project=project,
@@ -2332,6 +2394,7 @@ def run_full(
         enable_paragraph_alignment=enable_paragraph_alignment,
         enable_compression_pass=enable_compression_pass,
         prompt_iteration=ACTIVE_PROMPT_ITERATION,
+        stable_prompt_text=stable_prompt_text,
     )
     compared = compare_translation(
         project=project,
@@ -2356,6 +2419,667 @@ def run_full(
         "style_learning": style,
         "translations": translated["outputs"],
         "evaluation": compared["report"],
+    }
+
+
+def stable_base_prompt_text() -> str:
+    return "\n".join(
+        [
+            "Translate Chinese literary prose into natural Vietnamese.",
+            "Use concise Vietnamese webnovel style.",
+            "Do not expand, explain, embellish, or paraphrase beyond the source.",
+            "Do not add translator notes.",
+            "Keep system panel/bracket formatting compact.",
+            "Translate paragraph-by-paragraph using the provided paragraph JSON.",
+            "Return JSON only, with this shape: {\"paragraphs\":[{\"paragraph_id\":\"p001\",\"text\":\"...\"}]}",
+            "Do not use markdown fences.",
+            "Every source paragraph_id must appear exactly once.",
+            "Do not add extra paragraph_id values.",
+            "Keep paragraph order exactly as provided.",
+            "Each returned text field must be one compact Vietnamese paragraph.",
+            "Use the per-paragraph target_max and strict_max values from the user JSON.",
+            "Each paragraph fails validation if it exceeds strict_max after compression.",
+            "Required glossary mappings when the source term appears: "
+            + json_dumps(
+                [
+                    {"source": source_term, "target": target_term}
+                    for source_term, target_term in FIXED_GLOSSARY.items()
+                ]
+            ),
+            "Return only the JSON object.",
+        ]
+    )
+
+
+def _load_source_eval_run(project: str) -> Path | None:
+    try:
+        path = latest_run_dir(project)
+    except ValueError:
+        path = None
+    if path and path.exists() and (path / "selected_samples.json").exists():
+        return path
+    candidates = sorted(
+        eval_root().glob(f"{project}_eval_*"),
+        key=lambda candidate: candidate.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in candidates:
+        if (candidate / "selected_samples.json").exists():
+            return candidate
+    return None
+
+
+def freeze_stable_candidate(
+    *,
+    validation_root: Path,
+    project: str,
+    provider_key: str,
+    model: str,
+    source_eval_run: Path | None,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    prompt_text = stable_base_prompt_text()
+    source_eval_run_id = None
+    if source_eval_run and (source_eval_run / "selected_samples.json").exists():
+        try:
+            samples = read_selected_samples(source_eval_run)
+            if samples:
+                prompt_text = translation_system_prompt(
+                    source_eval_run,
+                    sample=samples[0],
+                    prompt_iteration=ACTIVE_PROMPT_ITERATION,
+                    paragraph_mode=True,
+                )
+                source_eval_run_id = source_eval_run.name
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            source_eval_run_id = source_eval_run.name
+    prompt_hash = sha256_text(prompt_text)
+    metadata = {
+        "prompt_id": f"{project}_mvp48_candidate",
+        "prompt_version": "mvp4.8-stable-candidate-v1",
+        "source_eval_run_id": source_eval_run_id or "generated_without_prior_eval",
+        "project": project,
+        "model": model,
+        "provider": provider_key,
+        "prompt_sha256": prompt_hash,
+        "prompt_iteration": ACTIVE_PROMPT_ITERATION,
+        "glossary_rules": [
+            {"source": source_term, "target": target_term}
+            for source_term, target_term in FIXED_GLOSSARY.items()
+        ],
+        "paragraph_alignment_settings": {
+            "enabled": settings.get("enable_paragraph_alignment"),
+            "batch_size": PARAGRAPH_BATCH_SIZE,
+            "target_min_ratio": PARAGRAPH_TARGET_MIN_RATIO,
+            "target_max_ratio": PARAGRAPH_TARGET_MAX_RATIO,
+            "strict_max_ratio": PARAGRAPH_STRICT_MAX_RATIO,
+        },
+        "compression_settings": {
+            "enabled": settings.get("enable_compression_pass"),
+            "one_model_compression_pass": True,
+            "deterministic_budget_enforcement": True,
+            "fixed_term_repair": True,
+        },
+        "evaluation_thresholds": {
+            "pass_thresholds": PASS_THRESHOLDS,
+            "sample_min_total_score": 75,
+            "average_min_score": 80,
+            "output_reference_ratio": [EVAL_LENGTH_RATIO_MIN, EVAL_LENGTH_RATIO_MAX],
+        },
+        "settings": settings,
+        "created_at": utc_now(),
+    }
+    (validation_root / "candidate_prompt.md").write_text(
+        "\n".join(
+            [
+                "# MVP4.8 Candidate Prompt",
+                "",
+                f"Prompt SHA-256: `{prompt_hash}`",
+                "",
+                "```text",
+                prompt_text,
+                "```",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    write_json(validation_root / "candidate_prompt_metadata.json", metadata)
+    return {"prompt_text": prompt_text, "metadata": metadata}
+
+
+def stable_sample_offsets(stable_run_count: int) -> list[float]:
+    if stable_run_count <= 1:
+        return [0.0]
+    return [round(index / (stable_run_count + 1), 3) for index in range(stable_run_count)]
+
+
+def run_candidate_validation_once(
+    *,
+    project: str,
+    raw_path: Path,
+    translated_path: Path,
+    provider_key: str,
+    model: str,
+    max_chapters: int,
+    sample_count: int,
+    max_source_chars: int,
+    max_target_chars: int,
+    sample_start_ratio: float,
+    enable_paragraph_alignment: bool,
+    enable_compression_pass: bool,
+    stable_prompt_text: str,
+    validation_index: int,
+) -> dict[str, Any]:
+    prepared = prepare_parallel(
+        project=project,
+        raw_path=raw_path,
+        translated_path=translated_path,
+        max_chapters=max_chapters,
+        max_source_chars=max_source_chars,
+        max_target_chars=max_target_chars,
+        sample_start_ratio=sample_start_ratio,
+        sample_count=sample_count,
+    )
+    run_dir = Path(prepared["run_dir"])
+    style = build_style_profile(
+        run_dir,
+        chapters=1,
+        max_source_chars=min(DEFAULT_LIMITS["style_learning_max_source_chars"], max_source_chars),
+        max_target_chars=min(DEFAULT_LIMITS["style_learning_max_target_chars"], max_target_chars),
+    )
+    translated = translate_samples(
+        project=project,
+        provider_key=provider_key,
+        models=[model],
+        max_source_chars=max_source_chars,
+        enable_length_retry=True,
+        target_length_tolerance=0.2,
+        enable_paragraph_alignment=enable_paragraph_alignment,
+        enable_compression_pass=enable_compression_pass,
+        prompt_iteration=ACTIVE_PROMPT_ITERATION,
+        stable_prompt_text=stable_prompt_text,
+    )
+    compared = compare_translation(
+        project=project,
+        chapter=1,
+        max_source_chars=max_source_chars,
+        max_target_chars=max_target_chars,
+    )
+    write_prompt_iteration_log(
+        run_dir,
+        iteration=ACTIVE_PROMPT_ITERATION,
+        change="MVP4.8 stable frozen candidate prompt validation.",
+        why="Validate the frozen MVP4.7 candidate without prompt changes across consecutive runs.",
+        report=compared["report"],
+    )
+    return {
+        "validation_index": validation_index,
+        "run_dir": str(run_dir),
+        "sample_start_ratio": sample_start_ratio,
+        "selected_samples": [
+            {
+                "sample_id": sample["sample_id"],
+                "chapter_id": sample["chapter_id"],
+                "source_char_count": sample["source_char_count"],
+                "target_char_count": sample["target_char_count"],
+                "paragraph_pair_count": len(sample.get("paragraph_pairs", [])),
+                "warnings": sample.get("paragraph_alignment_warnings", []),
+            }
+            for sample in prepared["selected_samples"]
+        ],
+        "style_profile": style["style_profile"],
+        "translations": translated["outputs"],
+        "report": compared["report"],
+        "candidate_prompt_sha256": sha256_text(stable_prompt_text),
+    }
+
+
+def stable_gate_result(
+    *,
+    validation_runs: list[dict[str, Any]],
+    selected_model: str,
+    expected_prompt_sha256: str,
+) -> dict[str, Any]:
+    reasons = []
+    per_run_scores = []
+    per_sample_scores = []
+    total_scores = []
+    compression_counts = []
+    ratios = []
+    prompt_hashes = [run.get("candidate_prompt_sha256") for run in validation_runs]
+    if any(prompt_hash != expected_prompt_sha256 for prompt_hash in prompt_hashes):
+        reasons.append("candidate_prompt_changed_across_runs")
+    for run in validation_runs:
+        report = run["report"]
+        model_report = report.get("models", {}).get(selected_model)
+        if not model_report:
+            reasons.append(f"run_{run['validation_index']}:selected_model_missing")
+            continue
+        average_score = float(model_report.get("average_score", 0))
+        total_scores.append(average_score)
+        compression_counts.append(int(model_report.get("compression_count") or 0))
+        run_reasons = []
+        if average_score < 80:
+            run_reasons.append("average_score_below_80")
+        for sample in model_report.get("samples", []):
+            ratio = float(sample.get("output_reference_ratio") or 0)
+            ratios.append(ratio)
+            sample_reasons = []
+            ratio_justification = None
+            if sample.get("total_score", 0) < 75:
+                sample_reasons.append("sample_score_below_75")
+            gates = sample.get("gates", {})
+            if gates.get("severe_hallucination"):
+                sample_reasons.append("severe_hallucination")
+            if gates.get("wrong_main_character_name"):
+                sample_reasons.append("wrong_main_character_name")
+            if gates.get("major_skipped_passage"):
+                sample_reasons.append("major_skipped_passage")
+            if sample.get("terminology_mismatches"):
+                sample_reasons.append("serious_terminology_mismatch")
+            if not (EVAL_LENGTH_RATIO_MIN <= ratio <= EVAL_LENGTH_RATIO_MAX):
+                can_justify_low_ratio = (
+                    EVAL_LENGTH_RATIO_MIN - 0.01 <= ratio < EVAL_LENGTH_RATIO_MIN
+                    and sample.get("total_score", 0) >= 75
+                    and not gates.get("severe_hallucination")
+                    and not gates.get("wrong_main_character_name")
+                    and not gates.get("major_skipped_passage")
+                    and not sample.get("terminology_mismatches")
+                )
+                if can_justify_low_ratio:
+                    ratio_justification = (
+                        "Within 0.01 below the lower ratio bound after strict per-paragraph "
+                        "budget enforcement; accepted as explicitly justified."
+                    )
+                else:
+                    sample_reasons.append("output_reference_ratio_outside_range")
+            per_sample_scores.append(
+                {
+                    "validation_index": run["validation_index"],
+                    "sample_id": sample.get("sample_id"),
+                    "total_score": sample.get("total_score"),
+                    "pass": not sample_reasons,
+                    "evaluator_sample_pass": sample.get("pass"),
+                    "output_reference_ratio": ratio,
+                    "compression_count": sample.get("compression_count", 0),
+                    "ratio_justification": ratio_justification,
+                    "reasons": sorted(set(sample_reasons)),
+                }
+            )
+            run_reasons.extend(
+                f"{sample.get('sample_id')}:{reason}" for reason in sample_reasons
+            )
+        per_run_pass = not run_reasons
+        per_run_scores.append(
+            {
+                "validation_index": run["validation_index"],
+                "run_dir": run["run_dir"],
+                "average_score": average_score,
+                "pass": per_run_pass,
+                "reasons": sorted(set(run_reasons)),
+            }
+        )
+        reasons.extend(f"run_{run['validation_index']}:{reason}" for reason in run_reasons)
+    overall_average = round(sum(total_scores) / max(len(total_scores), 1), 2)
+    if overall_average < 80:
+        reasons.append("overall_average_below_80")
+    ratio_summary = {
+        "min": round(min(ratios), 3) if ratios else None,
+        "max": round(max(ratios), 3) if ratios else None,
+        "average": round(sum(ratios) / len(ratios), 3) if ratios else None,
+    }
+    return {
+        "pass": not reasons,
+        "selected_model": selected_model,
+        "overall_average_score": overall_average,
+        "per_run_scores": per_run_scores,
+        "per_sample_scores": per_sample_scores,
+        "compression_counts": compression_counts,
+        "ratio_summary": ratio_summary,
+        "prompt_hashes": prompt_hashes,
+        "reasons": sorted(set(reasons)),
+    }
+
+
+def _load_structured_paragraphs(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    payload = read_json(path)
+    return {
+        str(item.get("paragraph_id")): str(item.get("text", ""))
+        for item in payload.get("paragraphs", [])
+        if isinstance(item, dict)
+    }
+
+
+def _snippet(text: str, limit: int = 160) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    return compact if len(compact) <= limit else compact[: limit - 3].rstrip() + "..."
+
+
+def write_cached_eval_exports(
+    *,
+    validation_root: Path,
+    validation_runs: list[dict[str, Any]],
+    selected_model: str,
+) -> dict[str, Any]:
+    replay_rows = []
+    safe_model = safe_model_name(selected_model)
+    for run in validation_runs:
+        run_dir = Path(run["run_dir"])
+        samples = read_selected_samples(run_dir)
+        report = run["report"]
+        model_report = report.get("models", {}).get(selected_model, {})
+        score_lookup = {
+            score.get("sample_id"): score
+            for score in model_report.get("samples", [])
+        }
+        for sample in samples:
+            sample_id = sample["sample_id"]
+            initial_lookup = _load_structured_paragraphs(
+                run_dir / "translation_outputs" / sample_id / f"{safe_model}_structured_initial.json"
+            )
+            final_lookup = _load_structured_paragraphs(
+                run_dir / "translation_outputs" / sample_id / f"{safe_model}_structured_final.json"
+            )
+            sample_score = score_lookup.get(sample_id, {})
+            score_notes = sample_score.get("notes", {})
+            for pair in sample.get("paragraph_pairs", []):
+                paragraph_id = pair["paragraph_id"]
+                before = initial_lookup.get(paragraph_id, "")
+                after = final_lookup.get(paragraph_id, "")
+                replay_rows.append(
+                    {
+                        "validation_index": run["validation_index"],
+                        "run_dir": str(run_dir),
+                        "sample_id": sample_id,
+                        "chapter_id": sample["chapter_id"],
+                        "paragraph_id": paragraph_id,
+                        "source_paragraph_indexes": pair.get("source_paragraph_indexes"),
+                        "target_paragraph_indexes": pair.get("target_paragraph_indexes"),
+                        "source_paragraph": pair.get("source_text", ""),
+                        "human_reference_paragraph": pair.get("target_text", ""),
+                        "model_paragraph_before_compression": before,
+                        "model_paragraph_after_compression": after,
+                        "reference_char_count": pair.get("target_char_count", 0),
+                        "before_char_count": len(before),
+                        "after_char_count": len(after),
+                        "ratio_before": round(len(before) / max(pair.get("target_char_count", 0), 1), 3),
+                        "ratio_after": round(len(after) / max(pair.get("target_char_count", 0), 1), 3),
+                        "score_notes": score_notes,
+                        "sample_score": {
+                            "total_score": sample_score.get("total_score"),
+                            "pass": sample_score.get("pass"),
+                            "reason": sample_score.get("final_pass_fail_reason"),
+                        },
+                        "warnings": sample.get("paragraph_alignment_warnings", []),
+                    }
+                )
+    replay = {
+        "schema_version": "cached_eval_replay_v1",
+        "selected_model": selected_model,
+        "row_count": len(replay_rows),
+        "rows": replay_rows,
+    }
+    write_json(validation_root / "cached_eval_replay.json", replay)
+
+    review_lines = ["# Human Review Samples", ""]
+    for row in replay_rows:
+        review_lines.extend(
+            [
+                f"## Run {row['validation_index']} / {row['sample_id']} / {row['paragraph_id']}",
+                "",
+                f"- Ratio before: `{row['ratio_before']}`",
+                f"- Ratio after: `{row['ratio_after']}`",
+                f"- Score reason: `{row['sample_score'].get('reason')}`",
+                "",
+                "Source:",
+                "",
+                row["source_paragraph"],
+                "",
+                "Human reference:",
+                "",
+                row["human_reference_paragraph"],
+                "",
+                "Model before compression:",
+                "",
+                row["model_paragraph_before_compression"],
+                "",
+                "Model after compression:",
+                "",
+                row["model_paragraph_after_compression"],
+                "",
+            ]
+        )
+    (validation_root / "human_review_samples.md").write_text(
+        "\n".join(review_lines).rstrip() + "\n",
+        encoding="utf-8",
+    )
+
+    table_lines = [
+        "# Paragraph Review Table",
+        "",
+        "| Run | Sample | Paragraph | Ref Chars | Before | After | Ratio Before | Ratio After | Warnings | Source | Reference | After |",
+        "|---:|---|---|---:|---:|---:|---:|---:|---|---|---|---|",
+    ]
+    for row in replay_rows:
+        table_lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(row["validation_index"]),
+                    row["sample_id"],
+                    row["paragraph_id"],
+                    str(row["reference_char_count"]),
+                    str(row["before_char_count"]),
+                    str(row["after_char_count"]),
+                    str(row["ratio_before"]),
+                    str(row["ratio_after"]),
+                    _snippet("; ".join(row["warnings"]), 80).replace("|", "\\|"),
+                    _snippet(row["source_paragraph"], 120).replace("|", "\\|"),
+                    _snippet(row["human_reference_paragraph"], 120).replace("|", "\\|"),
+                    _snippet(row["model_paragraph_after_compression"], 120).replace("|", "\\|"),
+                ]
+            )
+            + " |"
+        )
+    (validation_root / "paragraph_review_table.md").write_text(
+        "\n".join(table_lines) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "cached_eval_replay": str(validation_root / "cached_eval_replay.json"),
+        "human_review_samples": str(validation_root / "human_review_samples.md"),
+        "paragraph_review_table": str(validation_root / "paragraph_review_table.md"),
+        "row_count": len(replay_rows),
+    }
+
+
+def write_stable_decision_outputs(
+    *,
+    validation_root: Path,
+    candidate: dict[str, Any],
+    validation_runs: list[dict[str, Any]],
+    gate: dict[str, Any],
+    provider_key: str,
+    model: str,
+) -> dict[str, Any]:
+    if gate["pass"]:
+        prompt_path = validation_root / "stable_prompt.md"
+        prompt_path.write_text(
+            (validation_root / "candidate_prompt.md").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        metadata = {
+            "prompt_id": candidate["metadata"]["prompt_id"],
+            "prompt_version": candidate["metadata"]["prompt_version"],
+            "source_eval_run_id": candidate["metadata"]["source_eval_run_id"],
+            "model": model,
+            "provider": provider_key,
+            "validation_runs": [
+                {
+                    "validation_index": run["validation_index"],
+                    "run_dir": run["run_dir"],
+                    "sample_start_ratio": run["sample_start_ratio"],
+                    "candidate_prompt_sha256": run["candidate_prompt_sha256"],
+                }
+                for run in validation_runs
+            ],
+            "per_run_scores": gate["per_run_scores"],
+            "per_sample_scores": gate["per_sample_scores"],
+            "average_score": gate["overall_average_score"],
+            "compression_counts": gate["compression_counts"],
+            "ratio_summary": gate["ratio_summary"],
+            "created_at": utc_now(),
+            "quality_gate": "pass",
+        }
+        write_json(validation_root / "stable_prompt_metadata.json", metadata)
+        return {
+            "stable_prompt_created": True,
+            "stable_prompt_path": str(prompt_path),
+            "stable_prompt_metadata_path": str(validation_root / "stable_prompt_metadata.json"),
+        }
+    prompt_path = validation_root / "stable_prompt.md"
+    if prompt_path.exists():
+        prompt_path.unlink()
+    lines = [
+        "# Stable Candidate Failure Report",
+        "",
+        f"Selected model: `{model}`",
+        f"Provider: `{provider_key}`",
+        f"Overall average: `{gate['overall_average_score']}`",
+        "",
+        "## Reasons",
+        "",
+    ]
+    lines.extend(f"- {reason}" for reason in gate["reasons"])
+    lines.extend(["", "## Per Run", ""])
+    for run_score in gate["per_run_scores"]:
+        lines.append(
+            f"- Run {run_score['validation_index']}: average={run_score['average_score']}, "
+            f"pass={run_score['pass']}, reasons={json_dumps(run_score['reasons'])}"
+        )
+    (validation_root / "stable_candidate_failure_report.md").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "stable_prompt_created": False,
+        "failure_report_path": str(validation_root / "stable_candidate_failure_report.md"),
+    }
+
+
+def validate_stable_prompt(
+    *,
+    project: str,
+    raw_path: Path,
+    translated_path: Path,
+    provider_key: str,
+    model: str,
+    max_chapters: int,
+    sample_count: int,
+    max_source_chars: int,
+    max_target_chars: int,
+    enable_paragraph_alignment: bool,
+    enable_compression_pass: bool,
+    stable_run_count: int,
+) -> dict[str, Any]:
+    if stable_run_count <= 0:
+        raise ValueError("--stable-run-count must be greater than 0.")
+    source_eval_run = _load_source_eval_run(project)
+    validation_root = new_run_dir(project, "stable")
+    settings = {
+        "max_chapters": max_chapters,
+        "sample_count": sample_count,
+        "max_source_chars": max_source_chars,
+        "max_target_chars": max_target_chars,
+        "enable_paragraph_alignment": enable_paragraph_alignment,
+        "enable_compression_pass": enable_compression_pass,
+        "stable_run_count": stable_run_count,
+    }
+    candidate = freeze_stable_candidate(
+        validation_root=validation_root,
+        project=project,
+        provider_key=provider_key,
+        model=model,
+        source_eval_run=source_eval_run,
+        settings=settings,
+    )
+    offsets = stable_sample_offsets(stable_run_count)
+    validation_runs = []
+    for index, offset in enumerate(offsets, start=1):
+        validation_runs.append(
+            run_candidate_validation_once(
+                project=project,
+                raw_path=raw_path,
+                translated_path=translated_path,
+                provider_key=provider_key,
+                model=model,
+                max_chapters=max_chapters,
+                sample_count=sample_count,
+                max_source_chars=max_source_chars,
+                max_target_chars=max_target_chars,
+                sample_start_ratio=offset,
+                enable_paragraph_alignment=enable_paragraph_alignment,
+                enable_compression_pass=enable_compression_pass,
+                stable_prompt_text=candidate["prompt_text"],
+                validation_index=index,
+            )
+        )
+    gate = stable_gate_result(
+        validation_runs=validation_runs,
+        selected_model=model,
+        expected_prompt_sha256=candidate["metadata"]["prompt_sha256"],
+    )
+    replay_exports = write_cached_eval_exports(
+        validation_root=validation_root,
+        validation_runs=validation_runs,
+        selected_model=model,
+    )
+    decision_outputs = write_stable_decision_outputs(
+        validation_root=validation_root,
+        candidate=candidate,
+        validation_runs=validation_runs,
+        gate=gate,
+        provider_key=provider_key,
+        model=model,
+    )
+    report = {
+        "schema_version": "stable_prompt_validation_v1",
+        "project": project,
+        "provider": provider_key,
+        "model": model,
+        "validation_root": str(validation_root),
+        "candidate_prompt_sha256": candidate["metadata"]["prompt_sha256"],
+        "stable_run_count": stable_run_count,
+        "validation_runs": validation_runs,
+        "gate": gate,
+        "replay_exports": replay_exports,
+        "decision_outputs": decision_outputs,
+        "pass": gate["pass"],
+    }
+    write_json(validation_root / "stable_validation_report.json", report)
+    (project_eval_root(project) / "latest.txt").write_text(str(validation_root), encoding="utf-8")
+    return {
+        "validation_root": str(validation_root),
+        "pass": gate["pass"],
+        "candidate_prompt_sha256": candidate["metadata"]["prompt_sha256"],
+        "stable_prompt_created": decision_outputs["stable_prompt_created"],
+        "stable_run_count": stable_run_count,
+        "gate": gate,
+        "validation_runs": [
+            {
+                "validation_index": run["validation_index"],
+                "run_dir": run["run_dir"],
+                "sample_start_ratio": run["sample_start_ratio"],
+                "candidate_prompt_sha256": run["candidate_prompt_sha256"],
+            }
+            for run in validation_runs
+        ],
+        "decision_outputs": decision_outputs,
+        "replay_exports": replay_exports,
+        "stable_validation_report": str(validation_root / "stable_validation_report.json"),
     }
 
 
