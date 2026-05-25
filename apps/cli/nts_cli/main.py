@@ -6,6 +6,14 @@ from typing import Annotated, Optional
 
 import typer
 
+from nts_core.approved_memory_validation import (
+    DEFAULT_APPROVED_MEMORY_MAX_CHAPTERS,
+    DEFAULT_APPROVED_MEMORY_VALIDATION_CHAPTERS,
+    DEFAULT_APPROVED_MEMORY_VALIDATION_ROUNDS,
+    approved_memory_validation_status,
+    resume_approved_memory_validation,
+    start_approved_memory_validation,
+)
 from nts_core.config import validate_config_files
 from nts_core.corrections import (
     learn_corrections,
@@ -889,6 +897,99 @@ def learn_ablate_candidates(
     try:
         ws = discover_workspace(_workspace_arg(workspace))
         result = ablate_learning_candidates(ws, run=run)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("validate-approved-memory")
+def learn_validate_approved_memory(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    raw: Annotated[Path, typer.Option("--raw", help="Chinese raw text file.")],
+    translated: Annotated[Path, typer.Option("--translated", help="Human translated EPUB.")],
+    provider: Annotated[str, typer.Option("--provider")] = "mock",
+    model: Annotated[str, typer.Option("--model")] = "gpt-5.4",
+    workspace: WorkspaceOption = None,
+    fallback_model: Annotated[Optional[str], typer.Option("--fallback-model")] = "gpt-5.4-mini",
+    chapters: Annotated[str, typer.Option("--chapters")] = DEFAULT_APPROVED_MEMORY_VALIDATION_CHAPTERS,
+    rounds: Annotated[int, typer.Option("--rounds")] = DEFAULT_APPROVED_MEMORY_VALIDATION_ROUNDS,
+    require_consecutive_improvement: Annotated[
+        bool,
+        typer.Option("--require-consecutive-improvement/--no-require-consecutive-improvement"),
+    ] = True,
+    min_improvement: Annotated[float, typer.Option("--min-improvement")] = 1.0,
+    target_improvement: Annotated[float, typer.Option("--target-improvement")] = 3.0,
+    max_chapters: Annotated[int, typer.Option("--max-chapters")] = DEFAULT_APPROVED_MEMORY_MAX_CHAPTERS,
+    max_real_calls: Annotated[Optional[int], typer.Option("--max-real-calls")] = None,
+    use_stable_prompt: Annotated[bool, typer.Option("--use-stable-prompt")] = False,
+    resumable: Annotated[bool, typer.Option("--resumable")] = False,
+    rollback_on_regression: Annotated[bool, typer.Option("--rollback-on-regression")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output_dir: Annotated[Optional[Path], typer.Option("--output-dir")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = start_approved_memory_validation(
+            ws,
+            project_slug=project,
+            raw_path=raw,
+            translated_path=translated,
+            provider_key=provider,
+            model=model,
+            fallback_model=fallback_model,
+            chapters=chapters,
+            rounds=rounds,
+            require_consecutive_improvement=require_consecutive_improvement,
+            min_improvement=min_improvement,
+            target_improvement=target_improvement,
+            max_chapters=max_chapters,
+            max_real_calls=max_real_calls,
+            use_stable_prompt=use_stable_prompt,
+            resumable=resumable,
+            rollback_on_regression=rollback_on_regression,
+            dry_run=dry_run,
+            output_dir=output_dir,
+        )
+    except StablePromptBlocker as exc:
+        _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@learn_app.command("resume-approved-memory-validation")
+def learn_resume_approved_memory_validation(
+    run: Annotated[str, typer.Option("--run", help="Validation run id or path.")],
+    workspace: WorkspaceOption = None,
+    max_real_calls: Annotated[Optional[int], typer.Option("--max-real-calls")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = resume_approved_memory_validation(
+            ws,
+            run=run,
+            max_real_calls=max_real_calls,
+            dry_run=dry_run,
+        )
+    except StablePromptBlocker as exc:
+        _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@learn_app.command("approved-memory-validation-status")
+def learn_approved_memory_validation_status(
+    run: Annotated[str, typer.Option("--run", help="Validation run id or path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = approved_memory_validation_status(ws, run=run)
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)

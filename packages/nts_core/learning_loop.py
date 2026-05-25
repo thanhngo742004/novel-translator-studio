@@ -23,7 +23,7 @@ from nts_core.eval_harness import (
 )
 from nts_core.memory import add_evidence, create_memory_item, update_memory_status
 from nts_core.projects import get_project_by_slug
-from nts_core.stable_prompts import StablePromptRecord, load_approved_stable_prompt
+from nts_core.stable_prompts import StablePromptBlocker, StablePromptRecord, load_approved_stable_prompt
 from nts_storage.database import connection, insert_task_run, new_id, utc_now
 from nts_storage.workspace import Workspace
 

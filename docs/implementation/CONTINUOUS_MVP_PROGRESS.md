@@ -858,3 +858,58 @@
   - Useful candidates remain pending/test-only until explicit human approval.
 - Next recommended phase:
   - Human review and selective approval of useful MVP5C candidates, then a controlled production retranslation smoke using approved memory only.
+
+## 2026-05-26T01:05:00+07:00
+
+- Completed: MVP5D controlled approved-memory validation implementation only.
+- Implemented:
+  - `nts learn validate-approved-memory`
+  - `nts learn resume-approved-memory-validation`
+  - `nts learn approved-memory-validation-status`
+  - Resumable approved-memory validation artifacts under `artifacts/approved_memory_validation/<validation_run_id>/`.
+  - Two-round baseline vs approved-memory comparison with score deltas, per-chapter deltas, severe flag checks, checkpoint logs, API call logs, provider error logs, and final summary reports.
+  - Baseline memory exclusion so the baseline pass can exclude the newly approved MVP5C learning memory IDs while the approved-memory pass includes them.
+  - Provider-empty-output detection so provider/socket failures cannot be scored as normal low-quality translations.
+  - One reliable alignment window per requested chapter for MVP5D, preventing the generic eval selector from concentrating all samples in early chapters.
+- Commands run:
+  - `uv run --extra dev python -m pytest tests/test_mvp5d_approved_memory_validation.py -q -p no:cacheprovider --basetemp=.t`
+  - `uv run --extra dev python -m pytest -q -p no:cacheprovider --basetemp=.t`
+  - `uv run --extra dev python -m nts_cli.main learn validate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 1-10 --rounds 2 --require-consecutive-improvement --use-stable-prompt --resumable --dry-run --json`
+  - `uv run --extra dev python -m nts_cli.main learn validate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider mock --model mock-eval --fallback-model mock-eval --chapters 1-10 --rounds 2 --require-consecutive-improvement --use-stable-prompt --resumable --json`
+  - `uv run --extra dev python -m nts_cli.main learn validate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 1-10 --rounds 2 --require-consecutive-improvement --use-stable-prompt --resumable --max-real-calls 12 --json`
+  - `uv run --extra dev python -m nts_cli.main learn resume-approved-memory-validation --workspace workspace_mvp5c_smoke_20260525210758 --run workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779730137664 --max-real-calls 12 --json`
+- Test result:
+  - Focused MVP5D tests: 6 passed.
+  - Full suite: 121 passed.
+- Dry-run result:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779730120227`
+  - Estimated total API calls: 40.
+- Mock validation result:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779730126093`
+  - Final decision: PASS.
+  - Selected chapters: 1-10.
+  - Round 1: 25.4 -> 27.4, delta +2.0.
+  - Round 2: 25.4 -> 27.4, delta +2.0.
+- Real validation result:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779730137664`
+  - Final decision: FAIL.
+  - Selected chapters: 1-10.
+  - Round 1: 78.2 -> 78.9, delta +0.7.
+  - Round 2: 78.5 -> 78.7, delta +0.2.
+  - Per-chapter regressions over 3 points: none.
+  - Failure reason: severe validation flags were present in both rounds.
+  - Severe flags included truncation and unsafe compression on chapters/samples 2, 6, 7, 8, 9, and 10.
+  - Fallback model used: false.
+  - Automatic resumes performed: 3.
+- Approved memory IDs used:
+  - `memory_5190e5ee3320419992bc8833ffd45fcc`
+  - `memory_ee0e5afb1b8f4180b9d7b1907de1385c`
+  - `memory_9ae91c19082341ae85626f5f74e2cf3f`
+  - `memory_bc32c4066a624090918af5e0f89ddda7`
+  - `memory_160c0cae68964045bdc25b691f469bc4`
+- Known limitations:
+  - The approved memory improved average scores slightly in both rounds but did not reach the required safety gate because truncation and unsafe compression flags remained.
+  - The validator now enforces one selected aligned window per requested chapter, but it still validates controlled samples rather than translating full chapters end to end.
+  - No new memory was activated in MVP5D.
+- Next recommended phase:
+  - Investigate unsafe compression/truncation in the affected chapter samples before another approval-memory validation. Focus on the production compression selector and chapter 6/9/10 long-ratio samples before expanding validation.

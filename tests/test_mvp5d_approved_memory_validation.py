@@ -1,0 +1,319 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from typer.testing import CliRunner
+
+from nts_cli.main import app
+
+
+runner = CliRunner()
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RAW_PATH = REPO_ROOT / "test_data" / "translation_eval" / "han_jue" / "raw.txt"
+EPUB_PATH = REPO_ROOT / "test_data" / "translation_eval" / "han_jue" / "viettranslated.epub"
+
+
+def parse_json(output: str) -> dict:
+    return json.loads(output)
+
+
+def init_workspace(tmp_path: Path, monkeypatch, *, active_memory: bool = True) -> Path:
+    monkeypatch.chdir(tmp_path)
+    workspace = tmp_path / "workspace"
+    assert runner.invoke(app, ["init", "--workspace", str(workspace), "--json"]).exit_code == 0
+    created = runner.invoke(
+        app,
+        [
+            "project",
+            "create",
+            "--workspace",
+            str(workspace),
+            "--slug",
+            "han-jue",
+            "--name",
+            "Han Jue",
+            "--source-lang",
+            "zh",
+            "--target-lang",
+            "vi",
+            "--json",
+        ],
+    )
+    assert created.exit_code == 0, created.output
+    stable_dir = workspace / "artifacts" / "evaluations" / "stable_run"
+    stable_dir.mkdir(parents=True, exist_ok=True)
+    (stable_dir / "stable_prompt.md").write_text(
+        "# Stable Prompt\n\n```text\nTranslate Chinese into concise Vietnamese webnovel prose.\n```\n",
+        encoding="utf-8",
+    )
+    (stable_dir / "stable_prompt_metadata.json").write_text(
+        json.dumps(
+            {
+                "prompt_id": "stable_test",
+                "prompt_version": "mvp5d-test",
+                "source_eval_run_id": "stable_run",
+                "language_pair": "zh-vi",
+                "domain": "novel",
+                "quality_gate": "pass",
+                "average_score": 92,
+                "created_at": "2026-05-25T00:00:00Z",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (stable_dir / "stable_prompt_approval.json").write_text(
+        json.dumps({"decision": "approved", "reviewer": "pytest"}, sort_keys=True),
+        encoding="utf-8",
+    )
+    if active_memory:
+        active = runner.invoke(
+            app,
+            [
+                "memory",
+                "create",
+                "--workspace",
+                str(workspace),
+                "--type",
+                "term",
+                "--status",
+                "active",
+                "--layer",
+                "learning_candidate",
+                "--project",
+                "han-jue",
+                "--source-key",
+                "term_source",
+                "--target-text",
+                "Preferred Term",
+                "--confidence-score",
+                "0.8",
+                "--json",
+            ],
+        )
+        assert active.exit_code == 0, active.output
+        pending = runner.invoke(
+            app,
+            [
+                "memory",
+                "create",
+                "--workspace",
+                str(workspace),
+                "--type",
+                "term",
+                "--status",
+                "pending",
+                "--layer",
+                "learning_candidate",
+                "--project",
+                "han-jue",
+                "--source-key",
+                "pending_source",
+                "--target-text",
+                "Pending Term",
+                "--confidence-score",
+                "0.8",
+                "--json",
+            ],
+        )
+        assert pending.exit_code == 0, pending.output
+    return workspace
+
+
+def validate_command(workspace: Path, *, model: str = "mock-eval", extra: list[str] | None = None):
+    return runner.invoke(
+        app,
+        [
+            "learn",
+            "validate-approved-memory",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--raw",
+            str(RAW_PATH),
+            "--translated",
+            str(EPUB_PATH),
+            "--provider",
+            "mock",
+            "--model",
+            model,
+            "--fallback-model",
+            "mock-eval",
+            "--chapters",
+            "1-2",
+            "--rounds",
+            "2",
+            "--use-stable-prompt",
+            "--resumable",
+            *(extra or []),
+            "--json",
+        ],
+    )
+
+
+def test_validate_approved_memory_pass_requires_two_improving_rounds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+
+    result = validate_command(workspace)
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    run_dir = Path(data["run_dir"])
+    assert data["final_decision"] == "PASS"
+    assert data["rounds_completed"] == 2
+    assert all(row["score_delta"] > 0 for row in data["round_results"])
+    assert (run_dir / "validation_job_state.json").exists()
+    assert (run_dir / "round_1" / "baseline_evaluation.json").exists()
+    assert (run_dir / "round_1" / "memory_evaluation.json").exists()
+    assert (run_dir / "round_2" / "score_delta.json").exists()
+    assert (run_dir / "final_validation_summary.md").exists()
+    sample_selection = json.loads(
+        (run_dir / "approved_memory_validation_sample_selection.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sample_selection["selected_chapters"] == [1, 2]
+
+
+def test_validate_approved_memory_fails_when_only_one_round_improves(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+
+    result = validate_command(workspace, model="mock-one-round-fails")
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["final_decision"] == "FAIL"
+    assert data["round_results"][0]["score_delta"] > 0
+    assert data["round_results"][1]["score_delta"] == 0
+
+
+def test_validate_approved_memory_blocks_when_approved_memory_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch, active_memory=False)
+
+    result = validate_command(workspace)
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["final_decision"] == "BLOCKED"
+    assert data["last_error"] == "approved_learning_memory_missing"
+
+
+def test_validate_approved_memory_checkpoint_resume_and_memory_sets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+
+    paused = validate_command(workspace, extra=["--max-real-calls", "2"])
+    assert paused.exit_code == 0, paused.output
+    paused_data = parse_json(paused.output)["data"]
+    run_dir = Path(paused_data["run_dir"])
+    assert paused_data["status"] == "paused"
+    assert paused_data["can_resume"] is True
+
+    resumed = runner.invoke(
+        app,
+        [
+            "learn",
+            "resume-approved-memory-validation",
+            "--workspace",
+            str(workspace),
+            "--run",
+            str(run_dir),
+            "--max-real-calls",
+            "8",
+            "--json",
+        ],
+    )
+    assert resumed.exit_code == 0, resumed.output
+    resumed_data = parse_json(resumed.output)["data"]
+    assert resumed_data["final_decision"] == "PASS"
+
+    used = json.loads((run_dir / "approved_memory_used.json").read_text(encoding="utf-8"))
+    excluded = json.loads((run_dir / "baseline_memory_exclusion.json").read_text(encoding="utf-8"))
+    assert len(used["items"]) == 1
+    assert used["items"][0]["status"] == "active"
+    assert excluded["excluded_memory_ids"] == [used["items"][0]["id"]]
+
+
+def test_validate_approved_memory_status_command(tmp_path: Path, monkeypatch) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    result = validate_command(workspace)
+    data = parse_json(result.output)["data"]
+
+    status = runner.invoke(
+        app,
+        [
+            "learn",
+            "approved-memory-validation-status",
+            "--workspace",
+            str(workspace),
+            "--run",
+            data["run_dir"],
+            "--json",
+        ],
+    )
+
+    assert status.exit_code == 0, status.output
+    status_data = parse_json(status.output)["data"]
+    assert status_data["final_decision"] == "PASS"
+    assert status_data["round_results"]
+
+
+def test_provider_empty_output_blocks_before_scoring(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    fake_eval_run = tmp_path / "fake_eval_run"
+    fake_eval_run.mkdir()
+
+    def fake_translate_samples(**kwargs):
+        return {
+            "run_dir": str(fake_eval_run),
+            "outputs": {
+                "sample_1": {
+                    "mock-eval": {
+                        "provider_error": "Provider HTTP error 524: timeout",
+                        "provider_error_classification": {
+                            "retryable": True,
+                            "http_status": 524,
+                        },
+                        "output_char_count": 0,
+                        "verification_after_compression": {
+                            "provider_failure_empty_output": True,
+                            "reasons": [
+                                "provider_error",
+                                "provider_failure_empty_output",
+                                "provider_retry_exhausted",
+                            ],
+                        },
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr(
+        "nts_core.approved_memory_validation.translate_samples",
+        fake_translate_samples,
+    )
+
+    result = validate_command(workspace)
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["final_decision"] == "BLOCKED"
+    assert data["can_resume"] is True
+    assert "provider_failure" in data["last_error"]
+    assert data["round_results"] == []
