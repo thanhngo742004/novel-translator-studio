@@ -17,6 +17,7 @@ from nts_core.eval_harness import (
     build_alignment_blocks,
     build_alignment_candidates,
     build_translation_units,
+    classify_provider_error,
     compress_offending_paragraphs,
     create_paragraph_alignment,
     detect_truncated_vietnamese,
@@ -35,10 +36,12 @@ from nts_core.eval_harness import (
     stable_prompt_review,
     translate_samples,
     translation_system_prompt,
+    validation_run_failed_only_retryable_provider,
     validate_paragraph_translation,
     validate_eval_provider,
     verify_paragraph_output,
     write_cached_eval_exports,
+    write_final_human_review_package,
     write_stable_decision_outputs,
 )
 
@@ -945,6 +948,179 @@ def test_translate_samples_retries_invalid_provider_json_once(
     assert "provider_json_failure" not in metadata["verification_after_compression"]["reasons"]
 
 
+def test_provider_error_classification_retryable_and_non_retryable() -> None:
+    retryable = classify_provider_error("Provider HTTP error 524: temporary upstream error")
+    non_retryable = classify_provider_error("Provider HTTP error 401: invalid API key")
+
+    assert retryable["http_status"] == 524
+    assert retryable["retryable"] is True
+    assert non_retryable["http_status"] == 401
+    assert non_retryable["retryable"] is False
+
+
+def test_translate_samples_retries_retryable_provider_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    project = "provider-retry-success-test"
+    run_dir = eval_harness_module.new_run_dir(project, "eval")
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝继续修炼。",
+            "target_text": "Hàn Tuyệt tiếp tục tu luyện.",
+            "target_char_count": len("Hàn Tuyệt tiếp tục tu luyện."),
+            "target_length_min": 20,
+            "target_length_max": 40,
+            "source_char_count": len("韩绝继续修炼。"),
+        }
+    )
+    eval_harness_module.write_json(run_dir / "selected_samples.json", {"samples": [sample]})
+    eval_harness_module.write_json(
+        run_dir / "glossary_candidates.json",
+        {"fixed_terms": [{"source": "韩绝", "target": "Hàn Tuyệt"}]},
+    )
+    calls = []
+
+    def fake_chat_completion(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise ValueError("Provider HTTP error 524: temporary upstream error")
+        return json.dumps(
+            {"paragraphs": [{"paragraph_id": "p001", "text": "Hàn Tuyệt tiếp tục tu luyện."}]},
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(eval_harness_module, "_chat_completion", fake_chat_completion)
+
+    result = translate_samples(
+        project=project,
+        provider_key="mock",
+        models=["mock-retry"],
+        max_source_chars=200,
+        enable_length_retry=True,
+        target_length_tolerance=0.2,
+        enable_paragraph_alignment=True,
+        enable_compression_pass=False,
+        provider_retry_attempts=2,
+        provider_retry_backoff_seconds=0,
+    )
+
+    metadata = result["outputs"]["sample_1"]["mock-retry"]
+    retry_log = json.loads((run_dir / "provider_retry_log.json").read_text(encoding="utf-8"))
+    assert len(calls) == 2
+    assert metadata["provider_error"] is None
+    assert result["provider_retry_summary"]["sample_retries_succeeded"] == 1
+    assert retry_log["summary"]["sample_retries_attempted"] == 1
+
+
+def test_translate_samples_exhausted_retryable_provider_failure_is_not_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    project = "provider-retry-exhausted-test"
+    run_dir = eval_harness_module.new_run_dir(project, "eval")
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝继续修炼。",
+            "target_text": "Hàn Tuyệt tiếp tục tu luyện.",
+            "target_char_count": len("Hàn Tuyệt tiếp tục tu luyện."),
+            "target_length_min": 20,
+            "target_length_max": 40,
+            "source_char_count": len("韩绝继续修炼。"),
+        }
+    )
+    eval_harness_module.write_json(run_dir / "selected_samples.json", {"samples": [sample]})
+    eval_harness_module.write_json(
+        run_dir / "glossary_candidates.json",
+        {"fixed_terms": [{"source": "韩绝", "target": "Hàn Tuyệt"}]},
+    )
+
+    def fake_chat_completion(*args, **kwargs):
+        raise ValueError("Provider HTTP error 524: temporary upstream error")
+
+    monkeypatch.setattr(eval_harness_module, "_chat_completion", fake_chat_completion)
+
+    result = translate_samples(
+        project=project,
+        provider_key="mock",
+        models=["mock-retry"],
+        max_source_chars=200,
+        enable_length_retry=True,
+        target_length_tolerance=0.2,
+        enable_paragraph_alignment=True,
+        enable_compression_pass=False,
+        provider_retry_attempts=2,
+        provider_retry_backoff_seconds=0,
+    )
+
+    metadata = result["outputs"]["sample_1"]["mock-retry"]
+    verification = metadata["verification_after_compression"]
+    assert metadata["provider_error_classification"]["retryable"] is True
+    assert "provider_failure_empty_output" in verification["reasons"]
+    assert "provider_retry_exhausted" in verification["reasons"]
+    assert "paragraph_truncation_detected" not in verification["reasons"]
+    assert verification["truncated_paragraphs"] == []
+    assert result["provider_retry_summary"]["sample_retries_exhausted"] == 1
+
+
+def test_validation_run_retry_detection_only_for_provider_failures() -> None:
+    provider_failed_run = {
+        "report": {
+            "models": {
+                "m": {
+                    "samples": [
+                        {
+                            "sample_id": "sample_1",
+                            "pass": False,
+                            "verification_reasons": [
+                                "provider_error",
+                                "provider_failure_empty_output",
+                            ],
+                        }
+                    ]
+                }
+            }
+        },
+        "translations": {
+            "sample_1": {
+                "m": {
+                    "provider_error": "Provider HTTP error 524: temporary upstream error",
+                    "provider_error_classification": {"retryable": True},
+                }
+            }
+        },
+    }
+    quality_failed_run = {
+        "report": {
+            "models": {
+                "m": {
+                    "samples": [
+                        {
+                            "sample_id": "sample_1",
+                            "pass": False,
+                            "verification_reasons": ["unsafe_compression"],
+                        }
+                    ]
+                }
+            }
+        },
+        "translations": {"sample_1": {"m": {}}},
+    }
+
+    assert validation_run_failed_only_retryable_provider(
+        provider_failed_run,
+        selected_model="m",
+    )
+    assert not validation_run_failed_only_retryable_provider(
+        quality_failed_run,
+        selected_model="m",
+    )
+
+
 def test_learn_style_translate_compare_mock_outputs_and_score_schema(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1718,6 +1894,113 @@ def test_eval_replay_regenerates_reports_without_api_calls(tmp_path: Path) -> No
     assert result["per_sample"][0]["paragraph_count"] == 2
 
 
+def test_final_human_review_package_created_for_pass_and_masks_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validation_root = write_stable_review_fixture(tmp_path)
+    replay_result = replay_cached_eval(validation_root)
+    monkeypatch.setenv("CKEY_API_KEY", "secret-key-that-must-not-appear")
+    report = {
+        "project": "han-jue",
+        "provider": "ckey_openai_compatible",
+        "model": "gpt-5.4-mini",
+        "validation_root": str(validation_root),
+        "quality_gate": "pass",
+        "pass": True,
+        "validation_runs": [],
+        "strict_replay": replay_result,
+        "gate": {
+            "per_run_scores": [{"validation_index": 1, "average_score": 88, "pass": True}],
+            "per_sample_scores": [
+                {
+                    "validation_index": 1,
+                    "sample_id": "sample_1",
+                    "total_score": 88,
+                    "output_reference_ratio": 1.0,
+                    "pass": True,
+                }
+            ],
+            "ratio_summary": {"min": 1.0, "max": 1.0, "average": 1.0},
+            "reasons": [],
+        },
+        "provider_retry_summary": {
+            "retryable_failures": 0,
+            "non_retryable_failures": 0,
+            "sample_retries_attempted": 0,
+            "sample_retries_succeeded": 0,
+            "sample_retries_exhausted": 0,
+            "run_retries_attempted": 0,
+            "final_provider_failure_count": 0,
+        },
+        "decision_outputs": {"stable_prompt_created": True},
+    }
+
+    package = write_final_human_review_package(
+        validation_root=validation_root,
+        report=report,
+    )
+
+    review_md = Path(package["human_review_final"]).read_text(encoding="utf-8")
+    instructions = Path(package["approval_instructions"]).read_text(encoding="utf-8")
+    assert "READY FOR HUMAN REVIEW" in review_md
+    assert "Source Chinese excerpt" in review_md
+    assert "Human Vietnamese reference" in review_md
+    assert "Final model Vietnamese output" in review_md
+    assert "secret-key-that-must-not-appear" not in review_md
+    assert "--approve --json" in instructions
+    assert "--reject --reason" in instructions
+
+
+def test_final_human_review_package_created_for_fail(tmp_path: Path) -> None:
+    validation_root = write_truncated_stable_fixture(tmp_path)
+    replay_result = replay_cached_eval(validation_root)
+    report = {
+        "project": "han-jue",
+        "provider": "mock",
+        "model": "gpt-5.4-mini",
+        "validation_root": str(validation_root),
+        "quality_gate": "fail",
+        "pass": False,
+        "validation_runs": [],
+        "strict_replay": replay_result,
+        "gate": {
+            "per_run_scores": [{"validation_index": 1, "average_score": 90, "pass": False}],
+            "per_sample_scores": [
+                {
+                    "validation_index": 1,
+                    "sample_id": "sample_1",
+                    "total_score": 90,
+                    "output_reference_ratio": 1.0,
+                    "pass": False,
+                }
+            ],
+            "ratio_summary": {"min": 1.0, "max": 1.0, "average": 1.0},
+            "reasons": ["cached_replay_strict_gate_failed"],
+        },
+        "provider_retry_summary": {
+            "retryable_failures": 0,
+            "non_retryable_failures": 0,
+            "sample_retries_attempted": 0,
+            "sample_retries_succeeded": 0,
+            "sample_retries_exhausted": 0,
+            "run_retries_attempted": 0,
+            "final_provider_failure_count": 0,
+        },
+        "decision_outputs": {"stable_prompt_created": False},
+    }
+
+    package = write_final_human_review_package(
+        validation_root=validation_root,
+        report=report,
+    )
+
+    review_md = Path(package["human_review_final"]).read_text(encoding="utf-8")
+    summary = Path(package["human_review_summary"]).read_text(encoding="utf-8")
+    assert "NOT APPROVABLE" in review_md
+    assert "NOT APPROVABLE" in summary
+    assert (validation_root / "human_review_final" / "stable_prompt_for_review.md").exists()
+
+
 def test_eval_replay_command_outputs_machine_readable_json(tmp_path: Path) -> None:
     validation_root = write_stable_review_fixture(tmp_path)
 
@@ -1871,6 +2154,8 @@ def test_validate_stable_prompt_mock_command_creates_replay_and_failure_report(
             "140",
             "--stable-run-count",
             "1",
+            "--provider-retry-backoff-seconds",
+            "0",
             "--json",
         ],
     )
@@ -1881,12 +2166,25 @@ def test_validate_stable_prompt_mock_command_creates_replay_and_failure_report(
     assert "compression_attempts" not in data
     assert "compression_attempt_summary" in data
     assert "report_paths" in data
+    assert "provider_retry_summary" in data
+    assert "sample_retries_attempted" in data
     root = Path(data["validation_root"])
     assert (root / "candidate_prompt.md").exists()
     assert (root / "candidate_prompt_metadata.json").exists()
     assert (root / "cached_eval_replay.json").exists()
     assert (root / "human_review_samples.md").exists()
     assert (root / "paragraph_review_table.md").exists()
+    assert (root / "provider_retry_log.json").exists()
+    assert (root / "human_review_final" / "human_review_final.md").exists()
+    assert (root / "human_review_final" / "human_review_final.json").exists()
+    assert (root / "human_review_final" / "human_review_summary.md").exists()
+    assert (root / "human_review_final" / "human_review_table.csv").exists()
+    instructions = (root / "human_review_final" / "approval_instructions.md").read_text(
+        encoding="utf-8"
+    )
+    assert "nts eval review-stable --run" in instructions
+    assert "--approve --json" in instructions
+    assert "--reject --reason" in instructions
     if data["pass"]:
         assert (root / "stable_prompt.md").exists()
     else:

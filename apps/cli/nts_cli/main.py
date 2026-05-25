@@ -15,6 +15,9 @@ from nts_core.corrections import (
 from nts_core.doctor import build_doctor_report
 from nts_core.eval_harness import (
     DEFAULT_LIMITS,
+    DEFAULT_PROVIDER_RETRY_ATTEMPTS,
+    DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS,
+    DEFAULT_PROVIDER_RUN_RETRY_ATTEMPTS,
     TINY_PARAGRAPH_THRESHOLD,
     UNIT_TARGET_MIN_CHARS,
     compare_translation,
@@ -873,6 +876,27 @@ def eval_validate_stable_prompt(
     tiny_paragraph_threshold: Annotated[int, typer.Option("--tiny-paragraph-threshold")] = TINY_PARAGRAPH_THRESHOLD,
     unit_target_min_chars: Annotated[int, typer.Option("--unit-target-min-chars")] = UNIT_TARGET_MIN_CHARS,
     stable_run_count: Annotated[int, typer.Option("--stable-run-count")] = 3,
+    provider_retry_attempts: Annotated[
+        int,
+        typer.Option(
+            "--provider-retry-attempts",
+            help="Retry attempts for retryable provider failures within each sample.",
+        ),
+    ] = DEFAULT_PROVIDER_RETRY_ATTEMPTS,
+    provider_run_retry_attempts: Annotated[
+        int,
+        typer.Option(
+            "--provider-run-retry-attempts",
+            help="Run-level retries when a validation run fails only from retryable provider errors.",
+        ),
+    ] = DEFAULT_PROVIDER_RUN_RETRY_ATTEMPTS,
+    provider_retry_backoff_seconds: Annotated[
+        float,
+        typer.Option(
+            "--provider-retry-backoff-seconds",
+            help="Base exponential backoff in seconds for provider retries.",
+        ),
+    ] = DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
     verbose_json: Annotated[
         bool,
@@ -899,6 +923,9 @@ def eval_validate_stable_prompt(
             merge_tiny_paragraphs=merge_tiny_paragraphs,
             tiny_paragraph_threshold=tiny_paragraph_threshold,
             unit_target_min_chars=unit_target_min_chars,
+            provider_retry_attempts=provider_retry_attempts,
+            provider_run_retry_attempts=provider_run_retry_attempts,
+            provider_retry_backoff_seconds=provider_retry_backoff_seconds,
         )
     except ValueError as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)

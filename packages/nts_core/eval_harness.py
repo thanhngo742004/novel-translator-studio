@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import hashlib
+import csv
 import json
 import os
 import re
@@ -52,6 +53,16 @@ UNIT_HIGH_RISK_TARGET_MAX_CHARS = 600
 UNIT_COMBINED_TARGET_MAX_CHARS = 900
 PARAGRAPH_BATCH_SIZE = 12
 ALIGNMENT_QUALITY_THRESHOLD = 0.70
+DEFAULT_PROVIDER_RETRY_ATTEMPTS = 3
+DEFAULT_PROVIDER_RUN_RETRY_ATTEMPTS = 1
+DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS = 5.0
+RETRYABLE_PROVIDER_HTTP_STATUSES = {408, 429, 500, 502, 503, 504, 524}
+NON_RETRYABLE_PROVIDER_HTTP_STATUSES = {400, 401, 403}
+PROVIDER_ONLY_FAILURE_REASONS = {
+    "provider_error",
+    "provider_failure_empty_output",
+    "provider_retry_exhausted",
+}
 
 SCORE_WEIGHTS = {
     "meaning_accuracy": 25,
@@ -2264,6 +2275,226 @@ def _chat_completion(
     return data["choices"][0]["message"]["content"]
 
 
+def mask_provider_error_message(message: str, *, limit: int = 500) -> str:
+    text = str(message or "")
+    text = re.sub(r"(?i)Bearer\s+[A-Za-z0-9._\-]+", "Bearer ***", text)
+    text = re.sub(
+        r"(?i)(api[_-]?key|authorization|token)\s*[:=]\s*['\"]?[A-Za-z0-9._\-]{8,}",
+        r"\1=***",
+        text,
+    )
+    return text[:limit]
+
+
+def classify_provider_error(error: Any) -> dict[str, Any]:
+    message = mask_provider_error_message(str(error))
+    lowered = message.lower()
+    status_match = re.search(r"(?:http error|http status|status)\s+(\d{3})", lowered)
+    http_status = int(status_match.group(1)) if status_match else None
+    non_retry_keywords = [
+        "invalid api key",
+        "unauthorized",
+        "forbidden",
+        "invalid model",
+        "model_not_found",
+        "malformed request",
+        "bad request",
+        "content policy",
+        "policy violation",
+        "schema error",
+        "configuration error",
+    ]
+    retry_keywords = [
+        "timeout",
+        "timed out",
+        "connection reset",
+        "temporarily unavailable",
+        "temporary upstream",
+        "upstream error",
+        "gateway timeout",
+        "service unavailable",
+    ]
+    if http_status in NON_RETRYABLE_PROVIDER_HTTP_STATUSES or any(
+        keyword in lowered for keyword in non_retry_keywords
+    ):
+        retryable = False
+    elif http_status in RETRYABLE_PROVIDER_HTTP_STATUSES:
+        retryable = True
+    else:
+        retryable = any(keyword in lowered for keyword in retry_keywords)
+
+    if http_status is not None:
+        provider_error_type = "http_error"
+    elif any(keyword in lowered for keyword in retry_keywords):
+        provider_error_type = "network_or_timeout"
+    elif any(keyword in lowered for keyword in non_retry_keywords):
+        provider_error_type = "non_retryable_provider_error"
+    else:
+        provider_error_type = "provider_error"
+    return {
+        "provider_error_type": provider_error_type,
+        "http_status": http_status,
+        "retryable": retryable,
+        "error_message_masked": message,
+    }
+
+
+def provider_error_record(
+    error: Any,
+    *,
+    attempt_no: int,
+    max_attempts: int,
+    retry_scope: str,
+    status: str,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    classification = classify_provider_error(error)
+    return {
+        **classification,
+        "attempt_no": attempt_no,
+        "max_attempts": max_attempts,
+        "retry_scope": retry_scope,
+        "status": status,
+        "created_at": utc_now(),
+        **(context or {}),
+    }
+
+
+def provider_retry_id(context: dict[str, Any] | None) -> str:
+    context = context or {}
+    parts = [
+        str(context.get("validation_index", "")),
+        str(context.get("run_retry_no", "")),
+        str(context.get("sample_id", "")),
+        str(context.get("model", "")),
+        str(context.get("phase", "")),
+        str(context.get("batch_index", "")),
+        str(context.get("paragraph_id", "")),
+    ]
+    return ":".join(parts)
+
+
+def chat_completion_with_provider_retry(
+    provider: EvalProvider,
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    max_tokens: int | None = None,
+    retry_attempts: int = 1,
+    retry_backoff_seconds: float = 0.0,
+    retry_log_entries: list[dict[str, Any]] | None = None,
+    retry_context: dict[str, Any] | None = None,
+) -> str:
+    max_attempts = max(1, int(retry_attempts or 1))
+    context = dict(retry_context or {})
+    context.setdefault("model", model)
+    context.setdefault("retry_id", provider_retry_id(context))
+    last_error: ValueError | None = None
+    for attempt_no in range(1, max_attempts + 1):
+        try:
+            raw = _chat_completion(
+                provider,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+            )
+        except ValueError as exc:
+            last_error = exc
+            classification = classify_provider_error(exc)
+            final_attempt = attempt_no >= max_attempts
+            status = (
+                "non_retryable_failure"
+                if not classification["retryable"]
+                else "exhausted"
+                if final_attempt
+                else "failed_attempt"
+            )
+            if retry_log_entries is not None:
+                retry_log_entries.append(
+                    provider_error_record(
+                        exc,
+                        attempt_no=attempt_no,
+                        max_attempts=max_attempts,
+                        retry_scope="sample",
+                        status=status,
+                        context=context,
+                    )
+                )
+            if not classification["retryable"] or final_attempt:
+                raise
+            if retry_backoff_seconds > 0:
+                time.sleep(retry_backoff_seconds * (2 ** (attempt_no - 1)))
+            continue
+        if attempt_no > 1 and retry_log_entries is not None:
+            retry_log_entries.append(
+                {
+                    "provider_error_type": None,
+                    "http_status": None,
+                    "retryable": True,
+                    "attempt_no": attempt_no,
+                    "max_attempts": max_attempts,
+                    "retry_scope": "sample",
+                    "status": "succeeded_after_retry",
+                    "error_message_masked": None,
+                    "created_at": utc_now(),
+                    **context,
+                }
+            )
+        return raw
+    if last_error is not None:
+        raise last_error
+    raise ValueError("Provider retry failed without an exception.")
+
+
+def summarize_provider_retry_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        retry_id = str(entry.get("retry_id") or len(grouped))
+        grouped.setdefault(retry_id, []).append(entry)
+    sample_retries_attempted = 0
+    sample_retries_succeeded = 0
+    sample_retries_exhausted = 0
+    run_retries_attempted = 0
+    final_provider_failure_count = 0
+    for group in grouped.values():
+        scope = group[-1].get("retry_scope", "sample")
+        if scope == "run":
+            run_retries_attempted += sum(1 for item in group if item.get("status") == "run_retry_attempted")
+            continue
+        attempts = [
+            int(item.get("attempt_no") or 1)
+            for item in group
+            if item.get("attempt_no") is not None
+        ]
+        max_seen_attempt = max(attempts) if attempts else 1
+        sample_retries_attempted += max(0, max_seen_attempt - 1)
+        final_status = group[-1].get("status")
+        if final_status == "succeeded_after_retry":
+            sample_retries_succeeded += 1
+        elif final_status == "exhausted":
+            sample_retries_exhausted += 1
+            final_provider_failure_count += 1
+        elif final_status == "non_retryable_failure":
+            final_provider_failure_count += 1
+    return {
+        "retryable_failures": sum(
+            1
+            for entry in entries
+            if entry.get("retryable") is True
+            and entry.get("status") in {"failed_attempt", "exhausted"}
+        ),
+        "non_retryable_failures": sum(
+            1 for entry in entries if entry.get("status") == "non_retryable_failure"
+        ),
+        "sample_retries_attempted": sample_retries_attempted,
+        "sample_retries_succeeded": sample_retries_succeeded,
+        "sample_retries_exhausted": sample_retries_exhausted,
+        "run_retries_attempted": run_retries_attempted,
+        "final_provider_failure_count": final_provider_failure_count,
+        "entry_count": len(entries),
+    }
+
+
 def learn_style(
     *,
     project: str,
@@ -2956,6 +3187,10 @@ def compress_offending_paragraphs(
     sample: dict[str, Any],
     paragraphs: list[dict[str, str]],
     glossary: dict[str, Any],
+    provider_retry_attempts: int = 1,
+    provider_retry_backoff_seconds: float = 0.0,
+    provider_retry_log_entries: list[dict[str, Any]] | None = None,
+    provider_retry_context: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     before_table = per_paragraph_length_table(sample, paragraphs)
     offending_ids = [row["paragraph_id"] for row in before_table if row["over_strict_max"]]
@@ -2986,7 +3221,7 @@ def compress_offending_paragraphs(
                 previous_failure_reasons=failure_reasons,
             )
             try:
-                raw = _chat_completion(
+                raw = chat_completion_with_provider_retry(
                     provider,
                     model=model,
                     messages=[
@@ -3001,12 +3236,23 @@ def compress_offending_paragraphs(
                         {"role": "user", "content": prompt},
                     ],
                     max_tokens=max_tokens_for_paragraph_pairs([pair]),
+                    retry_attempts=provider_retry_attempts,
+                    retry_backoff_seconds=provider_retry_backoff_seconds,
+                    retry_log_entries=provider_retry_log_entries,
+                    retry_context={
+                        **(provider_retry_context or {}),
+                        "phase": "compression",
+                        "paragraph_id": paragraph_id,
+                        "compression_attempt": attempt,
+                    },
                 ).strip()
             except ValueError as exc:
+                classification = classify_provider_error(exc)
                 error = {
                     "attempt": attempt,
                     "paragraph_id": paragraph_id,
                     "error": str(exc),
+                    "classification": classification,
                 }
                 provider_errors.append(error)
                 attempts.append(
@@ -3015,6 +3261,7 @@ def compress_offending_paragraphs(
                         "valid": False,
                         "reasons": ["provider_error"],
                         "error": str(exc),
+                        "provider_error_classification": classification,
                     }
                 )
                 failure_reasons = ["provider_error"]
@@ -3176,6 +3423,10 @@ def translate_samples(
     sample_limit: int | None = None,
     prompt_iteration: int = 1,
     stable_prompt_text: str | None = None,
+    provider_retry_attempts: int = 1,
+    provider_retry_backoff_seconds: float = 0.0,
+    validation_index: int | None = None,
+    run_retry_no: int = 0,
 ) -> dict[str, Any]:
     if not models:
         raise ValueError("At least one model must be provided.")
@@ -3197,6 +3448,7 @@ def translate_samples(
     outputs_by_sample: dict[str, dict[str, Any]] = {}
     outputs_by_model: dict[str, Any] = {}
     compression_entries: list[dict[str, Any]] = []
+    provider_retry_entries: list[dict[str, Any]] = []
     failed_models: set[str] = set()
     translations_root = run_dir / "translation_outputs"
     translations_root.mkdir(parents=True, exist_ok=True)
@@ -3233,6 +3485,7 @@ def translate_samples(
             global_ratio_before_compression = None
             best_effort_used = False
             provider_error = None
+            provider_error_classification = None
             provider_json_failures: list[dict[str, Any]] = []
             unresolved_provider_json_failures: list[dict[str, Any]] = []
             term_repairs: list[dict[str, Any]] = []
@@ -3262,7 +3515,7 @@ def translate_samples(
                         paragraph_pairs=pair_batch,
                     )
                     try:
-                        raw_chunk = _chat_completion(
+                        raw_chunk = chat_completion_with_provider_retry(
                             provider,
                             model=model,
                             messages=[
@@ -3270,14 +3523,27 @@ def translate_samples(
                                 {"role": "user", "content": user_prompt},
                             ],
                             max_tokens=max_tokens_for_paragraph_pairs(pair_batch),
+                            retry_attempts=provider_retry_attempts,
+                            retry_backoff_seconds=provider_retry_backoff_seconds,
+                            retry_log_entries=provider_retry_entries,
+                            retry_context={
+                                "validation_index": validation_index,
+                                "run_retry_no": run_retry_no,
+                                "sample_id": sample_id,
+                                "model": model,
+                                "phase": "translation",
+                                "batch_index": batch_index,
+                            },
                         ).strip()
                     except ValueError as exc:
                         provider_error = str(exc)
+                        provider_error_classification = classify_provider_error(exc)
                         raw_chunks.append(
                             json_dumps(
                                 {
                                     "batch_index": batch_index,
                                     "provider_error": provider_error,
+                                    "provider_error_classification": provider_error_classification,
                                 }
                             )
                         )
@@ -3303,7 +3569,7 @@ def translate_samples(
                             raw_output=raw_chunk,
                         )
                         try:
-                            retry_chunk = _chat_completion(
+                            retry_chunk = chat_completion_with_provider_retry(
                                 provider,
                                 model=model,
                                 messages=[
@@ -3317,13 +3583,26 @@ def translate_samples(
                                     {"role": "user", "content": retry_prompt},
                                 ],
                                 max_tokens=max_tokens_for_paragraph_pairs(pair_batch),
+                                retry_attempts=provider_retry_attempts,
+                                retry_backoff_seconds=provider_retry_backoff_seconds,
+                                retry_log_entries=provider_retry_entries,
+                                retry_context={
+                                    "validation_index": validation_index,
+                                    "run_retry_no": run_retry_no,
+                                    "sample_id": sample_id,
+                                    "model": model,
+                                    "phase": "provider_json_repair",
+                                    "batch_index": batch_index,
+                                },
                             ).strip()
                         except ValueError as exc:
+                            classification = classify_provider_error(exc)
                             provider_json_failures.append(
                                 {
                                     "batch_index": batch_index,
                                     "attempt": 2,
                                     "provider_error": str(exc),
+                                    "provider_error_classification": classification,
                                     "resolved_by_retry": False,
                                 }
                             )
@@ -3332,6 +3611,7 @@ def translate_samples(
                                     "batch_index": batch_index,
                                     "reason": "provider_error",
                                     "error": str(exc),
+                                    "provider_error_classification": classification,
                                 }
                             )
                             parsed_chunk = []
@@ -3403,12 +3683,24 @@ def translate_samples(
                         sample=sample,
                         paragraphs=parsed,
                         glossary=glossary,
+                        provider_retry_attempts=provider_retry_attempts,
+                        provider_retry_backoff_seconds=provider_retry_backoff_seconds,
+                        provider_retry_log_entries=provider_retry_entries,
+                        provider_retry_context={
+                            "validation_index": validation_index,
+                            "run_retry_no": run_retry_no,
+                            "sample_id": sample_id,
+                            "model": model,
+                        },
                     )
                     if compression_result["triggered"]:
                         retry_triggered = True
                         retry_reason = "paragraph_compression_pass"
                         if compression_result.get("provider_errors"):
                             provider_error = "compression_provider_error"
+                            provider_error_classification = compression_result[
+                                "provider_errors"
+                            ][0].get("classification") or classify_provider_error(provider_error)
                         compression_entries.append(
                             {
                                 "model": model,
@@ -3471,13 +3763,42 @@ def translate_samples(
                 if provider_error:
                     verification_after["pass"] = False
                     verification_after["reasons"].append("provider_error")
+                    provider_error_classification = (
+                        provider_error_classification or classify_provider_error(provider_error)
+                    )
+                    verification_after["provider_error_classification"] = (
+                        provider_error_classification
+                    )
+                    provider_failure_empty_output = not any(
+                        paragraph.get("text", "").strip() for paragraph in final_paragraphs
+                    )
+                    if provider_failure_empty_output:
+                        verification_after["reasons"] = [
+                            reason
+                            for reason in verification_after["reasons"]
+                            if reason != "paragraph_truncation_detected"
+                        ]
+                        for reason in (
+                            "provider_failure_empty_output",
+                            "provider_retry_exhausted"
+                            if provider_error_classification.get("retryable")
+                            else None,
+                        ):
+                            if reason and reason not in verification_after["reasons"]:
+                                verification_after["reasons"].append(reason)
+                        verification_after["truncated_paragraphs"] = []
+                        for row in verification_after.get("per_paragraph_length_table", []):
+                            if int(row.get("output_char_count") or 0) == 0:
+                                row["truncation_detected"] = False
+                                row["truncation_reasons"] = ["provider_failure_empty_output"]
+                        verification_after["provider_failure_empty_output"] = True
                 final = render_paragraph_translation(sample, final_paragraphs)
                 (sample_dir / f"{safe_model}_structured_final.json").write_text(
                     json_dumps({"paragraphs": final_paragraphs}) + "\n",
                     encoding="utf-8",
                 )
             else:
-                initial = _chat_completion(
+                initial = chat_completion_with_provider_retry(
                     provider,
                     model=model,
                     messages=[
@@ -3485,6 +3806,16 @@ def translate_samples(
                         {"role": "user", "content": source},
                     ],
                     max_tokens=max_tokens_for_sample(sample),
+                    retry_attempts=provider_retry_attempts,
+                    retry_backoff_seconds=provider_retry_backoff_seconds,
+                    retry_log_entries=provider_retry_entries,
+                    retry_context={
+                        "validation_index": validation_index,
+                        "run_retry_no": run_retry_no,
+                        "sample_id": sample_id,
+                        "model": model,
+                        "phase": "translation_plain",
+                    },
                 ).strip()
                 initial_output_char_count = len(initial)
                 initial_path.write_text(initial + "\n", encoding="utf-8")
@@ -3493,7 +3824,7 @@ def translate_samples(
                     retry_triggered = True
                     retry_reason = length_retry_reason(initial, sample)
                     retry_prompt = concise_rewrite_prompt(sample=sample, output=initial)
-                    retry = _chat_completion(
+                    retry = chat_completion_with_provider_retry(
                         provider,
                         model=model,
                         messages=[
@@ -3504,6 +3835,16 @@ def translate_samples(
                             {"role": "user", "content": retry_prompt},
                         ],
                         max_tokens=max_tokens_for_sample(sample, retry=True),
+                        retry_attempts=provider_retry_attempts,
+                        retry_backoff_seconds=provider_retry_backoff_seconds,
+                        retry_log_entries=provider_retry_entries,
+                        retry_context={
+                            "validation_index": validation_index,
+                            "run_retry_no": run_retry_no,
+                            "sample_id": sample_id,
+                            "model": model,
+                            "phase": "length_retry",
+                        },
                     ).strip()
                     retry_path = sample_dir / f"{safe_model}_retry.txt"
                     retry_path.write_text(retry + "\n", encoding="utf-8")
@@ -3537,6 +3878,7 @@ def translate_samples(
                 "translation_unit_merge_count": sample.get("translation_unit_merge_count", 0),
                 "best_effort_rendering_used": best_effort_used,
                 "provider_error": provider_error,
+                "provider_error_classification": provider_error_classification,
                 "provider_json_failures": provider_json_failures,
                 "unresolved_provider_json_failures": unresolved_provider_json_failures,
                 "paragraph_validation": paragraph_validation,
@@ -3561,6 +3903,17 @@ def translate_samples(
             outputs_by_sample[sample_id][model] = metadata
             outputs_by_model.setdefault(model, metadata)
 
+    provider_retry_summary = summarize_provider_retry_entries(provider_retry_entries)
+    provider_retry_log = {
+        "schema_version": "provider_retry_log_v1",
+        "provider": provider_key,
+        "models": models,
+        "validation_index": validation_index,
+        "run_retry_no": run_retry_no,
+        "summary": provider_retry_summary,
+        "entries": provider_retry_entries,
+    }
+    write_json(run_dir / "provider_retry_log.json", provider_retry_log)
     metadata_payload = {
         "models": models,
         "samples": outputs_by_sample,
@@ -3573,6 +3926,8 @@ def translate_samples(
         "tiny_paragraph_threshold": tiny_paragraph_threshold,
         "unit_target_min_chars": unit_target_min_chars,
         "stable_prompt_sha256": sha256_text(stable_prompt_text) if stable_prompt_text else None,
+        "provider_retry_summary": provider_retry_summary,
+        "provider_retry_log": str(run_dir / "provider_retry_log.json"),
     }
     write_json(translations_root / "translation_metadata.json", metadata_payload)
     write_json(
@@ -3589,6 +3944,8 @@ def translate_samples(
         "outputs": outputs_by_sample,
         "outputs_by_model": outputs_by_model,
         "samples": samples,
+        "provider_retry_summary": provider_retry_summary,
+        "provider_retry_log": str(run_dir / "provider_retry_log.json"),
     }
 
 
@@ -4046,6 +4403,13 @@ def compare_multi_sample_outputs(
                 "global_ratio_after_compression"
             )
             score["compression_count"] = output_meta.get("compression_count", 0)
+            score["provider_error"] = output_meta.get("provider_error")
+            score["provider_error_classification"] = output_meta.get(
+                "provider_error_classification"
+            )
+            score["provider_failure_empty_output"] = (
+                output_meta.get("verification_after_compression", {}) or {}
+            ).get("provider_failure_empty_output", False)
             per_sample.append(score)
         if not per_sample:
             continue
@@ -4578,6 +4942,9 @@ def run_candidate_validation_once(
     unit_target_min_chars: int,
     stable_prompt_text: str,
     validation_index: int,
+    run_retry_no: int = 0,
+    provider_retry_attempts: int = DEFAULT_PROVIDER_RETRY_ATTEMPTS,
+    provider_retry_backoff_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS,
 ) -> dict[str, Any]:
     prepared = prepare_parallel(
         project=project,
@@ -4619,6 +4986,7 @@ def run_candidate_validation_once(
         )
         return {
             "validation_index": validation_index,
+            "run_retry_no": run_retry_no,
             "run_dir": str(run_dir),
             "sample_start_ratio": sample_start_ratio,
             "selected_samples": [
@@ -4641,6 +5009,8 @@ def run_candidate_validation_once(
             ],
             "style_profile": style["style_profile"],
             "translations": {},
+            "provider_retry_summary": summarize_provider_retry_entries([]),
+            "provider_retry_log": None,
             "report": report,
             "candidate_prompt_sha256": sha256_text(stable_prompt_text),
             "alignment_gate_failed": True,
@@ -4665,6 +5035,10 @@ def run_candidate_validation_once(
         unit_target_min_chars=unit_target_min_chars,
         prompt_iteration=ACTIVE_PROMPT_ITERATION,
         stable_prompt_text=stable_prompt_text,
+        provider_retry_attempts=provider_retry_attempts,
+        provider_retry_backoff_seconds=provider_retry_backoff_seconds,
+        validation_index=validation_index,
+        run_retry_no=run_retry_no,
     )
     compared = compare_translation(
         project=project,
@@ -4681,6 +5055,7 @@ def run_candidate_validation_once(
     )
     return {
         "validation_index": validation_index,
+        "run_retry_no": run_retry_no,
         "run_dir": str(run_dir),
         "sample_start_ratio": sample_start_ratio,
         "selected_samples": [
@@ -4701,6 +5076,8 @@ def run_candidate_validation_once(
         ],
         "style_profile": style["style_profile"],
         "translations": translated["outputs"],
+        "provider_retry_summary": translated.get("provider_retry_summary"),
+        "provider_retry_log": translated.get("provider_retry_log"),
         "report": compared["report"],
         "candidate_prompt_sha256": sha256_text(stable_prompt_text),
     }
@@ -4809,6 +5186,10 @@ def stable_gate_result(
                     "accepted_for_stable_validation": sample.get(
                         "accepted_for_stable_validation"
                     ),
+                    "provider_error": sample.get("provider_error"),
+                    "provider_error_classification": sample.get(
+                        "provider_error_classification"
+                    ),
                     "reasons": sorted(set(sample_reasons)),
                 }
             )
@@ -4847,6 +5228,84 @@ def stable_gate_result(
     }
 
 
+def validation_run_failed_only_retryable_provider(
+    run: dict[str, Any],
+    *,
+    selected_model: str,
+) -> bool:
+    model_report = run.get("report", {}).get("models", {}).get(selected_model, {})
+    failed_samples = [
+        sample for sample in model_report.get("samples", []) if sample.get("pass") is not True
+    ]
+    if not failed_samples:
+        return False
+    translations = run.get("translations", {})
+    for sample in failed_samples:
+        sample_id = sample.get("sample_id")
+        metadata = (
+            translations.get(sample_id, {}).get(selected_model, {})
+            if isinstance(translations, dict)
+            else {}
+        )
+        classification = metadata.get("provider_error_classification") or sample.get(
+            "provider_error_classification"
+        )
+        if not metadata.get("provider_error") or not classification:
+            return False
+        if classification.get("retryable") is not True:
+            return False
+        verification_reasons = set(sample.get("verification_reasons", []) or [])
+        non_provider_reasons = verification_reasons - PROVIDER_ONLY_FAILURE_REASONS
+        tolerated_empty_side_effects = {
+            "model_output_failed_paragraph_json_validation",
+            "rendered_paragraph_count_mismatch",
+            "global_ratio_outside_range",
+            "terminology_mismatch",
+        }
+        if non_provider_reasons - tolerated_empty_side_effects:
+            return False
+    return True
+
+
+def read_provider_retry_entries(run: dict[str, Any]) -> list[dict[str, Any]]:
+    path_value = run.get("provider_retry_log")
+    if not path_value:
+        return []
+    path = Path(path_value)
+    if not path.exists():
+        return []
+    try:
+        payload = read_json(path)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+    entries = payload.get("entries", [])
+    return entries if isinstance(entries, list) else []
+
+
+def aggregate_provider_retry_summary(
+    validation_runs: list[dict[str, Any]],
+    run_retry_entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    entries = list(run_retry_entries)
+    for run in validation_runs:
+        entries.extend(read_provider_retry_entries(run))
+    summary = summarize_provider_retry_entries(entries)
+    final_provider_failure_count = 0
+    for run in validation_runs:
+        selected_model = run.get("report", {}).get("best_model")
+        if not selected_model:
+            models = run.get("report", {}).get("models", {})
+            selected_model = next(iter(models), None)
+        for by_model in (run.get("translations", {}) or {}).values():
+            if not isinstance(by_model, dict):
+                continue
+            metadata = by_model.get(selected_model)
+            if isinstance(metadata, dict) and metadata.get("provider_error"):
+                final_provider_failure_count += 1
+    summary["final_provider_failure_count"] = final_provider_failure_count
+    return {**summary, "entries": entries}
+
+
 def _load_structured_paragraphs(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
@@ -4874,6 +5333,11 @@ def write_cached_eval_exports(
     for run in validation_runs:
         run_dir = Path(run["run_dir"])
         samples = read_selected_samples(run_dir)
+        glossary = (
+            read_json(run_dir / "glossary_candidates.json")
+            if (run_dir / "glossary_candidates.json").exists()
+            else {}
+        )
         report = run["report"]
         model_report = report.get("models", {}).get(selected_model, {})
         score_lookup = {
@@ -4882,6 +5346,22 @@ def write_cached_eval_exports(
         }
         for sample in samples:
             sample_id = sample["sample_id"]
+            sample_metadata = (
+                run.get("translations", {})
+                .get(sample_id, {})
+                .get(selected_model, {})
+                if isinstance(run.get("translations", {}), dict)
+                else {}
+            )
+            provider_error = sample_metadata.get("provider_error")
+            provider_error_classification = sample_metadata.get(
+                "provider_error_classification"
+            )
+            provider_failure_empty_output = bool(
+                (
+                    sample_metadata.get("verification_after_compression", {}) or {}
+                ).get("provider_failure_empty_output")
+            )
             initial_lookup = _load_structured_paragraphs(
                 run_dir / "translation_outputs" / sample_id / f"{safe_model}_structured_initial.json"
             )
@@ -4899,6 +5379,13 @@ def write_cached_eval_exports(
                     source_text=pair.get("source_text"),
                     strict_max=pair.get("strict_max"),
                 )
+                if provider_error and provider_failure_empty_output and not after.strip():
+                    truncation = {
+                        "is_truncated": False,
+                        "reasons": ["provider_failure_empty_output"],
+                    }
+                required_terms = required_terms_for_pair(pair, glossary)
+                missing_terms = required_terms_missing(pair, after, glossary)
                 replay_rows.append(
                     {
                         "validation_index": run["validation_index"],
@@ -4937,6 +5424,11 @@ def write_cached_eval_exports(
                         ),
                         "truncation_detected": truncation["is_truncated"],
                         "truncation_reasons": truncation["reasons"],
+                        "provider_error": provider_error,
+                        "provider_error_classification": provider_error_classification,
+                        "provider_failure_empty_output": provider_failure_empty_output,
+                        "required_terms": required_terms,
+                        "missing_terms": missing_terms,
                         "alignment_quality": sample.get("alignment_quality"),
                         "alignment_warnings": sample.get("alignment_warnings", []),
                         "accepted_for_stable_validation": sample.get(
@@ -5072,6 +5564,7 @@ def write_stable_decision_outputs(
             "validation_runs": [
                 {
                     "validation_index": run["validation_index"],
+                    "run_retry_no": run.get("run_retry_no", 0),
                     "run_dir": run["run_dir"],
                     "sample_start_ratio": run["sample_start_ratio"],
                     "candidate_prompt_sha256": run["candidate_prompt_sha256"],
@@ -5122,6 +5615,365 @@ def write_stable_decision_outputs(
     }
 
 
+def _review_run_argument(validation_root: Path) -> str:
+    try:
+        return str(validation_root.resolve().relative_to(repo_root().resolve())).replace("\\", "/")
+    except ValueError:
+        return str(validation_root)
+
+
+def _human_review_status(report: dict[str, Any]) -> str:
+    if report.get("pass") and report.get("decision_outputs", {}).get("stable_prompt_created"):
+        return "READY FOR HUMAN REVIEW"
+    return "NOT APPROVABLE"
+
+
+def write_final_human_review_package(
+    *,
+    validation_root: Path,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    review_root = validation_root / "human_review_final"
+    review_root.mkdir(parents=True, exist_ok=True)
+    replay_path = validation_root / "cached_eval_replay.json"
+    replay_report_path = validation_root / "replay_report.json"
+    replay = read_json(replay_path) if replay_path.exists() else {"rows": []}
+    replay_report = read_json(replay_report_path) if replay_report_path.exists() else {}
+    rows = replay.get("rows", []) if isinstance(replay.get("rows"), list) else []
+    counts = _stable_validation_counts(report)
+    retry_summary = report.get("provider_retry_summary", {})
+    status = _human_review_status(report)
+    run_arg = _review_run_argument(validation_root)
+    sample_lookup: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        sample_lookup.setdefault(
+            (int(row.get("validation_index") or 0), str(row.get("sample_id") or "")),
+            [],
+        ).append(row)
+
+    sample_scores = {
+        (int(item.get("validation_index") or 0), str(item.get("sample_id") or "")): item
+        for item in report.get("gate", {}).get("per_sample_scores", [])
+    }
+    payload = {
+        "schema_version": "human_review_final_v1",
+        "project": report.get("project"),
+        "provider": report.get("provider"),
+        "model": report.get("model"),
+        "prompt_version": (
+            read_json(validation_root / "candidate_prompt_metadata.json").get("prompt_version")
+            if (validation_root / "candidate_prompt_metadata.json").exists()
+            else None
+        ),
+        "validation_status": status,
+        "quality_gate": report.get("quality_gate"),
+        "stable_prompt_created": bool(
+            report.get("decision_outputs", {}).get("stable_prompt_created")
+        ),
+        "run_scores": report.get("gate", {}).get("per_run_scores", []),
+        "sample_scores": report.get("gate", {}).get("per_sample_scores", []),
+        "retry_summary": retry_summary,
+        "compression_summary": counts.get("compression_attempt_summary", {}),
+        "ratio_summary": report.get("gate", {}).get("ratio_summary", {}),
+        "truncation_count": counts.get("truncation_count", 0),
+        "unsafe_compression_count": counts.get("unsafe_compression_count", 0),
+        "provider_failure_count": retry_summary.get(
+            "final_provider_failure_count",
+            len(counts.get("provider_failures", [])),
+        ),
+        "final_pass_fail_reason": "pass"
+        if report.get("pass")
+        else "; ".join(report.get("gate", {}).get("reasons", [])),
+        "samples": [],
+        "created_at": utc_now(),
+    }
+
+    for (validation_index, sample_id), sample_rows in sorted(sample_lookup.items()):
+        score = sample_scores.get((validation_index, sample_id), {})
+        payload["samples"].append(
+            {
+                "validation_index": validation_index,
+                "sample_id": sample_id,
+                "score": score,
+                "source_excerpt": "\n\n".join(
+                    row.get("source_paragraph", "") for row in sample_rows
+                ),
+                "human_reference_excerpt": "\n\n".join(
+                    row.get("human_reference_paragraph", "") for row in sample_rows
+                ),
+                "model_before_compression": "\n\n".join(
+                    row.get("model_paragraph_before_compression", "") for row in sample_rows
+                ),
+                "model_final_output": "\n\n".join(
+                    row.get("model_paragraph_after_compression", "") for row in sample_rows
+                ),
+                "warnings": sorted(
+                    {
+                        warning
+                        for row in sample_rows
+                        for warning in row.get("warnings", []) or []
+                    }
+                ),
+                "units": [
+                    {
+                        "unit_id": row.get("unit_id") or row.get("paragraph_id"),
+                        "source_paragraph_ids": row.get("source_paragraph_ids", []),
+                        "target_paragraph_ids": row.get("target_paragraph_ids", []),
+                        "source_text": row.get("source_paragraph", ""),
+                        "human_reference_text": row.get("human_reference_paragraph", ""),
+                        "model_final_text": row.get("model_paragraph_after_compression", ""),
+                        "required_terms": row.get("required_terms", []),
+                        "missing_terms": row.get("missing_terms", []),
+                        "compression_attempts": row.get("compression_attempts", []),
+                        "safety_status": "fail"
+                        if row.get("truncation_detected")
+                        or row.get("missing_terms")
+                        or row.get("provider_error")
+                        else "pass",
+                        "alignment_quality": row.get("alignment_quality"),
+                        "pass_fail_reason": "; ".join(
+                            row.get("truncation_reasons", []) or []
+                        )
+                        or (
+                            "provider_failure"
+                            if row.get("provider_error")
+                            else "missing_terms"
+                            if row.get("missing_terms")
+                            else "pass"
+                        ),
+                    }
+                    for row in sample_rows
+                ],
+            }
+        )
+    write_json(review_root / "human_review_final.json", payload)
+
+    lines = [
+        "# Human Review Final",
+        "",
+        f"Status: **{status}**",
+        "",
+        f"- Project: `{payload['project']}`",
+        f"- Provider/model: `{payload['provider']}` / `{payload['model']}`",
+        f"- Prompt version: `{payload.get('prompt_version')}`",
+        f"- Quality gate: `{payload['quality_gate']}`",
+        f"- Stable prompt created: `{payload['stable_prompt_created']}`",
+        f"- Run scores: `{json_dumps(payload['run_scores'])}`",
+        f"- Sample scores: `{json_dumps(payload['sample_scores'])}`",
+        f"- Retry summary: `{json_dumps(retry_summary)}`",
+        f"- Compression summary: `{json_dumps(payload['compression_summary'])}`",
+        f"- Ratio summary: `{json_dumps(payload['ratio_summary'])}`",
+        f"- Truncation count: `{payload['truncation_count']}`",
+        f"- Unsafe compression count: `{payload['unsafe_compression_count']}`",
+        f"- Provider failure count: `{payload['provider_failure_count']}`",
+        f"- Final reason: `{payload['final_pass_fail_reason']}`",
+        "",
+    ]
+    for sample in payload["samples"]:
+        score = sample.get("score", {})
+        lines.extend(
+            [
+                f"## Run {sample['validation_index']} / {sample['sample_id']}",
+                "",
+                f"- Score: `{score.get('total_score')}`",
+                f"- Ratio: `{score.get('output_reference_ratio')}`",
+                f"- Warnings: `{json_dumps(sample.get('warnings', []))}`",
+                "- Reviewer decision: APPROVE / REJECT / NEEDS_EDIT",
+                "- Reviewer notes:",
+                "",
+                "Source Chinese excerpt:",
+                "",
+                sample["source_excerpt"],
+                "",
+                "Human Vietnamese reference:",
+                "",
+                sample["human_reference_excerpt"],
+                "",
+                "Model Vietnamese output before compression:",
+                "",
+                sample["model_before_compression"],
+                "",
+                "Final model Vietnamese output after compression/unit merge:",
+                "",
+                sample["model_final_output"],
+                "",
+            ]
+        )
+        for unit in sample["units"]:
+            lines.extend(
+                [
+                    f"### Unit {unit['unit_id']}",
+                    "",
+                    f"- Source paragraph IDs: `{json_dumps(unit['source_paragraph_ids'])}`",
+                    f"- Target paragraph IDs: `{json_dumps(unit['target_paragraph_ids'])}`",
+                    f"- Required terms: `{json_dumps(unit['required_terms'])}`",
+                    f"- Missing terms: `{json_dumps(unit['missing_terms'])}`",
+                    f"- Compression attempts: `{json_dumps(unit['compression_attempts'])}`",
+                    f"- Safety status: `{unit['safety_status']}`",
+                    f"- Alignment quality: `{unit['alignment_quality']}`",
+                    f"- Pass/fail reason: `{unit['pass_fail_reason']}`",
+                    "",
+                ]
+            )
+    (review_root / "human_review_final.md").write_text(
+        "\n".join(lines).rstrip() + "\n",
+        encoding="utf-8",
+    )
+
+    suspicious = [
+        unit
+        for sample in payload["samples"]
+        for unit in sample["units"]
+        if unit["safety_status"] != "pass" or unit.get("alignment_quality", 1.0) < ALIGNMENT_QUALITY_THRESHOLD
+    ]
+    summary_lines = [
+        "# Human Review Summary",
+        "",
+        f"Status: **{status}**",
+        "",
+        "## Approval Recommendation",
+        "",
+        (
+            "The prompt is ready for human review, not automatic production use."
+            if status == "READY FOR HUMAN REVIEW"
+            else "NOT APPROVABLE until the listed validation failures are fixed."
+        ),
+        "",
+        "## Top 5 Strengths",
+        "",
+        "- Strict cached replay is available.",
+        "- Source, reference, and final output are stored for review.",
+        "- Retry attempts are logged and bounded.",
+        "- Compression and truncation diagnostics are retained.",
+        "- Stable prompt is not auto-approved.",
+        "",
+        "## Top 5 Weaknesses",
+        "",
+        f"- Gate reasons: `{payload['final_pass_fail_reason']}`",
+        f"- Provider failure count: `{payload['provider_failure_count']}`",
+        f"- Truncation count: `{payload['truncation_count']}`",
+        f"- Unsafe compression count: `{payload['unsafe_compression_count']}`",
+        f"- Suspicious unit count: `{len(suspicious)}`",
+        "",
+        "## Suspicious Paragraphs Or Units",
+        "",
+    ]
+    if suspicious:
+        summary_lines.extend(
+            f"- `{unit['unit_id']}`: {unit['pass_fail_reason']}" for unit in suspicious[:50]
+        )
+    else:
+        summary_lines.append("- none")
+    summary_lines.extend(
+        [
+            "",
+            "## Production Translation Recommendation",
+            "",
+            (
+                "Do not start production translation until a human approves this stable prompt."
+                if status == "READY FOR HUMAN REVIEW"
+                else "Production translation is not recommended."
+            ),
+            "",
+            "## Review Commands",
+            "",
+            f"Approve: `nts eval review-stable --run {run_arg} --approve --json`",
+            f"Reject: `nts eval review-stable --run {run_arg} --reject --reason \"<reason>\" --json`",
+            "",
+        ]
+    )
+    (review_root / "human_review_summary.md").write_text(
+        "\n".join(summary_lines),
+        encoding="utf-8",
+    )
+
+    with (review_root / "human_review_table.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "validation_index",
+                "sample_id",
+                "unit_id",
+                "source_paragraph_ids",
+                "target_paragraph_ids",
+                "source_text",
+                "human_reference_text",
+                "model_final_text",
+                "required_terms",
+                "missing_terms",
+                "safety_status",
+                "alignment_quality",
+                "pass_fail_reason",
+            ],
+        )
+        writer.writeheader()
+        for sample in payload["samples"]:
+            for unit in sample["units"]:
+                writer.writerow(
+                    {
+                        "validation_index": sample["validation_index"],
+                        "sample_id": sample["sample_id"],
+                        "unit_id": unit["unit_id"],
+                        "source_paragraph_ids": json_dumps(unit["source_paragraph_ids"]),
+                        "target_paragraph_ids": json_dumps(unit["target_paragraph_ids"]),
+                        "source_text": unit["source_text"],
+                        "human_reference_text": unit["human_reference_text"],
+                        "model_final_text": unit["model_final_text"],
+                        "required_terms": json_dumps(unit["required_terms"]),
+                        "missing_terms": json_dumps(unit["missing_terms"]),
+                        "safety_status": unit["safety_status"],
+                        "alignment_quality": unit["alignment_quality"],
+                        "pass_fail_reason": unit["pass_fail_reason"],
+                    }
+                )
+
+    prompt_source = (
+        validation_root / "stable_prompt.md"
+        if (validation_root / "stable_prompt.md").exists()
+        else validation_root / "candidate_prompt.md"
+    )
+    if prompt_source.exists():
+        (review_root / "stable_prompt_for_review.md").write_text(
+            prompt_source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    approval_lines = [
+        "# Approval Instructions",
+        "",
+        "Approve:",
+        "",
+        f"`nts eval review-stable --run {run_arg} --approve --json`",
+        "",
+        "Reject:",
+        "",
+        f"`nts eval review-stable --run {run_arg} --reject --reason \"<reason>\" --json`",
+        "",
+    ]
+    if status != "READY FOR HUMAN REVIEW":
+        approval_lines.extend(
+            [
+                "This run is NOT APPROVABLE. Fix the validation failures before approval.",
+                "",
+            ]
+        )
+    (review_root / "approval_instructions.md").write_text(
+        "\n".join(approval_lines),
+        encoding="utf-8",
+    )
+    return {
+        "human_review_final_dir": str(review_root),
+        "human_review_final": str(review_root / "human_review_final.md"),
+        "human_review_final_json": str(review_root / "human_review_final.json"),
+        "human_review_summary": str(review_root / "human_review_summary.md"),
+        "human_review_table": str(review_root / "human_review_table.csv"),
+        "approval_instructions": str(review_root / "approval_instructions.md"),
+        "stable_prompt_for_review": str(review_root / "stable_prompt_for_review.md")
+        if (review_root / "stable_prompt_for_review.md").exists()
+        else None,
+        "status": status,
+    }
+
+
 def validate_stable_prompt(
     *,
     project: str,
@@ -5139,9 +5991,18 @@ def validate_stable_prompt(
     merge_tiny_paragraphs: bool = True,
     tiny_paragraph_threshold: int = TINY_PARAGRAPH_THRESHOLD,
     unit_target_min_chars: int = UNIT_TARGET_MIN_CHARS,
+    provider_retry_attempts: int = DEFAULT_PROVIDER_RETRY_ATTEMPTS,
+    provider_run_retry_attempts: int = DEFAULT_PROVIDER_RUN_RETRY_ATTEMPTS,
+    provider_retry_backoff_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS,
 ) -> dict[str, Any]:
     if stable_run_count <= 0:
         raise ValueError("--stable-run-count must be greater than 0.")
+    if provider_retry_attempts <= 0:
+        raise ValueError("--provider-retry-attempts must be greater than 0.")
+    if provider_run_retry_attempts < 0:
+        raise ValueError("--provider-run-retry-attempts cannot be negative.")
+    if provider_retry_backoff_seconds < 0:
+        raise ValueError("--provider-retry-backoff-seconds cannot be negative.")
     source_eval_run = _load_source_eval_run(project)
     validation_root = new_run_dir(project, "stable")
     settings = {
@@ -5155,6 +6016,9 @@ def validate_stable_prompt(
         "tiny_paragraph_threshold": tiny_paragraph_threshold,
         "unit_target_min_chars": unit_target_min_chars,
         "stable_run_count": stable_run_count,
+        "provider_retry_attempts": provider_retry_attempts,
+        "provider_run_retry_attempts": provider_run_retry_attempts,
+        "provider_retry_backoff_seconds": provider_retry_backoff_seconds,
     }
     candidate = freeze_stable_candidate(
         validation_root=validation_root,
@@ -5166,9 +6030,11 @@ def validate_stable_prompt(
     )
     offsets = stable_sample_offsets(stable_run_count)
     validation_runs = []
+    run_retry_entries: list[dict[str, Any]] = []
     for index, offset in enumerate(offsets, start=1):
-        validation_runs.append(
-            run_candidate_validation_once(
+        final_run = None
+        for run_retry_no in range(0, max(0, provider_run_retry_attempts) + 1):
+            candidate_run = run_candidate_validation_once(
                 project=project,
                 raw_path=raw_path,
                 translated_path=translated_path,
@@ -5186,8 +6052,69 @@ def validate_stable_prompt(
                 unit_target_min_chars=unit_target_min_chars,
                 stable_prompt_text=candidate["prompt_text"],
                 validation_index=index,
+                run_retry_no=run_retry_no,
+                provider_retry_attempts=provider_retry_attempts,
+                provider_retry_backoff_seconds=provider_retry_backoff_seconds,
             )
-        )
+            final_run = candidate_run
+            should_retry_run = (
+                run_retry_no < max(0, provider_run_retry_attempts)
+                and validation_run_failed_only_retryable_provider(
+                    candidate_run,
+                    selected_model=model,
+                )
+            )
+            if should_retry_run:
+                run_retry_entries.extend(read_provider_retry_entries(candidate_run))
+                run_retry_entries.append(
+                    {
+                        "provider_error_type": "retryable_provider_run_failure",
+                        "http_status": None,
+                        "retryable": True,
+                        "attempt_no": run_retry_no + 1,
+                        "max_attempts": max(0, provider_run_retry_attempts) + 1,
+                        "retry_scope": "run",
+                        "status": "run_retry_attempted",
+                        "error_message_masked": "validation run failed only because of retryable provider errors",
+                        "created_at": utc_now(),
+                        "retry_id": f"run:{index}",
+                        "validation_index": index,
+                        "run_retry_no": run_retry_no,
+                        "run_dir": candidate_run.get("run_dir"),
+                    }
+                )
+                continue
+            break
+        if final_run is not None:
+            validation_runs.append(final_run)
+    provider_retry_summary = aggregate_provider_retry_summary(
+        validation_runs,
+        run_retry_entries,
+    )
+    write_json(
+        validation_root / "provider_retry_summary.json",
+        {
+            "schema_version": "provider_retry_summary_v1",
+            "summary": {
+                key: value
+                for key, value in provider_retry_summary.items()
+                if key != "entries"
+            },
+            "entries": provider_retry_summary.get("entries", []),
+        },
+    )
+    write_json(
+        validation_root / "provider_retry_log.json",
+        {
+            "schema_version": "provider_retry_log_v1",
+            "summary": {
+                key: value
+                for key, value in provider_retry_summary.items()
+                if key != "entries"
+            },
+            "entries": provider_retry_summary.get("entries", []),
+        },
+    )
     gate = stable_gate_result(
         validation_runs=validation_runs,
         selected_model=model,
@@ -5223,6 +6150,8 @@ def validate_stable_prompt(
         "paragraph_review_table": replay_exports.get("paragraph_review_table"),
         "replay_report": strict_replay.get("replay_report"),
         "replay_report_md": strict_replay.get("replay_report_md"),
+        "provider_retry_log": str(validation_root / "provider_retry_log.json"),
+        "provider_retry_summary": str(validation_root / "provider_retry_summary.json"),
         "candidate_prompt": str(validation_root / "candidate_prompt.md"),
         "candidate_prompt_metadata": str(validation_root / "candidate_prompt_metadata.json"),
         **decision_outputs,
@@ -5240,10 +6169,21 @@ def validate_stable_prompt(
         "quality_gate": "pass" if gate["pass"] else "fail",
         "strict_replay": strict_replay,
         "replay_exports": replay_exports,
+        "provider_retry_summary": {
+            key: value for key, value in provider_retry_summary.items() if key != "entries"
+        },
+        "provider_retry_log": str(validation_root / "provider_retry_log.json"),
         "decision_outputs": decision_outputs,
         "report_paths": report_paths,
         "pass": gate["pass"],
     }
+    human_review_final = write_final_human_review_package(
+        validation_root=validation_root,
+        report=report,
+    )
+    report_paths = {**report_paths, **human_review_final}
+    report["report_paths"] = report_paths
+    report["human_review_final"] = human_review_final
     write_json(validation_root / "stable_validation_report.json", report)
     (project_eval_root(project) / "latest.txt").write_text(str(validation_root), encoding="utf-8")
     return {
@@ -5256,6 +6196,7 @@ def validate_stable_prompt(
         "validation_runs": [
             {
                 "validation_index": run["validation_index"],
+                "run_retry_no": run.get("run_retry_no", 0),
                 "run_dir": run["run_dir"],
                 "sample_start_ratio": run["sample_start_ratio"],
                 "candidate_prompt_sha256": run["candidate_prompt_sha256"],
@@ -5264,6 +6205,10 @@ def validate_stable_prompt(
         ],
         "decision_outputs": decision_outputs,
         "replay_exports": replay_exports,
+        "provider_retry_summary": {
+            key: value for key, value in provider_retry_summary.items() if key != "entries"
+        },
+        "human_review_final": human_review_final,
         "report_paths": report_paths,
         "quality_gate": "pass" if gate["pass"] else "fail",
         "selected_model": model,
@@ -5305,6 +6250,10 @@ def _stable_validation_counts(report: dict[str, Any]) -> dict[str, Any]:
                         "sample_id": sample_id,
                         "kind": "provider_error",
                         "message": provider_error,
+                        "classification": metadata.get("provider_error_classification"),
+                        "provider_failure_empty_output": (
+                            metadata.get("verification_after_compression", {}) or {}
+                        ).get("provider_failure_empty_output", False),
                     }
                 )
             for failure in unresolved_json:
@@ -5343,6 +6292,7 @@ def _stable_validation_counts(report: dict[str, Any]) -> dict[str, Any]:
         "truncation_count": truncation_count,
         "unsafe_compression_count": unsafe_compression_count,
         "provider_failures": provider_failures,
+        "provider_retry_summary": report.get("provider_retry_summary", {}),
         "provider_json_failure_count": provider_json_failure_count,
         "compression_attempts": compression_attempts,
         "unit_merge_count": unit_merge_count,
@@ -5380,6 +6330,26 @@ def compact_stable_validation_result(result: dict[str, Any]) -> dict[str, Any]:
         "truncation_count": counts["truncation_count"],
         "unsafe_compression_count": counts["unsafe_compression_count"],
         "provider_failures": counts["provider_failures"],
+        "provider_retry_summary": counts["provider_retry_summary"],
+        "retryable_failures": counts["provider_retry_summary"].get("retryable_failures", 0),
+        "non_retryable_failures": counts["provider_retry_summary"].get(
+            "non_retryable_failures", 0
+        ),
+        "sample_retries_attempted": counts["provider_retry_summary"].get(
+            "sample_retries_attempted", 0
+        ),
+        "sample_retries_succeeded": counts["provider_retry_summary"].get(
+            "sample_retries_succeeded", 0
+        ),
+        "sample_retries_exhausted": counts["provider_retry_summary"].get(
+            "sample_retries_exhausted", 0
+        ),
+        "run_retries_attempted": counts["provider_retry_summary"].get(
+            "run_retries_attempted", 0
+        ),
+        "final_provider_failure_count": counts["provider_retry_summary"].get(
+            "final_provider_failure_count", 0
+        ),
         "provider_json_failure_count": counts["provider_json_failure_count"],
         "unit_merge_count": counts["unit_merge_count"],
         "compression_attempt_summary": counts["compression_attempt_summary"],
@@ -5447,6 +6417,7 @@ def _replay_quality_summary(report: dict[str, Any]) -> dict[str, Any]:
         "low_alignment_quality_sample_count": len(
             report.get("overall", {}).get("low_alignment_quality_samples", [])
         ),
+        "provider_failure_count": report.get("overall", {}).get("provider_failure_count", 0),
     }
 
 
@@ -5499,6 +6470,7 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 "alignment_quality": alignment_quality,
                 "accepted_for_stable_validation": accepted_for_stable,
                 "truncated_paragraphs": [],
+                "provider_failures": [],
                 "ratio_before_values": [],
                 "ratio_after_values": [],
             },
@@ -5517,6 +6489,18 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
         if truncation["is_truncated"]:
             sample_summary["truncated_paragraphs"].append(
                 {"paragraph_id": paragraph_id, "reasons": truncation["reasons"]}
+            )
+        if row.get("provider_error") and not sample_summary["provider_failures"]:
+            sample_summary["provider_failures"].append(
+                {
+                    "provider_error": row.get("provider_error"),
+                    "provider_error_classification": row.get(
+                        "provider_error_classification"
+                    ),
+                    "provider_failure_empty_output": row.get(
+                        "provider_failure_empty_output", False
+                    ),
+                }
             )
         paragraph_diagnostics.append(
             {
@@ -5545,6 +6529,13 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "truncation_detected": truncation["is_truncated"],
                 "truncation_reasons": truncation["reasons"],
+                "provider_error": row.get("provider_error"),
+                "provider_error_classification": row.get("provider_error_classification"),
+                "provider_failure_empty_output": row.get(
+                    "provider_failure_empty_output", False
+                ),
+                "required_terms": row.get("required_terms", []),
+                "missing_terms": row.get("missing_terms", []),
                 "source_paragraph": row.get("source_paragraph", ""),
                 "human_reference_paragraph": row.get("human_reference_paragraph", ""),
                 "model_paragraph_before_compression": row.get(
@@ -5585,6 +6576,14 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 f"{reason}, alignment_quality_below_threshold"
                 if reason and reason != "pass"
                 else "alignment_quality_below_threshold"
+            )
+        if sample.get("provider_failures"):
+            sample["pass"] = False
+            reason = sample.get("reason")
+            sample["reason"] = (
+                f"{reason}, provider_failure"
+                if reason and reason != "pass"
+                else "provider_failure"
             )
         per_sample.append(sample)
     per_sample.sort(key=lambda item: (item["validation_index"], item["sample_id"]))
@@ -5659,8 +6658,22 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
         for sample in per_sample
         if sample.get("accepted_for_stable_validation") is False
     ]
+    provider_failure_samples = [
+        {
+            "validation_index": sample["validation_index"],
+            "sample_id": sample["sample_id"],
+            "provider_failures": sample.get("provider_failures", []),
+        }
+        for sample in per_sample
+        if sample.get("provider_failures")
+    ]
     all_samples_pass = bool(per_sample) and all(sample.get("pass") is True for sample in per_sample)
-    strict_replay_pass = all_samples_pass and not truncated_paragraphs and not low_quality_samples
+    strict_replay_pass = (
+        all_samples_pass
+        and not truncated_paragraphs
+        and not low_quality_samples
+        and not provider_failure_samples
+    )
     overall = {
         "average_score": round(sum(all_scores) / len(all_scores), 2) if all_scores else None,
         "all_samples_pass": all_samples_pass,
@@ -5668,6 +6681,8 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
         "truncated_paragraph_count": len(truncated_paragraphs),
         "truncated_paragraphs": truncated_paragraphs,
         "low_alignment_quality_samples": low_quality_samples,
+        "provider_failure_samples": provider_failure_samples,
+        "provider_failure_count": len(provider_failure_samples),
         "ratio_after_summary": {
             "min": min(all_after_ratios) if all_after_ratios else None,
             "max": max(all_after_ratios) if all_after_ratios else None,
@@ -5691,6 +6706,7 @@ def _md_cell(value: Any, limit: int = 120) -> str:
 
 def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
     overall = report["overall"]
+    retry_summary = report.get("retry_summary", {})
     lines = [
         "# Cached Eval Replay Report",
         "",
@@ -5699,6 +6715,12 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
         f"- All samples pass: `{overall.get('all_samples_pass')}`",
         f"- Strict replay pass: `{overall.get('strict_replay_pass')}`",
         f"- Truncated paragraphs: `{overall.get('truncated_paragraph_count')}`",
+        f"- Provider failures: `{overall.get('provider_failure_count', 0)}`",
+        f"- Retryable provider failures: `{retry_summary.get('retryable_failures', 0)}`",
+        f"- Sample retries attempted: `{retry_summary.get('sample_retries_attempted', 0)}`",
+        f"- Sample retries succeeded: `{retry_summary.get('sample_retries_succeeded', 0)}`",
+        f"- Sample retries exhausted: `{retry_summary.get('sample_retries_exhausted', 0)}`",
+        f"- Run retries attempted: `{retry_summary.get('run_retries_attempted', 0)}`",
         f"- Paragraph rows: `{report.get('row_count')}`",
         "",
     ]
@@ -5887,6 +6909,10 @@ def replay_cached_eval(run: str | Path) -> dict[str, Any]:
     report = summarize_cached_eval_replay(replay)
     report["run_dir"] = str(run_dir)
     report["cached_eval_replay_path"] = str(replay_path)
+    retry_summary_path = run_dir / "provider_retry_summary.json"
+    if retry_summary_path.exists():
+        retry_payload = read_json(retry_summary_path)
+        report["retry_summary"] = retry_payload.get("summary", retry_payload)
     report_json_path = run_dir / "replay_report.json"
     report_md_path = run_dir / "replay_report.md"
     write_json(report_json_path, report)

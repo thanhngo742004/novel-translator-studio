@@ -580,3 +580,59 @@
   - No production translation workflow is enabled.
 - Next recommended phase:
   - Add a provider-error retry policy for stable validation samples/runs, preserving strict output gates while retrying transient HTTP 5xx failures once before marking the run failed.
+
+## 2026-05-25T15:18:41+07:00
+
+- Completed: MVP4.8.10 bounded provider-error retry policy and final human review package only.
+- Implemented:
+  - Provider/API error classification with retryable HTTP 408/429/500/502/503/504/524, timeout/upstream/network failures, and fail-fast non-retryable 400/401/403/config/model/key/policy errors.
+  - Bounded sample-level provider retry wrapper used by stable-validation translation, JSON repair, and compression provider calls.
+  - Bounded run-level retry when a validation run fails only from retryable provider failures.
+  - Provider-empty-output handling so transient API failures are reported as provider failures, not normal translation truncation.
+  - Stable validation retry artifacts:
+    - `provider_retry_log.json`
+    - `provider_retry_summary.json`
+    - retry summary in `stable_validation_report.json`
+    - retry summary in compact `--json`
+    - retry summary in `replay_report.md`
+  - Final human review package always generated under `human_review_final/`:
+    - `human_review_final.md`
+    - `human_review_final.json`
+    - `human_review_summary.md`
+    - `human_review_table.csv`
+    - `stable_prompt_for_review.md`
+    - `approval_instructions.md`
+  - CLI flags:
+    - `--provider-retry-attempts`
+    - `--provider-run-retry-attempts`
+    - `--provider-retry-backoff-seconds`
+- Commands run:
+  - `python -m py_compile packages/nts_core/eval_harness.py apps/cli/nts_cli/main.py tests/test_mvp45_eval.py`
+  - `python -m pytest tests/test_mvp45_eval.py -q`
+  - `python -m pytest`
+  - `python -m nts_cli.main eval validate-stable-prompt --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4-mini --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --enable-paragraph-alignment --enable-compression-pass --merge-tiny-paragraphs --stable-run-count 3 --provider-retry-attempts 3 --provider-run-retry-attempts 1 --provider-retry-backoff-seconds 5 --json`
+- Test result:
+  - `python -m pytest tests/test_mvp45_eval.py -q` -> 55 passed.
+  - `python -m pytest` -> 88 passed.
+- Real validation result:
+  - Output folder: `artifacts/evaluations/han-jue_stable_1779696671929`
+  - Quality gate: pass.
+  - Stable prompt created: true.
+  - Human review status: READY FOR HUMAN REVIEW.
+  - Run scores: 92.67, 93.33, 93.67.
+  - Sample scores: 94, 91, 93, 95, 91, 94, 95, 92, 94.
+  - Ratio summary: min 0.956, max 1.165, average 1.063.
+  - Unit merge count: 90.
+  - Compression attempts: 9 attempts across 7 compressed units.
+  - Unsafe compression count: 0.
+  - Truncation count: 0.
+  - Provider JSON failure count: 0.
+  - Retryable provider failures: 0.
+  - Sample retries attempted/succeeded/exhausted: 0/0/0.
+  - Run retries attempted: 0.
+- Known limitations:
+  - The stable prompt is validated and ready for human review, but it is not human-approved.
+  - The retry policy is intentionally bounded and does not hide repeated provider outages.
+  - No production translation workflow is enabled.
+- Next recommended phase:
+  - Human-review the final package and approve or reject with `nts eval review-stable`; only after approval should the project move toward a production text translation pilot.
