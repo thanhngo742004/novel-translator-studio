@@ -18,11 +18,13 @@ from nts_core.eval_harness import (
     build_alignment_candidates,
     build_translation_units,
     classify_provider_error,
+    compression_attempt_prompt,
     compress_offending_paragraphs,
     create_paragraph_alignment,
     detect_truncated_vietnamese,
     evaluate_alignment_quality,
     extract_alignment_anchors,
+    final_output_selector,
     freeze_stable_candidate,
     limited_style_prompt,
     load_eval_provider,
@@ -34,6 +36,7 @@ from nts_core.eval_harness import (
     split_text_paragraphs,
     stable_gate_result,
     stable_prompt_review,
+    style_drift_checks,
     translate_samples,
     translation_system_prompt,
     validation_run_failed_only_retryable_provider,
@@ -946,6 +949,149 @@ def test_translate_samples_retries_invalid_provider_json_once(
     assert metadata["provider_json_failures"][0]["resolved_by_retry"] is True
     assert metadata["unresolved_provider_json_failures"] == []
     assert "provider_json_failure" not in metadata["verification_after_compression"]["reasons"]
+
+
+def test_final_output_selector_prefers_before_when_before_is_good() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝起身。他推开门。他停了一下。",
+            "target_text": "Hàn Tuyệt đứng dậy. Hắn đẩy cửa ra. Hắn dừng lại một chút.",
+            "target_char_count": len(
+                "Hàn Tuyệt đứng dậy. Hắn đẩy cửa ra. Hắn dừng lại một chút."
+            ),
+        }
+    )
+    before = [
+        {
+            "paragraph_id": "p001",
+            "text": "Hàn Tuyệt đứng dậy. Hắn đẩy cửa ra. Hắn dừng lại một chút.",
+        }
+    ]
+    after = [{"paragraph_id": "p001", "text": "Hàn Tuyệt đứng dậy rồi đẩy cửa ra."}]
+
+    selector = final_output_selector(
+        sample=sample,
+        before_paragraphs=before,
+        after_paragraphs=after,
+        before_verification=verify_paragraph_output(sample, before, glossary={"fixed_terms": []}),
+        after_verification=verify_paragraph_output(sample, after, glossary={"fixed_terms": []}),
+    )
+
+    assert selector["selected_final_output"] == "before_compression"
+    assert selector["selected_paragraphs"] == before
+    assert selector["selected_verification"]["pass"] is True
+
+
+def test_final_output_selector_uses_after_only_when_before_fails_ratio() -> None:
+    reference = "Hàn Tuyệt tiếp tục tu luyện."
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝继续修炼。",
+            "target_text": reference,
+            "target_char_count": len(reference),
+        }
+    )
+    before = [{"paragraph_id": "p001", "text": "Hàn Tuyệt tiếp tục tu luyện trong yên lặng. " * 5}]
+    after = [{"paragraph_id": "p001", "text": reference}]
+
+    selector = final_output_selector(
+        sample=sample,
+        before_paragraphs=before,
+        after_paragraphs=after,
+        before_verification=verify_paragraph_output(sample, before, glossary={"fixed_terms": []}),
+        after_verification=verify_paragraph_output(sample, after, glossary={"fixed_terms": []}),
+    )
+
+    assert selector["before_pass"] is False
+    assert selector["after_pass"] is True
+    assert selector["selected_final_output"] == "after_compression"
+    assert selector["selected_paragraphs"] == after
+
+
+def test_style_drift_detects_overmerged_action_beats() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝起身。他推开门。他停了一下。",
+            "target_text": "Hàn Tuyệt đứng dậy. Hắn đẩy cửa ra. Hắn dừng lại.",
+            "target_char_count": len("Hàn Tuyệt đứng dậy. Hắn đẩy cửa ra. Hắn dừng lại."),
+        }
+    )
+    before = [
+        {"paragraph_id": "p001", "text": "Hàn Tuyệt đứng dậy. Hắn đẩy cửa ra. Hắn dừng lại."}
+    ]
+    after = [
+        {
+            "paragraph_id": "p001",
+            "text": "Vì vậy Hàn Tuyệt đứng dậy rồi có lẽ đẩy cửa ra nên dừng lại.",
+        }
+    ]
+
+    drift = style_drift_checks(sample, before, after)
+
+    assert drift["above_threshold"] is True
+    assert "action_beat_merge_detected" in drift["warnings"]
+    assert "connective_rewriting" in drift["warnings"] or "excessive_connective_rewriting" in drift["warnings"]
+
+
+def test_after_output_with_high_style_drift_fails_selector_gate() -> None:
+    reference = "Hàn Tuyệt đứng dậy. Hắn đẩy cửa ra. Hắn dừng lại."
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝起身。他推开门。他停了一下。",
+            "target_text": reference,
+            "target_char_count": len(reference),
+        }
+    )
+    before = [{"paragraph_id": "p001", "text": reference + " " + ("Hắn suy nghĩ. " * 8)}]
+    after = [
+        {
+            "paragraph_id": "p001",
+            "text": "Vì vậy Hàn Tuyệt đứng dậy rồi có lẽ đẩy cửa ra nên dừng lại.",
+        }
+    ]
+
+    selector = final_output_selector(
+        sample=sample,
+        before_paragraphs=before,
+        after_paragraphs=after,
+        before_verification=verify_paragraph_output(sample, before, glossary={"fixed_terms": []}),
+        after_verification=verify_paragraph_output(sample, after, glossary={"fixed_terms": []}),
+    )
+
+    assert selector["selected_final_output"] == "after_compression"
+    assert selector["selected_verification"]["pass"] is False
+    assert "style_drift_above_threshold" in selector["selected_verification"]["reasons"]
+
+
+def test_compression_prompt_requires_minimal_edit_action_beat_preservation() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝起身。他推开门。",
+            "target_text": "Hàn Tuyệt đứng dậy. Hắn đẩy cửa ra.",
+            "target_char_count": len("Hàn Tuyệt đứng dậy. Hắn đẩy cửa ra."),
+        }
+    )
+    pair = sample["paragraph_pairs"][0]
+
+    prompt = compression_attempt_prompt(
+        pair=pair,
+        current_translation="Hàn Tuyệt đứng dậy. Hắn đẩy cửa ra. " * 4,
+        glossary={"fixed_terms": []},
+        attempt=1,
+    )
+
+    assert "Make the smallest edit" in prompt
+    assert "Preserve sentence order, action beats" in prompt
 
 
 def test_provider_error_classification_retryable_and_non_retryable() -> None:

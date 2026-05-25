@@ -636,3 +636,47 @@
   - No production translation workflow is enabled.
 - Next recommended phase:
   - Human-review the final package and approve or reject with `nts eval review-stable`; only after approval should the project move toward a production text translation pilot.
+
+## 2026-05-25T16:39:58+07:00
+
+- Completed: MVP4.8.11 human-preferred output selection and minimal-edit compression only.
+- Implemented:
+  - `final_output_selector` compares before-compression and after-compression candidates.
+  - Before-compression output is selected when it already passes safety, term, ratio, and truncation gates.
+  - After-compression output is selected only when before-compression fails required gates.
+  - Style-drift checks for sentence count changes, paragraph rhythm changes, action-beat merging, dialogue/system panel preservation, excessive connective rewriting, and semantic compression loss.
+  - Stable gate now fails selected after-compression output when style drift is above threshold.
+  - Compression prompts now request minimal edits and preservation of sentence order, action beats, dialogue turns, short exclamations, and webnovel rhythm.
+  - Review artifacts now show selected final output, selection reason, style drift score, and human-review recommendation.
+- Commands run:
+  - `python -m py_compile packages/nts_core/eval_harness.py tests/test_mvp45_eval.py`
+  - `python -m pytest tests/test_mvp45_eval.py -q`
+  - `python -m pytest`
+  - `python -m nts_cli.main eval validate-stable-prompt --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4-mini --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --enable-paragraph-alignment --enable-compression-pass --merge-tiny-paragraphs --stable-run-count 3 --provider-retry-attempts 3 --provider-run-retry-attempts 1 --provider-retry-backoff-seconds 5 --json`
+- Test result:
+  - `python -m pytest tests/test_mvp45_eval.py -q` -> 60 passed.
+  - `python -m pytest` -> 93 passed.
+- Real validation result:
+  - Output folder: `artifacts/evaluations/han-jue_stable_1779701585384`
+  - Quality gate: pass.
+  - Stable prompt created: true.
+  - Human review status: READY FOR HUMAN REVIEW.
+  - Run scores: 93.67, 93.33, 94.00.
+  - Sample scores: 94, 93, 94, 96, 91, 93, 95, 93, 94.
+  - Ratio summary: min 0.974, max 1.201, average 1.083.
+  - Selected output counts:
+    - before_compression: 9.
+  - Style drift warning count: 0.
+  - Unit merge count: 90.
+  - Compression attempts: 10 attempts across 9 compressed units, but selected final output used before-compression for all samples.
+  - Unsafe compression count: 0.
+  - Truncation count: 0.
+  - Provider JSON failure count: 0.
+  - Retryable provider failures: 0.
+  - Human review package API-key scan: key not found.
+- Known limitations:
+  - The selector is deterministic and heuristic; it does not replace human literary review.
+  - Compression is still generated for diagnostics/candidate comparison even when the selected final output is before-compression.
+  - No production translation workflow is enabled.
+- Next recommended phase:
+  - Human-review the new selected-output package and approve or reject it before any production translation pilot.

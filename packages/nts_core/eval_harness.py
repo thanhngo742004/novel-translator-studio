@@ -63,6 +63,17 @@ PROVIDER_ONLY_FAILURE_REASONS = {
     "provider_failure_empty_output",
     "provider_retry_exhausted",
 }
+STYLE_DRIFT_WARNING_THRESHOLD = 45
+STYLE_DRIFT_REVIEW_THRESHOLD = 25
+STYLE_CONNECTIVE_TERMS = {
+    "nên",
+    "vì vậy",
+    "có lẽ",
+    "do đó",
+    "bởi vậy",
+    "thế là",
+    "cho nên",
+}
 
 SCORE_WEIGHTS = {
     "meaning_accuracy": 25,
@@ -2837,6 +2848,163 @@ def required_terms_missing(
     return missing
 
 
+def sentence_count_for_style(text: str) -> int:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return 0
+    parts = [part for part in re.split(r"[。.!?！？…]+", normalized) if part.strip()]
+    return max(1, len(parts))
+
+
+def connective_count(text: str) -> int:
+    lowered = (text or "").lower()
+    return sum(len(re.findall(rf"\b{re.escape(term)}\b", lowered)) for term in STYLE_CONNECTIVE_TERMS)
+
+
+def style_drift_checks(
+    sample: dict[str, Any],
+    before_paragraphs: list[dict[str, str]],
+    after_paragraphs: list[dict[str, str]],
+) -> dict[str, Any]:
+    before = render_paragraph_translation(sample, before_paragraphs)
+    after = render_paragraph_translation(sample, after_paragraphs)
+    before_sentence_count = sentence_count_for_style(before)
+    after_sentence_count = sentence_count_for_style(after)
+    before_paragraph_count = paragraph_count(before)
+    after_paragraph_count = paragraph_count(after)
+    before_connectives = connective_count(before)
+    after_connectives = connective_count(after)
+    before_system_panels = before.count("【")
+    after_system_panels = after.count("【")
+    before_dialogue_marks = len(re.findall(r"[\"“”‘’]", before))
+    after_dialogue_marks = len(re.findall(r"[\"“”‘’]", after))
+    before_tokens = set(_tokens(before))
+    after_tokens = set(_tokens(after))
+    token_retention = (
+        len(before_tokens & after_tokens) / max(len(before_tokens), 1)
+        if before_tokens
+        else 1.0
+    )
+    char_ratio = len(after) / max(len(before), 1)
+    score = 0
+    warnings: list[str] = []
+    if before_sentence_count >= 3 and after_sentence_count <= before_sentence_count - 2:
+        score += 25
+        warnings.append("sentence_count_reduced")
+    if before_sentence_count >= 2 and after_sentence_count == 1:
+        score += 25
+        warnings.append("action_beat_merge_detected")
+    if before_paragraph_count and abs(before_paragraph_count - after_paragraph_count) >= max(
+        1,
+        int(before_paragraph_count * 0.4),
+    ):
+        score += 20
+        warnings.append("paragraph_rhythm_changed")
+    if before_system_panels > after_system_panels:
+        score += 30
+        warnings.append("system_panel_removed_or_merged")
+    if before_dialogue_marks > after_dialogue_marks:
+        score += 15
+        warnings.append("dialogue_marker_loss")
+    connective_delta = after_connectives - before_connectives
+    if connective_delta >= 4:
+        score += 30
+        warnings.append("excessive_connective_rewriting")
+    elif connective_delta >= 2:
+        score += 20
+        warnings.append("connective_rewriting")
+    if token_retention < 0.62 and len(before) > 60:
+        score += 25
+        warnings.append("semantic_compression_loss")
+    elif token_retention < 0.75 and len(before) > 60:
+        score += 12
+        warnings.append("semantic_compression_loss_possible")
+    if char_ratio < 0.58 and len(before) > 80:
+        score += 20
+        warnings.append("aggressive_length_reduction")
+    elif char_ratio < 0.75 and len(before) > 80:
+        score += 8
+        warnings.append("noticeable_length_reduction")
+    score = min(score, 100)
+    return {
+        "score": score,
+        "warnings": sorted(set(warnings)),
+        "above_threshold": score >= STYLE_DRIFT_WARNING_THRESHOLD,
+        "human_review_recommended": score >= STYLE_DRIFT_REVIEW_THRESHOLD,
+        "threshold": STYLE_DRIFT_WARNING_THRESHOLD,
+        "review_threshold": STYLE_DRIFT_REVIEW_THRESHOLD,
+        "metrics": {
+            "before_sentence_count": before_sentence_count,
+            "after_sentence_count": after_sentence_count,
+            "before_paragraph_count": before_paragraph_count,
+            "after_paragraph_count": after_paragraph_count,
+            "before_connective_count": before_connectives,
+            "after_connective_count": after_connectives,
+            "connective_delta": connective_delta,
+            "before_system_panel_count": before_system_panels,
+            "after_system_panel_count": after_system_panels,
+            "before_dialogue_marker_count": before_dialogue_marks,
+            "after_dialogue_marker_count": after_dialogue_marks,
+            "token_retention": round(token_retention, 3),
+            "after_before_char_ratio": round(char_ratio, 3),
+        },
+    }
+
+
+def final_output_selector(
+    *,
+    sample: dict[str, Any],
+    before_paragraphs: list[dict[str, str]],
+    after_paragraphs: list[dict[str, str]],
+    before_verification: dict[str, Any],
+    after_verification: dict[str, Any],
+) -> dict[str, Any]:
+    drift = style_drift_checks(sample, before_paragraphs, after_paragraphs)
+    before_passes = bool(before_verification.get("pass"))
+    after_passes = bool(after_verification.get("pass"))
+    selected = "before_compression" if before_passes else "after_compression"
+    selected_paragraphs = before_paragraphs if before_passes else after_paragraphs
+    selected_verification = dict(before_verification if before_passes else after_verification)
+    selected_reason = (
+        "before_passes_safety_terms_ratio_and_truncation_gates"
+        if before_passes
+        else "after_selected_because_before_failed_gates"
+    )
+    if not before_passes and after_passes and drift["above_threshold"]:
+        selected_verification = {
+            **selected_verification,
+            "pass": False,
+            "reasons": sorted(
+                set(
+                    selected_verification.get("reasons", [])
+                    + ["style_drift_above_threshold"]
+                )
+            ),
+            "style_drift": drift,
+        }
+        selected_reason = "after_failed_style_drift_gate"
+    elif before_passes:
+        selected_verification["style_drift"] = {
+            **drift,
+            "ignored_for_gate": True,
+            "reason": "before_output_selected",
+        }
+    else:
+        selected_verification["style_drift"] = drift
+    return {
+        "selected_final_output": selected,
+        "selected_paragraphs": selected_paragraphs,
+        "selected_verification": selected_verification,
+        "selection_reason": selected_reason,
+        "before_pass": before_passes,
+        "after_pass": after_passes,
+        "style_drift": drift,
+        "human_review_recommended": bool(
+            selected == "after_compression" and drift["human_review_recommended"]
+        ),
+    }
+
+
 def compression_attempt_prompt(
     *,
     pair: dict[str, Any],
@@ -2850,7 +3018,10 @@ def compression_attempt_prompt(
         "Rewrite-compress this Vietnamese paragraph. Preserve all source meaning, names, "
         "terms, numbers, and system panels. Do not hard truncate. Do not add translator notes. "
         "Do not start with glossary labels unless the source starts with that label. Return one "
-        "complete Vietnamese paragraph."
+        "complete Vietnamese paragraph. Make the smallest edit that fixes the length issue. "
+        "Preserve sentence order, action beats, dialogue turns, short exclamations, and webnovel "
+        "rhythm. Do not merge multiple short actions into one explanatory sentence when a concise "
+        "multi-sentence form fits."
     )
     if attempt == 2:
         instructions += (
@@ -3230,7 +3401,8 @@ def compress_offending_paragraphs(
                             "content": (
                                 "You safely rewrite-compress one Vietnamese paragraph. Return JSON only. "
                                 "Never truncate. Preserve required terms, names, numbers, and system panels. "
-                                "Use complete Vietnamese sentences and closed brackets."
+                                "Use complete Vietnamese sentences and closed brackets. Make minimal edits, "
+                                "preserve sentence order, action beats, dialogue turns, and webnovel rhythm."
                             ),
                         },
                         {"role": "user", "content": prompt},
@@ -3482,7 +3654,10 @@ def translate_samples(
             compression_result = {"triggered": False, "offending_paragraph_ids": [], "entries": []}
             verification_before = None
             verification_after = None
+            verification_after_candidate = None
             global_ratio_before_compression = None
+            global_ratio_after_compression_candidate = None
+            final_output_selection: dict[str, Any] | None = None
             best_effort_used = False
             provider_error = None
             provider_error_classification = None
@@ -3792,6 +3967,31 @@ def translate_samples(
                                 row["truncation_detected"] = False
                                 row["truncation_reasons"] = ["provider_failure_empty_output"]
                         verification_after["provider_failure_empty_output"] = True
+                after_compression_paragraphs = list(final_paragraphs)
+                verification_after_candidate = verification_after
+                global_ratio_after_compression_candidate = round(
+                    len(render_paragraph_translation(sample, after_compression_paragraphs))
+                    / max(sample["target_char_count"], 1),
+                    3,
+                )
+                (sample_dir / f"{safe_model}_structured_after_compression.json").write_text(
+                    json_dumps({"paragraphs": after_compression_paragraphs}) + "\n",
+                    encoding="utf-8",
+                )
+                final_output_selection = final_output_selector(
+                    sample=sample,
+                    before_paragraphs=parsed,
+                    after_paragraphs=after_compression_paragraphs,
+                    before_verification=verification_before,
+                    after_verification=verification_after_candidate,
+                )
+                final_paragraphs = final_output_selection["selected_paragraphs"]
+                verification_after = final_output_selection["selected_verification"]
+                compression_result["final_output_selector"] = {
+                    key: value
+                    for key, value in final_output_selection.items()
+                    if key not in {"selected_paragraphs", "selected_verification"}
+                }
                 final = render_paragraph_translation(sample, final_paragraphs)
                 (sample_dir / f"{safe_model}_structured_final.json").write_text(
                     json_dumps({"paragraphs": final_paragraphs}) + "\n",
@@ -3883,11 +4083,29 @@ def translate_samples(
                 "unresolved_provider_json_failures": unresolved_provider_json_failures,
                 "paragraph_validation": paragraph_validation,
                 "verification_before_compression": verification_before,
+                "verification_after_compression_candidate": verification_after_candidate,
                 "verification_after_compression": verification_after,
                 "global_ratio_before_compression": global_ratio_before_compression,
+                "global_ratio_after_compression_candidate": global_ratio_after_compression_candidate,
                 "global_ratio_after_compression": round(
                     len(final) / max(sample["target_char_count"], 1),
                     3,
+                ),
+                "selected_final_output": final_output_selection.get("selected_final_output")
+                if final_output_selection
+                else "plain_translation",
+                "selected_final_output_reason": final_output_selection.get("selection_reason")
+                if final_output_selection
+                else "plain_translation",
+                "final_output_selector": {
+                    key: value
+                    for key, value in (final_output_selection or {}).items()
+                    if key not in {"selected_paragraphs", "selected_verification"}
+                },
+                "style_drift": (final_output_selection or {}).get("style_drift"),
+                "human_review_recommended": (final_output_selection or {}).get(
+                    "human_review_recommended",
+                    False,
                 ),
                 "compression": compression_result,
                 "compression_count": len(compression_result.get("entries", [])),
@@ -4260,6 +4478,19 @@ def _score_translation(
         "low_alignment_units": verification.get("low_alignment_units", [])
         if verification
         else [],
+        "style_drift": verification.get("style_drift") if verification else None,
+        "style_drift_score": (verification.get("style_drift") or {}).get("score")
+        if verification
+        else None,
+        "style_drift_warnings": (verification.get("style_drift") or {}).get("warnings", [])
+        if verification
+        else [],
+        "human_review_recommended": (verification.get("style_drift") or {}).get(
+            "human_review_recommended",
+            False,
+        )
+        if verification
+        else False,
         "length_penalty_reason": length_warning,
         "terminology_mismatches": terminology_mismatches,
         "final_pass_fail_reason": "pass" if pass_fail else ", ".join(fail_reasons),
@@ -4410,6 +4641,16 @@ def compare_multi_sample_outputs(
             score["provider_failure_empty_output"] = (
                 output_meta.get("verification_after_compression", {}) or {}
             ).get("provider_failure_empty_output", False)
+            score["selected_final_output"] = output_meta.get("selected_final_output")
+            score["selected_final_output_reason"] = output_meta.get(
+                "selected_final_output_reason"
+            )
+            score["style_drift"] = output_meta.get("style_drift")
+            score["style_drift_score"] = (output_meta.get("style_drift") or {}).get("score")
+            score["human_review_recommended"] = output_meta.get(
+                "human_review_recommended",
+                False,
+            )
             per_sample.append(score)
         if not per_sample:
             continue
@@ -5145,6 +5386,15 @@ def stable_gate_result(
                 "low_alignment_units"
             ):
                 sample_reasons.append("unit_alignment_quality_below_threshold")
+            style_drift = sample.get("style_drift") or {}
+            if not style_drift.get("ignored_for_gate") and (
+                style_drift.get("above_threshold")
+                or (
+                    sample.get("style_drift_score") is not None
+                    and sample.get("style_drift_score") >= STYLE_DRIFT_WARNING_THRESHOLD
+                )
+            ):
+                sample_reasons.append("style_drift_above_threshold")
             gates = sample.get("gates", {})
             if gates.get("severe_hallucination"):
                 sample_reasons.append("severe_hallucination")
@@ -5189,6 +5439,19 @@ def stable_gate_result(
                     "provider_error": sample.get("provider_error"),
                     "provider_error_classification": sample.get(
                         "provider_error_classification"
+                    ),
+                    "selected_final_output": sample.get("selected_final_output"),
+                    "selected_final_output_reason": sample.get(
+                        "selected_final_output_reason"
+                    ),
+                    "style_drift_score": sample.get("style_drift_score"),
+                    "style_drift_warnings": (sample.get("style_drift") or {}).get(
+                        "warnings",
+                        [],
+                    ),
+                    "human_review_recommended": sample.get(
+                        "human_review_recommended",
+                        False,
                     ),
                     "reasons": sorted(set(sample_reasons)),
                 }
@@ -5365,6 +5628,12 @@ def write_cached_eval_exports(
             initial_lookup = _load_structured_paragraphs(
                 run_dir / "translation_outputs" / sample_id / f"{safe_model}_structured_initial.json"
             )
+            after_compression_lookup = _load_structured_paragraphs(
+                run_dir
+                / "translation_outputs"
+                / sample_id
+                / f"{safe_model}_structured_after_compression.json"
+            )
             final_lookup = _load_structured_paragraphs(
                 run_dir / "translation_outputs" / sample_id / f"{safe_model}_structured_final.json"
             )
@@ -5373,19 +5642,23 @@ def write_cached_eval_exports(
             for pair in active_eval_pairs(sample):
                 paragraph_id = pair["paragraph_id"]
                 before = initial_lookup.get(paragraph_id, "")
-                after = final_lookup.get(paragraph_id, "")
+                after_candidate = after_compression_lookup.get(
+                    paragraph_id,
+                    final_lookup.get(paragraph_id, ""),
+                )
+                selected_final = final_lookup.get(paragraph_id, after_candidate)
                 truncation = detect_truncated_vietnamese(
-                    after,
+                    selected_final,
                     source_text=pair.get("source_text"),
                     strict_max=pair.get("strict_max"),
                 )
-                if provider_error and provider_failure_empty_output and not after.strip():
+                if provider_error and provider_failure_empty_output and not selected_final.strip():
                     truncation = {
                         "is_truncated": False,
                         "reasons": ["provider_failure_empty_output"],
                     }
                 required_terms = required_terms_for_pair(pair, glossary)
-                missing_terms = required_terms_missing(pair, after, glossary)
+                missing_terms = required_terms_missing(pair, selected_final, glossary)
                 replay_rows.append(
                     {
                         "validation_index": run["validation_index"],
@@ -5404,12 +5677,30 @@ def write_cached_eval_exports(
                         "source_paragraph": pair.get("source_text", ""),
                         "human_reference_paragraph": pair.get("target_text", ""),
                         "model_paragraph_before_compression": before,
-                        "model_paragraph_after_compression": after,
+                        "model_paragraph_after_compression": after_candidate,
+                        "model_paragraph_selected_final": selected_final,
+                        "selected_final_output": sample_metadata.get("selected_final_output"),
+                        "selected_final_output_reason": sample_metadata.get(
+                            "selected_final_output_reason"
+                        ),
+                        "style_drift": sample_metadata.get("style_drift"),
+                        "style_drift_score": (sample_metadata.get("style_drift") or {}).get(
+                            "score"
+                        ),
+                        "human_review_recommended": sample_metadata.get(
+                            "human_review_recommended",
+                            False,
+                        ),
                         "reference_char_count": pair.get("target_char_count", 0),
                         "before_char_count": len(before),
-                        "after_char_count": len(after),
+                        "after_char_count": len(after_candidate),
+                        "selected_char_count": len(selected_final),
                         "ratio_before": round(len(before) / max(pair.get("target_char_count", 0), 1), 3),
-                        "ratio_after": round(len(after) / max(pair.get("target_char_count", 0), 1), 3),
+                        "ratio_after": round(len(after_candidate) / max(pair.get("target_char_count", 0), 1), 3),
+                        "ratio_selected": round(
+                            len(selected_final) / max(pair.get("target_char_count", 0), 1),
+                            3,
+                        ),
                         "strict_max": pair.get("strict_max"),
                         "budget_policy_used": pair.get("budget_policy_used"),
                         "paragraph_allowed_over_budget_reason": next(
@@ -5462,6 +5753,11 @@ def write_cached_eval_exports(
                 f"- Merge reason: `{row.get('merge_reason')}`",
                 f"- Ratio before: `{row['ratio_before']}`",
                 f"- Ratio after: `{row['ratio_after']}`",
+                f"- Ratio selected: `{row.get('ratio_selected')}`",
+                f"- Selected final output: `{row.get('selected_final_output')}`",
+                f"- Selection reason: `{row.get('selected_final_output_reason')}`",
+                f"- Style drift score: `{row.get('style_drift_score')}`",
+                f"- Human review recommended: `{row.get('human_review_recommended')}`",
                 f"- Score reason: `{row['sample_score'].get('reason')}`",
                 f"- Truncation detected: `{row['truncation_detected']}`",
                 f"- Truncation reasons: `{json_dumps(row['truncation_reasons'])}`",
@@ -5486,6 +5782,10 @@ def write_cached_eval_exports(
                 "",
                 row["model_paragraph_after_compression"],
                 "",
+                "Selected final output:",
+                "",
+                row["model_paragraph_selected_final"],
+                "",
             ]
         )
     (validation_root / "human_review_samples.md").write_text(
@@ -5496,8 +5796,8 @@ def write_cached_eval_exports(
     table_lines = [
         "# Paragraph Review Table",
         "",
-        "| Run | Sample | Unit | Original IDs | Ref Chars | Before | After | Ratio Before | Ratio After | Budget | Merge Reason | Allowed Over Budget | Truncated | Reasons | Align Quality | Eligible | Warnings | Source | Reference | After |",
-        "|---:|---|---|---|---:|---:|---:|---:|---:|---|---|---|---|---|---:|---|---|---|---|---|",
+        "| Run | Sample | Unit | Original IDs | Ref Chars | Before | After | Selected | Ratio Before | Ratio After | Ratio Selected | Selected Output | Style Drift | Budget | Merge Reason | Allowed Over Budget | Truncated | Reasons | Align Quality | Eligible | Warnings | Source | Reference | Selected Final |",
+        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---|---|---|---|---:|---|---|---|---|---|",
     ]
     for row in replay_rows:
         table_lines.append(
@@ -5511,8 +5811,12 @@ def write_cached_eval_exports(
                     str(row["reference_char_count"]),
                     str(row["before_char_count"]),
                     str(row["after_char_count"]),
+                    str(row.get("selected_char_count")),
                     str(row["ratio_before"]),
                     str(row["ratio_after"]),
+                    str(row.get("ratio_selected")),
+                    str(row.get("selected_final_output")),
+                    str(row.get("style_drift_score")),
                     str(row.get("budget_policy_used")),
                     str(row.get("merge_reason")),
                     str(row.get("paragraph_allowed_over_budget_reason")),
@@ -5523,7 +5827,7 @@ def write_cached_eval_exports(
                     _snippet("; ".join(row["warnings"]), 80).replace("|", "\\|"),
                     _snippet(row["source_paragraph"], 120).replace("|", "\\|"),
                     _snippet(row["human_reference_paragraph"], 120).replace("|", "\\|"),
-                    _snippet(row["model_paragraph_after_compression"], 120).replace("|", "\\|"),
+                    _snippet(row["model_paragraph_selected_final"], 120).replace("|", "\\|"),
                 ]
             )
             + " |"
@@ -5705,7 +6009,25 @@ def write_final_human_review_package(
                     row.get("model_paragraph_before_compression", "") for row in sample_rows
                 ),
                 "model_final_output": "\n\n".join(
-                    row.get("model_paragraph_after_compression", "") for row in sample_rows
+                    row.get(
+                        "model_paragraph_selected_final",
+                        row.get("model_paragraph_after_compression", ""),
+                    )
+                    for row in sample_rows
+                ),
+                "selected_final_output": sample_rows[0].get("selected_final_output")
+                if sample_rows
+                else None,
+                "selected_final_output_reason": sample_rows[0].get(
+                    "selected_final_output_reason"
+                )
+                if sample_rows
+                else None,
+                "style_drift_score": sample_rows[0].get("style_drift_score")
+                if sample_rows
+                else None,
+                "human_review_recommended": any(
+                    row.get("human_review_recommended") for row in sample_rows
                 ),
                 "warnings": sorted(
                     {
@@ -5721,7 +6043,25 @@ def write_final_human_review_package(
                         "target_paragraph_ids": row.get("target_paragraph_ids", []),
                         "source_text": row.get("source_paragraph", ""),
                         "human_reference_text": row.get("human_reference_paragraph", ""),
-                        "model_final_text": row.get("model_paragraph_after_compression", ""),
+                        "model_before_compression_text": row.get(
+                            "model_paragraph_before_compression",
+                            "",
+                        ),
+                        "model_after_compression_text": row.get(
+                            "model_paragraph_after_compression",
+                            "",
+                        ),
+                        "model_final_text": row.get(
+                            "model_paragraph_selected_final",
+                            row.get("model_paragraph_after_compression", ""),
+                        ),
+                        "selected_final_output": row.get("selected_final_output"),
+                        "selection_reason": row.get("selected_final_output_reason"),
+                        "style_drift_score": row.get("style_drift_score"),
+                        "human_review_recommended": row.get(
+                            "human_review_recommended",
+                            False,
+                        ),
                         "required_terms": row.get("required_terms", []),
                         "missing_terms": row.get("missing_terms", []),
                         "compression_attempts": row.get("compression_attempts", []),
@@ -5777,6 +6117,10 @@ def write_final_human_review_package(
                 "",
                 f"- Score: `{score.get('total_score')}`",
                 f"- Ratio: `{score.get('output_reference_ratio')}`",
+                f"- Selected final output: `{sample.get('selected_final_output')}`",
+                f"- Selection reason: `{sample.get('selected_final_output_reason')}`",
+                f"- Style drift score: `{sample.get('style_drift_score')}`",
+                f"- Human review recommended: `{sample.get('human_review_recommended')}`",
                 f"- Warnings: `{json_dumps(sample.get('warnings', []))}`",
                 "- Reviewer decision: APPROVE / REJECT / NEEDS_EDIT",
                 "- Reviewer notes:",
@@ -5809,6 +6153,10 @@ def write_final_human_review_package(
                     f"- Required terms: `{json_dumps(unit['required_terms'])}`",
                     f"- Missing terms: `{json_dumps(unit['missing_terms'])}`",
                     f"- Compression attempts: `{json_dumps(unit['compression_attempts'])}`",
+                    f"- Selected final output: `{unit.get('selected_final_output')}`",
+                    f"- Selection reason: `{unit.get('selection_reason')}`",
+                    f"- Style drift score: `{unit.get('style_drift_score')}`",
+                    f"- Human review recommended: `{unit.get('human_review_recommended')}`",
                     f"- Safety status: `{unit['safety_status']}`",
                     f"- Alignment quality: `{unit['alignment_quality']}`",
                     f"- Pass/fail reason: `{unit['pass_fail_reason']}`",
@@ -5824,7 +6172,9 @@ def write_final_human_review_package(
         unit
         for sample in payload["samples"]
         for unit in sample["units"]
-        if unit["safety_status"] != "pass" or unit.get("alignment_quality", 1.0) < ALIGNMENT_QUALITY_THRESHOLD
+        if unit["safety_status"] != "pass"
+        or unit.get("alignment_quality", 1.0) < ALIGNMENT_QUALITY_THRESHOLD
+        or (unit.get("style_drift_score") or 0) >= STYLE_DRIFT_REVIEW_THRESHOLD
     ]
     summary_lines = [
         "# Human Review Summary",
@@ -5853,6 +6203,7 @@ def write_final_human_review_package(
         f"- Provider failure count: `{payload['provider_failure_count']}`",
         f"- Truncation count: `{payload['truncation_count']}`",
         f"- Unsafe compression count: `{payload['unsafe_compression_count']}`",
+        f"- Human review recommended samples: `{sum(1 for sample in payload['samples'] if sample.get('human_review_recommended'))}`",
         f"- Suspicious unit count: `{len(suspicious)}`",
         "",
         "## Suspicious Paragraphs Or Units",
@@ -5899,6 +6250,10 @@ def write_final_human_review_package(
                 "source_text",
                 "human_reference_text",
                 "model_final_text",
+                "selected_final_output",
+                "selection_reason",
+                "style_drift_score",
+                "human_review_recommended",
                 "required_terms",
                 "missing_terms",
                 "safety_status",
@@ -5919,6 +6274,10 @@ def write_final_human_review_package(
                         "source_text": unit["source_text"],
                         "human_reference_text": unit["human_reference_text"],
                         "model_final_text": unit["model_final_text"],
+                        "selected_final_output": unit.get("selected_final_output"),
+                        "selection_reason": unit.get("selection_reason"),
+                        "style_drift_score": unit.get("style_drift_score"),
+                        "human_review_recommended": unit.get("human_review_recommended"),
                         "required_terms": json_dumps(unit["required_terms"]),
                         "missing_terms": json_dumps(unit["missing_terms"]),
                         "safety_status": unit["safety_status"],
@@ -6225,12 +6584,22 @@ def _stable_validation_counts(report: dict[str, Any]) -> dict[str, Any]:
     provider_json_failure_count = 0
     compression_attempts: list[dict[str, Any]] = []
     unit_merge_count = 0
+    selected_output_counts: dict[str, int] = {}
+    style_drift_warning_count = 0
     for run in report.get("validation_runs", []):
         validation_index = run.get("validation_index")
         model_report = run.get("report", {}).get("models", {}).get(selected_model, {})
         for sample in model_report.get("samples", []):
             truncation_count += len(sample.get("truncated_paragraphs", []) or [])
             unit_merge_count += int(sample.get("translation_unit_merge_count") or 0)
+            selected = str(sample.get("selected_final_output") or "unknown")
+            selected_output_counts[selected] = selected_output_counts.get(selected, 0) + 1
+            style_drift = sample.get("style_drift") or {}
+            if (
+                not style_drift.get("ignored_for_gate")
+                and (sample.get("style_drift_score") or 0) >= STYLE_DRIFT_WARNING_THRESHOLD
+            ):
+                style_drift_warning_count += 1
         translations = run.get("translations", {})
         if not isinstance(translations, dict):
             continue
@@ -6296,6 +6665,8 @@ def _stable_validation_counts(report: dict[str, Any]) -> dict[str, Any]:
         "provider_json_failure_count": provider_json_failure_count,
         "compression_attempts": compression_attempts,
         "unit_merge_count": unit_merge_count,
+        "selected_output_counts": selected_output_counts,
+        "style_drift_warning_count": style_drift_warning_count,
         "compression_attempt_summary": {
             "paragraph_count": len(compression_attempts),
             "total_attempts": sum(attempt_counts),
@@ -6352,6 +6723,8 @@ def compact_stable_validation_result(result: dict[str, Any]) -> dict[str, Any]:
         ),
         "provider_json_failure_count": counts["provider_json_failure_count"],
         "unit_merge_count": counts["unit_merge_count"],
+        "selected_output_counts": counts["selected_output_counts"],
+        "style_drift_warning_count": counts["style_drift_warning_count"],
         "compression_attempt_summary": counts["compression_attempt_summary"],
         "gate_reasons": gate.get("reasons", []),
         "gate": {
@@ -6418,6 +6791,10 @@ def _replay_quality_summary(report: dict[str, Any]) -> dict[str, Any]:
             report.get("overall", {}).get("low_alignment_quality_samples", [])
         ),
         "provider_failure_count": report.get("overall", {}).get("provider_failure_count", 0),
+        "style_drift_warning_count": report.get("overall", {}).get(
+            "style_drift_warning_count",
+            0,
+        ),
     }
 
 
@@ -6435,8 +6812,11 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
         sample_id = str(row.get("sample_id") or "")
         paragraph_id = str(row.get("paragraph_id") or "")
         ratio_before = _float_or_none(row.get("ratio_before"))
-        ratio_after = _float_or_none(row.get("ratio_after"))
-        after_text = row.get("model_paragraph_after_compression", "")
+        ratio_after = _float_or_none(row.get("ratio_selected", row.get("ratio_after")))
+        after_text = row.get(
+            "model_paragraph_selected_final",
+            row.get("model_paragraph_after_compression", ""),
+        )
         truncation = {
             "is_truncated": bool(row.get("truncation_detected")),
             "reasons": row.get("truncation_reasons", []) or [],
@@ -6471,10 +6851,20 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 "accepted_for_stable_validation": accepted_for_stable,
                 "truncated_paragraphs": [],
                 "provider_failures": [],
+                "style_drift_score": row.get("style_drift_score"),
+                "selected_final_output": row.get("selected_final_output"),
+                "human_review_recommended": row.get("human_review_recommended", False),
                 "ratio_before_values": [],
                 "ratio_after_values": [],
             },
         )
+        if row.get("style_drift_score") is not None:
+            sample_summary["style_drift_score"] = max(
+                sample_summary.get("style_drift_score") or 0,
+                row.get("style_drift_score") or 0,
+            )
+        if row.get("human_review_recommended"):
+            sample_summary["human_review_recommended"] = True
         sample_summary["paragraph_count"] += 1
         if ratio_before is not None:
             sample_summary["ratio_before_values"].append(ratio_before)
@@ -6517,8 +6907,14 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 "reference_char_count": row.get("reference_char_count"),
                 "before_char_count": row.get("before_char_count"),
                 "after_char_count": row.get("after_char_count"),
+                "selected_char_count": row.get(
+                    "selected_char_count",
+                    row.get("after_char_count"),
+                ),
                 "ratio_before": ratio_before,
                 "ratio_after": ratio_after,
+                "ratio_after_compression": _float_or_none(row.get("ratio_after")),
+                "ratio_selected": ratio_after,
                 "score_notes": row.get("score_notes", {}),
                 "warnings": row.get("warnings", []),
                 "alignment_quality": alignment_quality,
@@ -6536,6 +6932,11 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "required_terms": row.get("required_terms", []),
                 "missing_terms": row.get("missing_terms", []),
+                "selected_final_output": row.get("selected_final_output"),
+                "selected_final_output_reason": row.get("selected_final_output_reason"),
+                "style_drift": row.get("style_drift"),
+                "style_drift_score": row.get("style_drift_score"),
+                "human_review_recommended": row.get("human_review_recommended", False),
                 "source_paragraph": row.get("source_paragraph", ""),
                 "human_reference_paragraph": row.get("human_reference_paragraph", ""),
                 "model_paragraph_before_compression": row.get(
@@ -6544,6 +6945,7 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 "model_paragraph_after_compression": row.get(
                     "model_paragraph_after_compression", ""
                 ),
+                "model_paragraph_selected_final": after_text,
             }
         )
 
@@ -6584,6 +6986,22 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 f"{reason}, provider_failure"
                 if reason and reason != "pass"
                 else "provider_failure"
+            )
+        high_drift = [
+            diagnostic
+            for diagnostic in paragraph_diagnostics
+            if diagnostic["validation_index"] == sample["validation_index"]
+            and diagnostic["sample_id"] == sample["sample_id"]
+            and (diagnostic.get("style_drift_score") or 0) >= STYLE_DRIFT_WARNING_THRESHOLD
+            and diagnostic.get("selected_final_output") == "after_compression"
+        ]
+        if high_drift:
+            sample["pass"] = False
+            reason = sample.get("reason")
+            sample["reason"] = (
+                f"{reason}, style_drift_above_threshold"
+                if reason and reason != "pass"
+                else "style_drift_above_threshold"
             )
         per_sample.append(sample)
     per_sample.sort(key=lambda item: (item["validation_index"], item["sample_id"]))
@@ -6667,12 +7085,30 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
         for sample in per_sample
         if sample.get("provider_failures")
     ]
+    style_drift_samples = [
+        {
+            "validation_index": sample["validation_index"],
+            "sample_id": sample["sample_id"],
+            "style_drift_score": max(
+                (
+                    diagnostic.get("style_drift_score") or 0
+                    for diagnostic in paragraph_diagnostics
+                    if diagnostic["validation_index"] == sample["validation_index"]
+                    and diagnostic["sample_id"] == sample["sample_id"]
+                ),
+                default=0,
+            ),
+        }
+        for sample in per_sample
+        if sample.get("reason") and "style_drift_above_threshold" in sample.get("reason", "")
+    ]
     all_samples_pass = bool(per_sample) and all(sample.get("pass") is True for sample in per_sample)
     strict_replay_pass = (
         all_samples_pass
         and not truncated_paragraphs
         and not low_quality_samples
         and not provider_failure_samples
+        and not style_drift_samples
     )
     overall = {
         "average_score": round(sum(all_scores) / len(all_scores), 2) if all_scores else None,
@@ -6683,6 +7119,8 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
         "low_alignment_quality_samples": low_quality_samples,
         "provider_failure_samples": provider_failure_samples,
         "provider_failure_count": len(provider_failure_samples),
+        "style_drift_samples": style_drift_samples,
+        "style_drift_warning_count": len(style_drift_samples),
         "ratio_after_summary": {
             "min": min(all_after_ratios) if all_after_ratios else None,
             "max": max(all_after_ratios) if all_after_ratios else None,
@@ -6716,6 +7154,7 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
         f"- Strict replay pass: `{overall.get('strict_replay_pass')}`",
         f"- Truncated paragraphs: `{overall.get('truncated_paragraph_count')}`",
         f"- Provider failures: `{overall.get('provider_failure_count', 0)}`",
+        f"- Style drift warnings: `{overall.get('style_drift_warning_count', 0)}`",
         f"- Retryable provider failures: `{retry_summary.get('retryable_failures', 0)}`",
         f"- Sample retries attempted: `{retry_summary.get('sample_retries_attempted', 0)}`",
         f"- Sample retries succeeded: `{retry_summary.get('sample_retries_succeeded', 0)}`",
@@ -6762,8 +7201,8 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
             "",
             "## Samples",
             "",
-            "| Run | Sample | Chapter | Score | Pass | Ratio Avg | Paragraphs | Alignment | Truncated | Reason |",
-            "|---:|---|---:|---:|---|---:|---:|---:|---:|---|",
+            "| Run | Sample | Chapter | Score | Pass | Ratio Avg | Paragraphs | Alignment | Truncated | Style Drift | Reason |",
+            "|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---|",
         ]
     )
     for sample in report["per_sample"]:
@@ -6780,6 +7219,7 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
                     str(sample["paragraph_count"]),
                     str(sample.get("alignment_quality")),
                     str(len(sample.get("truncated_paragraphs", []))),
+                    str(sample.get("style_drift_score")),
                     _md_cell(sample.get("reason"), 90),
                 ]
             )
@@ -6790,8 +7230,8 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
             "",
             "## Paragraph Diagnostics",
             "",
-            "| Run | Sample | Paragraph | Ref Chars | Before | After | Ratio Before | Ratio After | Truncated | Reasons | Alignment | Eligible | Source | Reference | Final |",
-            "|---:|---|---|---:|---:|---:|---:|---:|---|---|---:|---|---|---|---|",
+            "| Run | Sample | Paragraph | Ref Chars | Before | After | Selected | Ratio Before | Ratio After | Ratio Selected | Selected Output | Style Drift | Truncated | Reasons | Alignment | Eligible | Source | Reference | Selected Final |",
+            "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---|---:|---|---|---|---|",
         ]
     )
     for diagnostic in report["paragraph_diagnostics"]:
@@ -6805,15 +7245,19 @@ def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
                     str(diagnostic.get("reference_char_count")),
                     str(diagnostic.get("before_char_count")),
                     str(diagnostic.get("after_char_count")),
+                    str(diagnostic.get("selected_char_count")),
                     str(diagnostic.get("ratio_before")),
+                    str(diagnostic.get("ratio_after_compression")),
                     str(diagnostic.get("ratio_after")),
+                    str(diagnostic.get("selected_final_output")),
+                    str(diagnostic.get("style_drift_score")),
                     str(diagnostic.get("truncation_detected")),
                     _md_cell("; ".join(diagnostic.get("truncation_reasons", [])), 80),
                     str(diagnostic.get("alignment_quality")),
                     str(diagnostic.get("accepted_for_stable_validation")),
                     _md_cell(diagnostic.get("source_paragraph"), 100),
                     _md_cell(diagnostic.get("human_reference_paragraph"), 100),
-                    _md_cell(diagnostic.get("model_paragraph_after_compression"), 100),
+                    _md_cell(diagnostic.get("model_paragraph_selected_final"), 100),
                 ]
             )
             + " |"
@@ -6839,7 +7283,12 @@ def write_replay_human_review_exports(run_dir: Path, report: dict[str, Any]) -> 
                     f"`{diagnostic.get('accepted_for_stable_validation')}`"
                 ),
                 f"- Ratio before: `{diagnostic.get('ratio_before')}`",
-                f"- Ratio after: `{diagnostic.get('ratio_after')}`",
+                f"- Ratio after compression: `{diagnostic.get('ratio_after_compression')}`",
+                f"- Ratio selected: `{diagnostic.get('ratio_after')}`",
+                f"- Selected final output: `{diagnostic.get('selected_final_output')}`",
+                f"- Selection reason: `{diagnostic.get('selected_final_output_reason')}`",
+                f"- Style drift score: `{diagnostic.get('style_drift_score')}`",
+                f"- Human review recommended: `{diagnostic.get('human_review_recommended')}`",
                 "",
                 "Source:",
                 "",
@@ -6857,6 +7306,10 @@ def write_replay_human_review_exports(run_dir: Path, report: dict[str, Any]) -> 
                 "",
                 diagnostic.get("model_paragraph_after_compression", ""),
                 "",
+                "Selected final output:",
+                "",
+                diagnostic.get("model_paragraph_selected_final", ""),
+                "",
             ]
         )
     (run_dir / "human_review_samples.md").write_text(
@@ -6867,8 +7320,8 @@ def write_replay_human_review_exports(run_dir: Path, report: dict[str, Any]) -> 
     table_lines = [
         "# Paragraph Review Table",
         "",
-        "| Run | Sample | Paragraph | Ref Chars | Before | After | Ratio Before | Ratio After | Truncated | Reasons | Alignment | Eligible | Source | Reference | After |",
-        "|---:|---|---|---:|---:|---:|---:|---:|---|---|---:|---|---|---|---|",
+        "| Run | Sample | Paragraph | Ref Chars | Before | After | Selected | Ratio Before | Ratio After | Ratio Selected | Selected Output | Style Drift | Truncated | Reasons | Alignment | Eligible | Source | Reference | Selected Final |",
+        "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---|---:|---|---|---|---|",
     ]
     for diagnostic in report["paragraph_diagnostics"]:
         table_lines.append(
@@ -6881,15 +7334,19 @@ def write_replay_human_review_exports(run_dir: Path, report: dict[str, Any]) -> 
                     str(diagnostic.get("reference_char_count")),
                     str(diagnostic.get("before_char_count")),
                     str(diagnostic.get("after_char_count")),
+                    str(diagnostic.get("selected_char_count")),
                     str(diagnostic.get("ratio_before")),
+                    str(diagnostic.get("ratio_after_compression")),
                     str(diagnostic.get("ratio_after")),
+                    str(diagnostic.get("selected_final_output")),
+                    str(diagnostic.get("style_drift_score")),
                     str(diagnostic.get("truncation_detected")),
                     _md_cell("; ".join(diagnostic.get("truncation_reasons", [])), 80),
                     str(diagnostic.get("alignment_quality")),
                     str(diagnostic.get("accepted_for_stable_validation")),
                     _md_cell(diagnostic.get("source_paragraph"), 100),
                     _md_cell(diagnostic.get("human_reference_paragraph"), 100),
-                    _md_cell(diagnostic.get("model_paragraph_after_compression"), 100),
+                    _md_cell(diagnostic.get("model_paragraph_selected_final"), 100),
                 ]
             )
             + " |"
