@@ -15,7 +15,10 @@ from nts_core.corrections import (
 from nts_core.doctor import build_doctor_report
 from nts_core.eval_harness import (
     DEFAULT_LIMITS,
+    TINY_PARAGRAPH_THRESHOLD,
+    UNIT_TARGET_MIN_CHARS,
     compare_translation,
+    compact_stable_validation_result,
     learn_style,
     prepare_parallel,
     replay_cached_eval,
@@ -600,6 +603,15 @@ def eval_prepare_parallel(
     ],
     sample_start_ratio: Annotated[float, typer.Option("--sample-start-ratio")] = 0.0,
     sample_count: Annotated[int, typer.Option("--sample-count")] = 1,
+    merge_tiny_paragraphs: Annotated[
+        bool,
+        typer.Option(
+            "--merge-tiny-paragraphs/--no-merge-tiny-paragraphs",
+            help="Merge tiny aligned paragraphs into safer eval translation units.",
+        ),
+    ] = True,
+    tiny_paragraph_threshold: Annotated[int, typer.Option("--tiny-paragraph-threshold")] = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: Annotated[int, typer.Option("--unit-target-min-chars")] = UNIT_TARGET_MIN_CHARS,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
@@ -612,6 +624,9 @@ def eval_prepare_parallel(
             max_target_chars=max_target_chars,
             sample_start_ratio=sample_start_ratio,
             sample_count=sample_count,
+            merge_tiny_paragraphs=merge_tiny_paragraphs,
+            tiny_paragraph_threshold=tiny_paragraph_threshold,
+            unit_target_min_chars=unit_target_min_chars,
         )
     except ValueError as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
@@ -682,9 +697,18 @@ def eval_translate_sample(
         bool,
         typer.Option(
             "--enable-compression-pass/--disable-compression-pass",
-            help="Compress overlong paragraph outputs once.",
+            help="Compress overlong paragraph outputs with the safe two-attempt protocol.",
         ),
     ] = True,
+    merge_tiny_paragraphs: Annotated[
+        bool,
+        typer.Option(
+            "--merge-tiny-paragraphs/--no-merge-tiny-paragraphs",
+            help="Merge tiny aligned paragraphs into safer eval translation units.",
+        ),
+    ] = True,
+    tiny_paragraph_threshold: Annotated[int, typer.Option("--tiny-paragraph-threshold")] = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: Annotated[int, typer.Option("--unit-target-min-chars")] = UNIT_TARGET_MIN_CHARS,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     _ = (chapter, max_target_chars, max_chapters, sample_start_ratio)
@@ -698,6 +722,9 @@ def eval_translate_sample(
             target_length_tolerance=target_length_tolerance,
             enable_paragraph_alignment=enable_paragraph_alignment,
             enable_compression_pass=enable_compression_pass,
+            merge_tiny_paragraphs=merge_tiny_paragraphs,
+            tiny_paragraph_threshold=tiny_paragraph_threshold,
+            unit_target_min_chars=unit_target_min_chars,
         )
     except ValueError as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
@@ -766,9 +793,18 @@ def eval_run_full(
         bool,
         typer.Option(
             "--enable-compression-pass/--disable-compression-pass",
-            help="Compress overlong paragraph outputs once.",
+            help="Compress overlong paragraph outputs with the safe two-attempt protocol.",
         ),
     ] = True,
+    merge_tiny_paragraphs: Annotated[
+        bool,
+        typer.Option(
+            "--merge-tiny-paragraphs/--no-merge-tiny-paragraphs",
+            help="Merge tiny aligned paragraphs into safer eval translation units.",
+        ),
+    ] = True,
+    tiny_paragraph_threshold: Annotated[int, typer.Option("--tiny-paragraph-threshold")] = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: Annotated[int, typer.Option("--unit-target-min-chars")] = UNIT_TARGET_MIN_CHARS,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
@@ -787,6 +823,9 @@ def eval_run_full(
             target_length_tolerance=target_length_tolerance,
             enable_paragraph_alignment=enable_paragraph_alignment,
             enable_compression_pass=enable_compression_pass,
+            merge_tiny_paragraphs=merge_tiny_paragraphs,
+            tiny_paragraph_threshold=tiny_paragraph_threshold,
+            unit_target_min_chars=unit_target_min_chars,
         )
     except ValueError as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
@@ -821,11 +860,27 @@ def eval_validate_stable_prompt(
         bool,
         typer.Option(
             "--enable-compression-pass/--disable-compression-pass",
-            help="Compress overlong paragraph outputs once.",
+            help="Compress overlong paragraph outputs with the safe two-attempt protocol.",
         ),
     ] = True,
+    merge_tiny_paragraphs: Annotated[
+        bool,
+        typer.Option(
+            "--merge-tiny-paragraphs/--no-merge-tiny-paragraphs",
+            help="Merge tiny aligned paragraphs into safer eval translation units.",
+        ),
+    ] = True,
+    tiny_paragraph_threshold: Annotated[int, typer.Option("--tiny-paragraph-threshold")] = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: Annotated[int, typer.Option("--unit-target-min-chars")] = UNIT_TARGET_MIN_CHARS,
     stable_run_count: Annotated[int, typer.Option("--stable-run-count")] = 3,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+    verbose_json: Annotated[
+        bool,
+        typer.Option(
+            "--verbose-json",
+            help="Include full stable-validation diagnostics in JSON output.",
+        ),
+    ] = False,
 ) -> None:
     try:
         result = validate_stable_prompt(
@@ -841,10 +896,14 @@ def eval_validate_stable_prompt(
             enable_paragraph_alignment=enable_paragraph_alignment,
             enable_compression_pass=enable_compression_pass,
             stable_run_count=stable_run_count,
+            merge_tiny_paragraphs=merge_tiny_paragraphs,
+            tiny_paragraph_threshold=tiny_paragraph_threshold,
+            unit_target_min_chars=unit_target_min_chars,
         )
     except ValueError as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
-    _print(success_envelope(result), json_output)
+    output = result if verbose_json else compact_stable_validation_result(result)
+    _print(success_envelope(output), json_output)
 
 
 @eval_app.command("replay")

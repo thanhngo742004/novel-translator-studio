@@ -487,3 +487,96 @@
   - The real validation command exceeded the shell timeout while printing the final large JSON payload, but the validation artifacts were written and inspected.
 - Next recommended phase:
   - Improve the model compression/rewrite protocol and reduce CLI stable-validation output size before rerunning the full real gate.
+
+## 2026-05-25T10:59:05+07:00
+
+- Completed: MVP4.8.8 safe compression protocol and compact stable-validation JSON output only.
+- Implemented so far:
+  - Compression now uses a per-paragraph structured rewrite protocol with at most two model attempts.
+  - Compression responses must include `paragraph_id`, `revised_text`, `preserved_terms`, `dropped_details`, `confidence`, and `notes`.
+  - Unsafe compression fails the paragraph when output is truncated, drops details, has low confidence, starts with an injected glossary label, or misses required terms/numbers.
+  - Deterministic hard clipping fallback was removed from the real compression/repair path.
+  - Short reference paragraphs use a relaxed strict budget while the global output/reference ratio remains enforced.
+  - Provider JSON output failures now get one retry and fail only when unresolved.
+  - `nts eval validate-stable-prompt --json` now emits compact default JSON; `--verbose-json` keeps full diagnostics.
+  - Stable validation reports now include paths and counters for truncation, unsafe compression, provider JSON failures, and compression attempts.
+  - Default stable-validation JSON now omits full paragraph text and full compression-attempt rows; full diagnostics remain in artifact files and `--verbose-json`.
+- Commands run:
+  - `python -m pytest tests/test_mvp45_eval.py -q`
+  - `python -m pytest`
+  - `python -m nts_cli.main eval validate-stable-prompt --help`
+  - `python -m nts_cli.main eval validate-stable-prompt --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4-mini --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --enable-paragraph-alignment --enable-compression-pass --stable-run-count 3 --json`
+  - `python -m nts_cli.main eval validate-stable-prompt --project mvp488-compact-smoke --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider mock --model mock-stable --max-chapters 1 --sample-count 1 --max-source-chars 200 --max-target-chars 400 --stable-run-count 1 --json`
+- Test result:
+  - `python -m pytest tests/test_mvp45_eval.py -q` -> 40 passed.
+  - `python -m pytest` -> 73 passed.
+- Strict validation result:
+  - Output folder: `artifacts/evaluations/han-jue_stable_1779682631990`
+  - Quality gate: fail.
+  - Stable prompt created: false.
+  - Run scores: 92.33, 92.67, 92.00.
+  - Sample alignment qualities: all selected samples were 1.000.
+  - Sample ratios after compression: 1.094, 0.946, 0.982, 1.100, 0.970, 1.038, 1.144, 0.965, 0.972.
+  - Truncation count: 0.
+  - Provider JSON failure count: 0.
+  - Unsafe compression count: 29.
+  - Primary failure reason: rewritten paragraphs remained above relaxed per-paragraph budget after two safe compression attempts.
+- Known limitations:
+  - Real validation no longer passes by truncating or clipping, but the provider still cannot safely compress some very short reference paragraphs within the strict paragraph budget.
+  - The completed real run took about 24 minutes.
+  - No production translation workflow is enabled.
+- Next recommended phase:
+  - Improve sample paragraph budgeting/alignment granularity for very short human-reference paragraphs, likely by merging adjacent tiny reference paragraphs into safer evaluation units before translation/compression.
+
+## 2026-05-25T14:49:06+07:00
+
+- Completed: MVP4.8.9 merged aligned paragraph translation/evaluation units only.
+- Implemented:
+  - `translation_units` builder over paragraph alignment pairs.
+  - Conservative adjacent merging for tiny/short reference paragraphs, system panel runs, dialogue fragments, and high-risk short-reference narrative units.
+  - Unit-level translation prompts and validation while preserving original paragraph IDs inside each unit.
+  - Unit-level budgets:
+    - `target_min = 0.80 * reference_unit_char_count`
+    - `target_max = 1.20 * reference_unit_char_count`
+    - `strict_max = 1.35 * reference_unit_char_count`
+    - short merged units can use a 1.50 strict ratio.
+  - Active unit mode for translation, compression, rendering, scoring, cached replay, and human review exports.
+  - Reports:
+    - `translation_units.json`
+    - `unit_alignment_report.json`
+    - enhanced `paragraph_review_table.md`
+    - enhanced `human_review_samples.md`
+  - CLI flags:
+    - `--merge-tiny-paragraphs/--no-merge-tiny-paragraphs`
+    - `--tiny-paragraph-threshold`
+    - `--unit-target-min-chars`
+  - Targeted system-panel alias handling so preserved Chinese system labels such as `寿命` satisfy the safety-preservation check without relaxing fixed name/term mappings.
+- Commands run:
+  - `python -m pytest tests/test_mvp45_eval.py -q`
+  - `python -m pytest`
+  - `python -m nts_cli.main eval validate-stable-prompt --help`
+  - `python -m nts_cli.main eval prepare-parallel --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --project mvp489-unit-smoke --max-chapters 1 --sample-count 1 --max-source-chars 300 --max-target-chars 500 --json`
+  - `python -m nts_cli.main eval prepare-parallel --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --project mvp489-merge-check --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --merge-tiny-paragraphs --json`
+  - `python -m nts_cli.main eval prepare-parallel --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --project mvp489-merge-check2 --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --merge-tiny-paragraphs --json`
+  - `python -m nts_cli.main eval validate-stable-prompt --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4-mini --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --enable-paragraph-alignment --enable-compression-pass --merge-tiny-paragraphs --stable-run-count 3 --json`
+- Test result:
+  - `python -m pytest tests/test_mvp45_eval.py -q` -> 49 passed.
+  - `python -m pytest` -> 82 passed.
+- Real validation results:
+  - Output folder: `artifacts/evaluations/han-jue_stable_1779694766407`
+  - Quality gate: fail.
+  - Stable prompt created: false.
+  - Run 1: pass, average score 93.33.
+  - Run 2: fail, average score 68.67, caused by provider HTTP 524 on sample 2.
+  - Run 3: pass, average score 92.67.
+  - Ratio summary: min 0.001, max 1.196, average 0.953.
+  - Truncation count: 5, all from empty unit outputs after provider HTTP 524.
+  - Unsafe compression count: 0.
+  - Provider JSON failure count: 0.
+  - Unit merge count: 90.
+- Known limitations:
+  - The stable gate did not pass because the provider returned HTTP 524 during one validation sample, not because of unsafe compression.
+  - The current harness treats provider failures as hard validation failures and does not retry the whole sample.
+  - No production translation workflow is enabled.
+- Next recommended phase:
+  - Add a provider-error retry policy for stable validation samples/runs, preserving strict output gates while retrying transient HTTP 5xx failures once before marking the run failed.

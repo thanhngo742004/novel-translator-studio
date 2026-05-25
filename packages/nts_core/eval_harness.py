@@ -38,8 +38,18 @@ PROMPT_TARGET_MAX_RATIO = 1.20
 LENGTH_RETRY_RATIO = 1.30
 ACTIVE_PROMPT_ITERATION = 4
 PARAGRAPH_TARGET_MIN_RATIO = 0.80
-PARAGRAPH_TARGET_MAX_RATIO = 1.15
-PARAGRAPH_STRICT_MAX_RATIO = 1.25
+PARAGRAPH_TARGET_MAX_RATIO = 1.20
+PARAGRAPH_STRICT_MAX_RATIO = 1.30
+PARAGRAPH_SHORT_STRICT_MAX_RATIO = 1.40
+PARAGRAPH_SHORT_REFERENCE_CHARS = 80
+PARAGRAPH_ALLOWED_OVER_BUDGET_RATIO = 1.55
+TINY_PARAGRAPH_THRESHOLD = 80
+UNIT_TARGET_MIN_CHARS = 150
+UNIT_STRICT_MAX_RATIO = 1.35
+UNIT_SHORT_STRICT_MAX_RATIO = 1.50
+UNIT_HIGH_RISK_SOURCE_CHARS = 220
+UNIT_HIGH_RISK_TARGET_MAX_CHARS = 600
+UNIT_COMBINED_TARGET_MAX_CHARS = 900
 PARAGRAPH_BATCH_SIZE = 12
 ALIGNMENT_QUALITY_THRESHOLD = 0.70
 
@@ -324,27 +334,6 @@ def detect_truncated_vietnamese(
         reasons.append("hard_budget_boundary_without_sentence_end")
 
     return {"is_truncated": bool(reasons), "reasons": sorted(set(reasons))}
-
-
-def safe_trim_complete_text(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text.strip()
-    if max_chars <= 0:
-        return text
-    candidate = text[:max_chars].rstrip()
-    sentence_end_positions = [
-        index + 1
-        for index, char in enumerate(candidate)
-        if char in TERMINAL_PUNCTUATION
-        and (index == len(candidate) - 1 or candidate[index + 1].isspace())
-    ]
-    if not sentence_end_positions:
-        return text
-    trimmed = candidate[: sentence_end_positions[-1]].strip()
-    if not trimmed:
-        return text
-    detection = detect_truncated_vietnamese(trimmed, strict_max=max_chars)
-    return text if detection["is_truncated"] else trimmed
 
 
 def paragraph_count(text: str) -> int:
@@ -833,6 +822,11 @@ def _paragraph_pair(
     target_text = _merge_paragraph_text(target_paragraphs, target_indexes)
     source_char_count = len(source_text)
     target_char_count = len(target_text)
+    strict_ratio = (
+        PARAGRAPH_SHORT_STRICT_MAX_RATIO
+        if target_char_count < PARAGRAPH_SHORT_REFERENCE_CHARS
+        else PARAGRAPH_STRICT_MAX_RATIO
+    )
     return {
         "paragraph_id": f"p{pair_index:03d}",
         "source_paragraph_indexes": source_indexes,
@@ -844,7 +838,11 @@ def _paragraph_pair(
         "target_source_ratio": round(target_char_count / max(source_char_count, 1), 3),
         "target_min": int(target_char_count * PARAGRAPH_TARGET_MIN_RATIO),
         "target_max": int(target_char_count * PARAGRAPH_TARGET_MAX_RATIO),
-        "strict_max": int(target_char_count * PARAGRAPH_STRICT_MAX_RATIO),
+        "strict_max": int(target_char_count * strict_ratio),
+        "strict_max_ratio": strict_ratio,
+        "budget_policy_used": "short_paragraph_relaxed"
+        if target_char_count < PARAGRAPH_SHORT_REFERENCE_CHARS
+        else "normal_paragraph",
     }
 
 
@@ -981,6 +979,322 @@ def paragraph_alignment_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
             }
             for sample in samples
         ],
+    }
+
+
+def _pair_text_type(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return "empty"
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    panel_lines = [line for line in lines if line.startswith("【") or line.endswith("】")]
+    if panel_lines and len(panel_lines) >= max(1, len(lines) - 1):
+        return "panel"
+    if re.match(r"^[\"'“”‘’「『（(]*[A-ZÀ-ỸĐ\wÀ-ỹđĐ]{1,24}\s*[:：]", stripped):
+        return "dialogue"
+    if re.match(r"^[\"'“”‘’「『].+", stripped):
+        return "dialogue"
+    return "narrative"
+
+
+def _pair_unit_type(pair: dict[str, Any]) -> str:
+    source_type = _pair_text_type(pair.get("source_text", ""))
+    target_type = _pair_text_type(pair.get("target_text", ""))
+    if source_type == "panel" or target_type == "panel":
+        return "panel"
+    if source_type == "dialogue" or target_type == "dialogue":
+        return "dialogue"
+    return "narrative"
+
+
+def _is_scene_boundary_pair(pair: dict[str, Any]) -> bool:
+    combined = f"{pair.get('source_text', '')}\n{pair.get('target_text', '')}".strip()
+    if not combined:
+        return True
+    if CHAPTER_HEADING_RE.match(combined):
+        return True
+    lines = [line.strip() for line in combined.splitlines() if line.strip()]
+    if lines and all(re.fullmatch(r"[-=*_]{3,}|[·•。…]{3,}", line) for line in lines):
+        return True
+    return any(
+        re.match(r"^(第\s*\d+\s*章|chương\s+\d+)\b", line, flags=re.IGNORECASE)
+        for line in lines
+    )
+
+
+def _merge_compatible(current_type: str, next_type: str) -> bool:
+    if "boundary" in {current_type, next_type}:
+        return False
+    if current_type == "panel" or next_type == "panel":
+        return current_type == next_type
+    return True
+
+
+def _unit_type_for_pairs(pairs: list[dict[str, Any]]) -> str:
+    types = [_pair_unit_type(pair) for pair in pairs]
+    if not types:
+        return "empty"
+    if all(item == types[0] for item in types):
+        return types[0]
+    if "panel" in types:
+        return "mixed"
+    if "dialogue" in types:
+        return "dialogue"
+    return "narrative"
+
+
+def _unit_text(pairs: list[dict[str, Any]], key: str) -> str:
+    return "\n\n".join(str(pair.get(key, "")).strip() for pair in pairs if str(pair.get(key, "")).strip())
+
+
+def _unit_merge_reason(pairs: list[dict[str, Any]], unit_target_min_chars: int) -> str:
+    if len(pairs) == 1:
+        return "single_paragraph"
+    if all(_pair_unit_type(pair) == "panel" for pair in pairs):
+        return "consecutive_system_panel_lines"
+    if any(_pair_unit_type(pair) == "dialogue" for pair in pairs):
+        return "short_dialogue_fragment_merge"
+    if sum(pair.get("target_char_count", 0) for pair in pairs) < unit_target_min_chars:
+        return "tiny_paragraph_merge_to_minimum_unit"
+    return "adjacent_short_paragraph_merge"
+
+
+def _unit_from_pairs(
+    *,
+    unit_index: int,
+    pairs: list[dict[str, Any]],
+    sample: dict[str, Any],
+    unit_target_min_chars: int,
+) -> dict[str, Any]:
+    source_text = _unit_text(pairs, "source_text")
+    target_text = _unit_text(pairs, "target_text")
+    source_char_count = len(source_text)
+    target_char_count = len(target_text)
+    strict_ratio = (
+        UNIT_SHORT_STRICT_MAX_RATIO
+        if target_char_count < unit_target_min_chars
+        else UNIT_STRICT_MAX_RATIO
+    )
+    unit = {
+        "unit_id": f"u{unit_index:03d}",
+        "paragraph_id": f"u{unit_index:03d}",
+        "source_paragraph_ids": [pair["paragraph_id"] for pair in pairs],
+        "target_paragraph_ids": [pair["paragraph_id"] for pair in pairs],
+        "original_paragraph_ids": [pair["paragraph_id"] for pair in pairs],
+        "source_paragraph_indexes": [
+            index
+            for pair in pairs
+            for index in pair.get("source_paragraph_indexes", [])
+        ],
+        "target_paragraph_indexes": [
+            index
+            for pair in pairs
+            for index in pair.get("target_paragraph_indexes", [])
+        ],
+        "source_text": source_text,
+        "target_text": target_text,
+        "reference_text": target_text,
+        "source_char_count": source_char_count,
+        "target_char_count": target_char_count,
+        "reference_char_count": target_char_count,
+        "target_source_ratio": round(target_char_count / max(source_char_count, 1), 3),
+        "target_min": int(target_char_count * PARAGRAPH_TARGET_MIN_RATIO),
+        "target_max": int(target_char_count * PARAGRAPH_TARGET_MAX_RATIO),
+        "strict_max": max(
+            int(target_char_count * PARAGRAPH_TARGET_MAX_RATIO),
+            int(target_char_count * strict_ratio),
+        ),
+        "strict_max_ratio": strict_ratio,
+        "budget_policy_used": "merged_short_unit_relaxed"
+        if target_char_count < unit_target_min_chars
+        else "merged_unit",
+        "unit_type": _unit_type_for_pairs(pairs),
+        "merge_reason": _unit_merge_reason(pairs, unit_target_min_chars),
+        "alignment_quality": sample.get("alignment_quality", 1.0),
+        "alignment_warnings": sample.get("alignment_warnings", []),
+        "is_merged_unit": len(pairs) > 1,
+        "original_paragraph_count": len(pairs),
+    }
+    unit["required_terms"] = required_terms_for_pair(
+        unit,
+        {"fixed_terms": [{"source": source, "target": target} for source, target in FIXED_GLOSSARY.items()]},
+    )
+    return unit
+
+
+def build_translation_units(
+    sample: dict[str, Any],
+    *,
+    tiny_paragraph_threshold: int = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: int = UNIT_TARGET_MIN_CHARS,
+) -> list[dict[str, Any]]:
+    pairs = list(sample.get("paragraph_pairs", []))
+    if not pairs:
+        return []
+    units: list[list[dict[str, Any]]] = []
+    index = 0
+    while index < len(pairs):
+        current = pairs[index]
+        current_type = "boundary" if _is_scene_boundary_pair(current) else _pair_unit_type(current)
+        group = [current]
+        index += 1
+        while index < len(pairs):
+            next_pair = pairs[index]
+            next_type = "boundary" if _is_scene_boundary_pair(next_pair) else _pair_unit_type(next_pair)
+            group_source_chars = sum(pair.get("source_char_count", 0) for pair in group)
+            group_target_chars = sum(pair.get("target_char_count", 0) for pair in group)
+            group_tiny = (
+                group_source_chars < tiny_paragraph_threshold
+                or group_target_chars < tiny_paragraph_threshold
+                or group_target_chars < unit_target_min_chars
+            )
+            next_tiny = (
+                next_pair.get("source_char_count", 0) < tiny_paragraph_threshold
+                or next_pair.get("target_char_count", 0) < tiny_paragraph_threshold
+                or next_pair.get("target_char_count", 0) < unit_target_min_chars
+            )
+            same_panel_run = current_type == "panel" and next_type == "panel"
+            if not _merge_compatible(current_type, next_type):
+                break
+            if not (group_tiny or next_tiny or same_panel_run):
+                break
+            group.append(next_pair)
+            current_type = _unit_type_for_pairs(group)
+            index += 1
+            if sum(pair.get("target_char_count", 0) for pair in group) >= unit_target_min_chars and not same_panel_run:
+                break
+        if (
+            len(group) == 1
+            and units
+            and not _is_scene_boundary_pair(group[0])
+            and (
+                group[0].get("target_char_count", 0) < tiny_paragraph_threshold
+                or group[0].get("source_char_count", 0) < tiny_paragraph_threshold
+                or group[0].get("target_char_count", 0) < unit_target_min_chars
+            )
+            and not any(_is_scene_boundary_pair(pair) for pair in units[-1])
+            and _merge_compatible(_unit_type_for_pairs(units[-1]), _pair_unit_type(group[0]))
+        ):
+            units[-1].extend(group)
+        else:
+            units.append(group)
+    merged_units: list[list[dict[str, Any]]] = []
+    for group in units:
+        group_source_chars = sum(pair.get("source_char_count", 0) for pair in group)
+        group_target_chars = sum(pair.get("target_char_count", 0) for pair in group)
+        group_type = _unit_type_for_pairs(group)
+        high_risk_isolated_unit = (
+            group_type != "panel"
+            and group_source_chars >= UNIT_HIGH_RISK_SOURCE_CHARS
+            and group_target_chars < UNIT_HIGH_RISK_TARGET_MAX_CHARS
+        )
+        if (
+            high_risk_isolated_unit
+            and merged_units
+            and not any(_is_scene_boundary_pair(pair) for pair in group)
+            and not any(_is_scene_boundary_pair(pair) for pair in merged_units[-1])
+            and _merge_compatible(_unit_type_for_pairs(merged_units[-1]), group_type)
+            and sum(pair.get("target_char_count", 0) for pair in merged_units[-1] + group)
+            <= UNIT_COMBINED_TARGET_MAX_CHARS
+        ):
+            merged_units[-1].extend(group)
+        else:
+            merged_units.append(group)
+    units = merged_units
+    return [
+        _unit_from_pairs(
+            unit_index=unit_index,
+            pairs=unit_pairs,
+            sample=sample,
+            unit_target_min_chars=unit_target_min_chars,
+        )
+        for unit_index, unit_pairs in enumerate(units, start=1)
+    ]
+
+
+def apply_translation_units(
+    samples: list[dict[str, Any]],
+    *,
+    merge_tiny_paragraphs: bool = True,
+    tiny_paragraph_threshold: int = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: int = UNIT_TARGET_MIN_CHARS,
+) -> list[dict[str, Any]]:
+    updated = []
+    for sample in samples:
+        sample_copy = dict(sample)
+        units = build_translation_units(
+            sample_copy,
+            tiny_paragraph_threshold=tiny_paragraph_threshold,
+            unit_target_min_chars=unit_target_min_chars,
+        )
+        merge_count = sum(max(0, unit.get("original_paragraph_count", 1) - 1) for unit in units)
+        sample_copy["translation_units"] = units
+        sample_copy["use_translation_units"] = bool(merge_tiny_paragraphs and merge_count)
+        sample_copy["translation_unit_settings"] = {
+            "merge_tiny_paragraphs": merge_tiny_paragraphs,
+            "tiny_paragraph_threshold": tiny_paragraph_threshold,
+            "unit_target_min_chars": unit_target_min_chars,
+        }
+        sample_copy["translation_unit_merge_count"] = merge_count
+        updated.append(sample_copy)
+    return updated
+
+
+def active_eval_pairs(sample: dict[str, Any]) -> list[dict[str, Any]]:
+    if sample.get("use_translation_units") and sample.get("translation_units"):
+        return sample["translation_units"]
+    return sample.get("paragraph_pairs", [])
+
+
+def translation_units_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    all_units = [unit for sample in samples for unit in sample.get("translation_units", [])]
+    return {
+        "schema_version": "translation_units_v1",
+        "sample_count": len(samples),
+        "unit_count": len(all_units),
+        "merged_unit_count": sum(1 for unit in all_units if unit.get("is_merged_unit")),
+        "paragraph_merge_count": sum(max(0, unit.get("original_paragraph_count", 1) - 1) for unit in all_units),
+        "samples": [
+            {
+                "sample_id": sample["sample_id"],
+                "chapter_id": sample["chapter_id"],
+                "use_translation_units": sample.get("use_translation_units", False),
+                "translation_unit_merge_count": sample.get("translation_unit_merge_count", 0),
+                "units": sample.get("translation_units", []),
+            }
+            for sample in samples
+        ],
+    }
+
+
+def unit_alignment_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = []
+    for sample in samples:
+        for unit in sample.get("translation_units", []):
+            rows.append(
+                {
+                    "sample_id": sample["sample_id"],
+                    "chapter_id": sample["chapter_id"],
+                    "unit_id": unit["unit_id"],
+                    "source_paragraph_ids": unit["source_paragraph_ids"],
+                    "target_paragraph_ids": unit["target_paragraph_ids"],
+                    "unit_type": unit["unit_type"],
+                    "merge_reason": unit["merge_reason"],
+                    "source_char_count": unit["source_char_count"],
+                    "reference_char_count": unit["reference_char_count"],
+                    "strict_max": unit["strict_max"],
+                    "alignment_quality": unit.get("alignment_quality"),
+                    "warnings": unit.get("alignment_warnings", []),
+                    "accepted_for_stable_validation": (
+                        unit.get("alignment_quality", 0) >= ALIGNMENT_QUALITY_THRESHOLD
+                    ),
+                }
+            )
+    return {
+        "schema_version": "unit_alignment_report_v1",
+        "unit_count": len(rows),
+        "merged_unit_count": sum(1 for row in rows if len(row["source_paragraph_ids"]) > 1),
+        "units": rows,
     }
 
 
@@ -1559,6 +1873,9 @@ def prepare_parallel(
     max_target_chars: int = 2500,
     sample_start_ratio: float = 0.0,
     sample_count: int = 1,
+    merge_tiny_paragraphs: bool = True,
+    tiny_paragraph_threshold: int = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: int = UNIT_TARGET_MIN_CHARS,
 ) -> dict[str, Any]:
     if max_chapters <= 0:
         raise ValueError("--max-chapters must be greater than 0.")
@@ -1568,6 +1885,8 @@ def prepare_parallel(
         raise ValueError("--sample-start-ratio must be between 0 and 1.")
     if sample_count <= 0:
         raise ValueError("--sample-count must be greater than 0.")
+    if tiny_paragraph_threshold <= 0 or unit_target_min_chars <= 0:
+        raise ValueError("--tiny-paragraph-threshold and --unit-target-min-chars must be greater than 0.")
     run_dir = new_run_dir(project, "eval")
     raw_chapters = extract_raw_chapters(raw_path, max_chapters=max_chapters)
     target_chapters = extract_epub_chapters(translated_path, max_chapters=max_chapters)
@@ -1592,6 +1911,12 @@ def prepare_parallel(
             max_target_chars=max_target_chars,
             sample_start_ratio=sample_start_ratio,
         )
+    samples = apply_translation_units(
+        samples,
+        merge_tiny_paragraphs=merge_tiny_paragraphs,
+        tiny_paragraph_threshold=tiny_paragraph_threshold,
+        unit_target_min_chars=unit_target_min_chars,
+    )
     sample = samples[0]
     block_report = block_alignment_report(
         source_blocks=source_blocks,
@@ -1614,6 +1939,8 @@ def prepare_parallel(
         },
     )
     write_json(run_dir / "paragraph_alignment_report.json", paragraph_alignment_report(samples))
+    write_json(run_dir / "translation_units.json", translation_units_report(samples))
+    write_json(run_dir / "unit_alignment_report.json", unit_alignment_report(samples))
     write_json(run_dir / "selected_sample.json", sample)
     write_json(run_dir / "selected_samples.json", {"samples": samples})
     write_alignment_markdown(run_dir, chapter_report=alignment, block_report=block_report)
@@ -1839,13 +2166,35 @@ def _api_key(provider: EvalProvider) -> str:
     raise ValueError(f"Missing API key env var: {provider.api_key_env}")
 
 
+def _mock_rewrite_complete_paragraph(text: str, max_chars: int) -> str:
+    stripped = text.strip()
+    if len(stripped) <= max_chars:
+        return stripped
+    sentences = [
+        match.group(0).strip()
+        for match in re.finditer(r"[^.!?。！？…]+[.!?。！？…]+", stripped)
+    ]
+    if not sentences:
+        return stripped
+    kept: list[str] = []
+    for sentence in sentences:
+        candidate = " ".join(kept + [sentence]).strip()
+        if len(candidate) <= max_chars or not kept:
+            kept.append(sentence)
+            continue
+        break
+    candidate = " ".join(kept).strip()
+    detection = detect_truncated_vietnamese(candidate, strict_max=max_chars)
+    return stripped if detection["is_truncated"] else candidate
+
+
 def _mock_chat_completion(model: str, messages: list[dict[str, str]]) -> str:
     content = messages[-1]["content"]
     try:
         payload = json.loads(content)
     except json.JSONDecodeError:
         payload = None
-    if isinstance(payload, dict) and payload.get("task") == "translate_paragraphs":
+    if isinstance(payload, dict) and payload.get("task") in {"translate_paragraphs", "translate_units"}:
         return json_dumps(
             {
                 "paragraphs": [
@@ -1862,8 +2211,19 @@ def _mock_chat_completion(model: str, messages: list[dict[str, str]]) -> str:
         for paragraph in payload.get("paragraphs", []):
             target_max = int(paragraph.get("target_max") or paragraph.get("strict_max") or 80)
             current = str(paragraph.get("current_translation", ""))
-            text = safe_trim_complete_text(current, target_max)
-            compressed.append({"paragraph_id": paragraph["paragraph_id"], "text": text})
+            text = _mock_rewrite_complete_paragraph(current, target_max)
+            compressed.append(
+                {
+                    "paragraph_id": paragraph["paragraph_id"],
+                    "revised_text": text,
+                    "preserved_terms": [
+                        item.get("target") for item in paragraph.get("required_terms", [])
+                    ],
+                    "dropped_details": [],
+                    "confidence": 0.95,
+                    "notes": "mock safe complete-sentence rewrite",
+                }
+            )
         return json_dumps({"paragraphs": compressed})
     source = content[:240].replace("\n", " ")
     return f"[MOCK {model}] {source}"
@@ -1952,26 +2312,37 @@ def paragraph_translation_user_prompt(
     *,
     paragraph_pairs: list[dict[str, Any]] | None = None,
 ) -> str:
-    pairs = paragraph_pairs if paragraph_pairs is not None else sample.get("paragraph_pairs", [])
+    pairs = paragraph_pairs if paragraph_pairs is not None else active_eval_pairs(sample)
+    unit_mode = bool(sample.get("use_translation_units") and sample.get("translation_units"))
     paragraphs = [
         {
             "paragraph_id": pair["paragraph_id"],
+            "source_paragraph_ids": pair.get("source_paragraph_ids", [pair["paragraph_id"]]),
+            "unit_type": pair.get("unit_type", _pair_unit_type(pair)),
+            "merge_reason": pair.get("merge_reason"),
             "source_text": pair["source_text"],
             "target_min": pair["target_min"],
             "target_max": pair["target_max"],
             "strict_max": pair["strict_max"],
+            "required_terms": pair.get("required_terms", []),
         }
         for pair in pairs
     ]
     return json_dumps(
         {
-            "task": "translate_paragraphs",
+            "task": "translate_units" if unit_mode else "translate_paragraphs",
             "sample_id": sample["sample_id"],
             "instructions": (
-                "Translate each source paragraph into Vietnamese. Return exactly one object per "
+                "Translate each source unit into Vietnamese. Return exactly one object per "
+                "paragraph_id, in the same order. Preserve source paragraph order inside merged "
+                "units, keep complete Vietnamese sentences, preserve system panels, names, terms, "
+                "and numbers, and stay at or below target_max when safe."
+                if unit_mode
+                else "Translate each source paragraph into Vietnamese. Return exactly one object per "
                 "paragraph_id, in the same order. Keep each paragraph at or below target_max."
             ),
             "paragraphs": paragraphs,
+            "original_paragraph_count_relaxed": unit_mode,
             "output_schema": {
                 "paragraphs": [
                     {"paragraph_id": paragraph["paragraph_id"], "text": "Vietnamese translation"}
@@ -2014,27 +2385,77 @@ def parse_paragraph_translation_output(raw_output: str) -> list[dict[str, str]]:
         if not isinstance(paragraph, dict):
             continue
         paragraph_id = str(paragraph.get("paragraph_id", "")).strip()
-        text = re.sub(r"\s*\n+\s*", " ", str(paragraph.get("text", "")).strip())
+        raw_text = paragraph.get("text", paragraph.get("revised_text", ""))
+        text = re.sub(r"\s*\n+\s*", " ", str(raw_text).strip())
         text = re.sub(r"[ \t]+", " ", text).strip()
         if paragraph_id:
             parsed.append({"paragraph_id": paragraph_id, "text": text})
     return parsed
 
 
+def parse_compression_output(raw_output: str) -> list[dict[str, Any]]:
+    data = _extract_json_object(raw_output)
+    if not data:
+        return []
+    paragraphs = data.get("paragraphs")
+    if not isinstance(paragraphs, list):
+        return []
+    parsed = []
+    for paragraph in paragraphs:
+        if not isinstance(paragraph, dict):
+            continue
+        paragraph_id = str(paragraph.get("paragraph_id", "")).strip()
+        text = re.sub(
+            r"\s*\n+\s*",
+            " ",
+            str(paragraph.get("revised_text", paragraph.get("text", ""))).strip(),
+        )
+        text = re.sub(r"[ \t]+", " ", text).strip()
+        if not paragraph_id:
+            continue
+        confidence = paragraph.get("confidence", 1.0)
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        parsed.append(
+            {
+                "paragraph_id": paragraph_id,
+                "text": text,
+                "preserved_terms": paragraph.get("preserved_terms", []),
+                "dropped_details": paragraph.get("dropped_details", []),
+                "confidence": confidence_value,
+                "notes": paragraph.get("notes", ""),
+            }
+        )
+    return parsed
+
+
 def expected_paragraph_ids(sample: dict[str, Any]) -> list[str]:
-    return [pair["paragraph_id"] for pair in sample.get("paragraph_pairs", [])]
+    return [pair["paragraph_id"] for pair in active_eval_pairs(sample)]
+
+
+def paragraph_json_retry_prompt(
+    *,
+    sample: dict[str, Any],
+    paragraph_pairs: list[dict[str, Any]],
+    raw_output: str,
+) -> str:
+    base = json.loads(paragraph_translation_user_prompt(sample, paragraph_pairs=paragraph_pairs))
+    base["instructions"] = (
+        "Your previous response was invalid JSON or missed paragraph_id values. "
+        "Return JSON only. Include exactly the requested paragraph_id values, no markdown, "
+        "no explanations, and no extra keys outside the schema."
+    )
+    base["previous_response_excerpt"] = _snippet(raw_output, 1000)
+    return json_dumps(base)
 
 
 def best_effort_paragraph_output(raw_output: str, sample: dict[str, Any]) -> list[dict[str, str]]:
     ids = expected_paragraph_ids(sample)
     parts = [part[2] for part in _paragraphs(raw_output)]
     if len(parts) != len(ids):
-        parts = [raw_output.strip()]
-    if len(parts) == 1 and len(ids) > 1:
-        average = max(1, len(parts[0]) // len(ids))
-        text = parts[0]
-        parts = [text[index * average : (index + 1) * average].strip() for index in range(len(ids))]
-        parts[-1] = text[(len(ids) - 1) * average :].strip()
+        return [{"paragraph_id": paragraph_id, "text": ""} for paragraph_id in ids]
     return [
         {"paragraph_id": paragraph_id, "text": parts[index].strip() if index < len(parts) else ""}
         for index, paragraph_id in enumerate(ids)
@@ -2084,7 +2505,7 @@ def per_paragraph_length_table(
 ) -> list[dict[str, Any]]:
     lookup = {paragraph.get("paragraph_id"): paragraph.get("text", "") for paragraph in paragraphs}
     rows = []
-    for pair in sample.get("paragraph_pairs", []):
+    for pair in active_eval_pairs(sample):
         output_text = lookup.get(pair["paragraph_id"], "")
         output_count = len(output_text)
         truncation = detect_truncated_vietnamese(
@@ -2095,11 +2516,18 @@ def per_paragraph_length_table(
         rows.append(
             {
                 "paragraph_id": pair["paragraph_id"],
+                "source_paragraph_ids": pair.get("source_paragraph_ids", [pair["paragraph_id"]]),
+                "target_paragraph_ids": pair.get("target_paragraph_ids", [pair["paragraph_id"]]),
+                "unit_type": pair.get("unit_type"),
+                "merge_reason": pair.get("merge_reason"),
+                "is_merged_unit": pair.get("is_merged_unit", False),
                 "source_char_count": pair["source_char_count"],
                 "reference_char_count": pair["target_char_count"],
                 "target_min": pair["target_min"],
                 "target_max": pair["target_max"],
                 "strict_max": pair["strict_max"],
+                "strict_max_ratio": pair.get("strict_max_ratio"),
+                "budget_policy_used": pair.get("budget_policy_used"),
                 "output_char_count": output_count,
                 "output_reference_ratio": round(output_count / max(pair["target_char_count"], 1), 3),
                 "over_strict_max": output_count > pair["strict_max"],
@@ -2119,8 +2547,166 @@ def max_tokens_for_paragraph_pairs(pairs: list[dict[str, Any]]) -> int:
     return max(260, int(strict_total / 3.2) + 160)
 
 
-def clip_to_char_budget(text: str, max_chars: int) -> str:
-    return safe_trim_complete_text(text, max_chars)
+def required_terms_for_pair(pair: dict[str, Any], glossary: dict[str, Any]) -> list[dict[str, Any]]:
+    source_text = pair.get("source_text", "")
+    required: list[dict[str, Any]] = []
+    for term in (glossary or {}).get("fixed_terms", []):
+        source_term = str(term.get("source", ""))
+        target_term = str(term.get("target", ""))
+        if source_term and target_term and source_term in source_text:
+            aliases = [target_term]
+            for anchor_id, alias_map in ALIGNMENT_ANCHORS.items():
+                if source_term in alias_map.get("zh", []):
+                    aliases.extend(alias_map.get("vi", []))
+            required.append(
+                {
+                    "kind": "term",
+                    "source": source_term,
+                    "target": target_term,
+                    "aliases": sorted(set(alias.lower() for alias in aliases if alias)),
+                }
+            )
+    for anchor_id in extract_alignment_anchors(source_text, lang="zh"):
+        aliases = ALIGNMENT_ANCHORS.get(anchor_id, {}).get("vi", [])
+        if anchor_id.startswith("system_"):
+            aliases = aliases + ALIGNMENT_ANCHORS.get(anchor_id, {}).get("zh", [])
+        if aliases and not any(item.get("anchor_id") == anchor_id for item in required):
+            required.append(
+                {
+                    "kind": "anchor",
+                    "anchor_id": anchor_id,
+                    "source": anchor_id,
+                    "target": aliases[0],
+                    "aliases": sorted(set(alias.lower() for alias in aliases if alias)),
+                }
+            )
+    for number in sorted(set(re.findall(r"\d+(?:/\d+)?", source_text))):
+        required.append(
+            {
+                "kind": "number",
+                "source": number,
+                "target": number,
+                "aliases": [number],
+            }
+        )
+    return required
+
+
+def required_terms_missing(
+    pair: dict[str, Any],
+    text: str,
+    glossary: dict[str, Any],
+) -> list[dict[str, Any]]:
+    lowered = text.lower()
+    missing = []
+    for required in required_terms_for_pair(pair, glossary):
+        aliases = required.get("aliases", [])
+        if not any(alias and alias in lowered for alias in aliases):
+            missing.append(required)
+    return missing
+
+
+def compression_attempt_prompt(
+    *,
+    pair: dict[str, Any],
+    current_translation: str,
+    glossary: dict[str, Any],
+    attempt: int,
+    previous_failure_reasons: list[str] | None = None,
+) -> str:
+    required = required_terms_for_pair(pair, glossary)
+    instructions = (
+        "Rewrite-compress this Vietnamese paragraph. Preserve all source meaning, names, "
+        "terms, numbers, and system panels. Do not hard truncate. Do not add translator notes. "
+        "Do not start with glossary labels unless the source starts with that label. Return one "
+        "complete Vietnamese paragraph."
+    )
+    if attempt == 2:
+        instructions += (
+            " This is the final retry. Explicitly check every required term/number and return "
+            "only valid JSON. If you cannot compress safely, keep meaning complete and exceed "
+            "the budget rather than truncating."
+        )
+    return json_dumps(
+        {
+            "task": "compress_paragraphs",
+            "attempt": attempt,
+            "instructions": instructions,
+            "paragraphs": [
+                {
+                    "paragraph_id": pair["paragraph_id"],
+                    "source_text": pair["source_text"],
+                    "current_translation": current_translation,
+                    "target_max": pair["target_max"],
+                    "strict_max": pair["strict_max"],
+                    "budget_policy_used": pair.get("budget_policy_used"),
+                    "required_terms": required,
+                    "previous_failure_reasons": previous_failure_reasons or [],
+                }
+            ],
+            "output_schema": {
+                "paragraphs": [
+                    {
+                        "paragraph_id": pair["paragraph_id"],
+                        "revised_text": "complete Vietnamese paragraph",
+                        "preserved_terms": ["terms/numbers kept"],
+                        "dropped_details": [],
+                        "confidence": 0.95,
+                        "notes": "brief safety note",
+                    }
+                ]
+            },
+        }
+    )
+
+
+def validate_compression_candidate(
+    *,
+    pair: dict[str, Any],
+    before: str,
+    candidate: dict[str, Any],
+    glossary: dict[str, Any],
+) -> dict[str, Any]:
+    text = candidate.get("text", "")
+    truncation = detect_truncated_vietnamese(
+        text,
+        source_text=pair.get("source_text"),
+        strict_max=pair.get("strict_max"),
+    )
+    missing_terms = required_terms_missing(pair, text, glossary)
+    dropped_details = candidate.get("dropped_details", [])
+    confidence = float(candidate.get("confidence", 0.0) or 0.0)
+    reasons = []
+    if truncation["is_truncated"]:
+        reasons.append("sentence_completeness_failed")
+    if missing_terms:
+        reasons.append("required_terms_missing")
+    if dropped_details:
+        reasons.append("dropped_details_reported")
+    if confidence < 0.75:
+        reasons.append("low_compression_confidence")
+    if not text:
+        reasons.append("empty_compression_output")
+    if _starts_with_injected_glossary_label(text):
+        reasons.append("glossary_label_prefix_injection")
+    over_strict = len(text) > pair["strict_max"]
+    paragraph_ratio = len(text) / max(pair.get("target_char_count", 1), 1)
+    if over_strict and paragraph_ratio > PARAGRAPH_ALLOWED_OVER_BUDGET_RATIO:
+        reasons.append("paragraph_exceeds_relaxed_budget")
+    return {
+        "valid": not reasons,
+        "reasons": sorted(set(reasons)),
+        "text": text,
+        "truncation": truncation,
+        "missing_terms": missing_terms,
+        "dropped_details": dropped_details,
+        "confidence": confidence,
+        "over_strict": over_strict,
+        "paragraph_ratio": round(paragraph_ratio, 3),
+        "budget_policy_used": pair.get("budget_policy_used"),
+        "before_char_count": len(before),
+        "after_char_count": len(text),
+    }
 
 
 def enforce_fixed_terms_in_paragraphs(
@@ -2132,7 +2718,7 @@ def enforce_fixed_terms_in_paragraphs(
     terms = (glossary or {}).get("fixed_terms", [])
     if not terms:
         return paragraphs, []
-    pair_lookup = {pair["paragraph_id"]: pair for pair in sample.get("paragraph_pairs", [])}
+    pair_lookup = {pair["paragraph_id"]: pair for pair in active_eval_pairs(sample)}
     repaired = []
     repairs = []
     for paragraph in paragraphs:
@@ -2176,7 +2762,7 @@ def enforce_global_length_floor(
     floor_chars = int(sample["target_char_count"] * EVAL_LENGTH_RATIO_MIN)
     if len(current) >= floor_chars:
         return final_paragraphs, []
-    pair_lookup = {pair["paragraph_id"]: pair for pair in sample.get("paragraph_pairs", [])}
+    pair_lookup = {pair["paragraph_id"]: pair for pair in active_eval_pairs(sample)}
     before_lookup = {paragraph["paragraph_id"]: paragraph["text"] for paragraph in before_paragraphs}
     updated = [dict(paragraph) for paragraph in final_paragraphs]
     repairs = []
@@ -2186,18 +2772,25 @@ def enforce_global_length_floor(
         before = before_lookup.get(paragraph_id, "")
         if not pair or len(before) <= len(paragraph["text"]):
             continue
-        candidate = clip_to_char_budget(before, pair["strict_max"])
-        if len(candidate) > pair["strict_max"] or len(candidate) <= len(paragraph["text"]):
+        if len(before) > pair["strict_max"]:
+            continue
+        candidate_detection = detect_truncated_vietnamese(
+            before,
+            source_text=pair.get("source_text"),
+            strict_max=pair.get("strict_max"),
+        )
+        if candidate_detection["is_truncated"]:
             continue
         before_count = len(paragraph["text"])
-        paragraph["text"] = candidate
+        paragraph["text"] = before
         repairs.append(
             {
                 "paragraph_id": paragraph_id,
                 "before_char_count": before_count,
-                "after_char_count": len(candidate),
+                "after_char_count": len(before),
                 "strict_max": pair["strict_max"],
                 "reason": "restore_global_length_floor",
+                "deterministic_clip_applied": False,
             }
         )
         if len(render_paragraph_translation(sample, updated)) >= floor_chars:
@@ -2232,7 +2825,26 @@ def verify_paragraph_output(
     reasons = list(validation["errors"])
     if not (EVAL_LENGTH_RATIO_MIN <= ratio <= EVAL_LENGTH_RATIO_MAX):
         reasons.append("global_ratio_outside_range")
-    if overlong:
+    safe_over_budget_rows = [
+        row
+        for row in table
+        if row["over_strict_max"]
+        and row["output_reference_ratio"] <= PARAGRAPH_ALLOWED_OVER_BUDGET_RATIO
+    ]
+    unsafe_over_budget = [
+        row["paragraph_id"]
+        for row in table
+        if row["over_strict_max"]
+        and row["output_reference_ratio"] > PARAGRAPH_ALLOWED_OVER_BUDGET_RATIO
+    ]
+    over_budget_allowed = (
+        bool(overlong)
+        and not unsafe_over_budget
+        and ratio <= EVAL_LENGTH_RATIO_MAX
+        and not truncated
+        and not terminology_mismatches
+    )
+    if overlong and not over_budget_allowed:
         reasons.append("paragraph_exceeds_strict_max")
     if truncated:
         reasons.append("paragraph_truncation_detected")
@@ -2240,18 +2852,41 @@ def verify_paragraph_output(
         reasons.append("terminology_mismatch")
     if sample.get("accepted_for_stable_validation") is False:
         reasons.append("alignment_quality_below_threshold")
+    low_alignment_units = [
+        pair["paragraph_id"]
+        for pair in active_eval_pairs(sample)
+        if pair.get("alignment_quality", sample.get("alignment_quality", 1.0))
+        < ALIGNMENT_QUALITY_THRESHOLD
+    ]
+    if low_alignment_units:
+        reasons.append("unit_alignment_quality_below_threshold")
     return {
         "pass": not reasons,
         "reasons": reasons,
         "paragraph_validation": validation,
         "global_ratio": round(ratio, 3),
-        "overlong_paragraph_ids": overlong,
+        "overlong_paragraph_ids": unsafe_over_budget if over_budget_allowed else overlong,
+        "allowed_over_budget_paragraphs": [
+            {
+                "paragraph_id": row["paragraph_id"],
+                "output_reference_ratio": row["output_reference_ratio"],
+                "reason": "global_ratio_ok_and_paragraph_ratio_within_relaxed_limit",
+            }
+            for row in safe_over_budget_rows
+        ]
+        if over_budget_allowed
+        else [],
         "truncated_paragraphs": truncated,
         "terminology_mismatches": terminology_mismatches,
         "per_paragraph_length_table": table,
         "alignment_quality": sample.get("alignment_quality"),
         "alignment_warnings": sample.get("alignment_warnings", []),
         "accepted_for_stable_validation": sample.get("accepted_for_stable_validation"),
+        "low_alignment_units": low_alignment_units,
+        "translation_unit_merge_count": sample.get("translation_unit_merge_count", 0),
+        "original_paragraph_count_relaxed": bool(
+            sample.get("use_translation_units") and sample.get("translation_unit_merge_count", 0)
+        ),
     }
 
 
@@ -2299,7 +2934,14 @@ def compression_user_prompt(
             "paragraphs": offenders,
             "output_schema": {
                 "paragraphs": [
-                    {"paragraph_id": paragraph["paragraph_id"], "text": "revised paragraph"}
+                    {
+                        "paragraph_id": paragraph["paragraph_id"],
+                        "revised_text": "complete Vietnamese paragraph",
+                        "preserved_terms": [],
+                        "dropped_details": [],
+                        "confidence": 0.95,
+                        "notes": "brief safety note",
+                    }
                     for paragraph in offenders
                 ]
             },
@@ -2324,53 +2966,136 @@ def compress_offending_paragraphs(
             "entries": [],
         }
     raw_chunks = []
-    revised = []
     provider_errors = []
-    pair_lookup = {pair["paragraph_id"]: pair for pair in sample.get("paragraph_pairs", [])}
-    for batch_index, offender_batch in enumerate(
-        _chunks(offending_ids, PARAGRAPH_BATCH_SIZE),
-        start=1,
-    ):
-        prompt = compression_user_prompt(
-            sample=sample,
-            paragraphs=paragraphs,
-            glossary=glossary,
-            paragraph_ids=offender_batch,
-        )
-        try:
-            raw = _chat_completion(
-                provider,
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You compress overlong Vietnamese translation paragraphs. "
-                            "Return JSON only. Rewrite-compress without losing meaning. Preserve names, "
-                            "terms, numbers, and system panels. Do not hard truncate, do not leave dangling "
-                            "brackets, and do not return unfinished Vietnamese words or sentences."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=max_tokens_for_paragraph_pairs([pair_lookup[item] for item in offender_batch]),
-            ).strip()
-        except ValueError as exc:
-            provider_errors.append(
-                {
-                    "batch_index": batch_index,
-                    "paragraph_ids": offender_batch,
+    pair_lookup = {pair["paragraph_id"]: pair for pair in active_eval_pairs(sample)}
+    paragraph_lookup = {paragraph["paragraph_id"]: paragraph["text"] for paragraph in paragraphs}
+    revised_lookup: dict[str, str] = {}
+    entry_lookup: dict[str, dict[str, Any]] = {}
+    for paragraph_id in offending_ids:
+        pair = pair_lookup[paragraph_id]
+        before = paragraph_lookup.get(paragraph_id, "")
+        attempts = []
+        accepted: dict[str, Any] | None = None
+        failure_reasons: list[str] = []
+        for attempt in (1, 2):
+            prompt = compression_attempt_prompt(
+                pair=pair,
+                current_translation=before if attempt == 1 else attempts[-1].get("text", before),
+                glossary=glossary,
+                attempt=attempt,
+                previous_failure_reasons=failure_reasons,
+            )
+            try:
+                raw = _chat_completion(
+                    provider,
+                    model=model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You safely rewrite-compress one Vietnamese paragraph. Return JSON only. "
+                                "Never truncate. Preserve required terms, names, numbers, and system panels. "
+                                "Use complete Vietnamese sentences and closed brackets."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=max_tokens_for_paragraph_pairs([pair]),
+                ).strip()
+            except ValueError as exc:
+                error = {
+                    "attempt": attempt,
+                    "paragraph_id": paragraph_id,
                     "error": str(exc),
                 }
+                provider_errors.append(error)
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "valid": False,
+                        "reasons": ["provider_error"],
+                        "error": str(exc),
+                    }
+                )
+                failure_reasons = ["provider_error"]
+                continue
+            raw_chunks.append(
+                json_dumps(
+                    {
+                        "paragraph_id": paragraph_id,
+                        "attempt": attempt,
+                        "raw_response": raw,
+                    }
+                )
             )
-            continue
-        raw_chunks.append(json_dumps({"batch_index": batch_index, "raw_response": raw}))
-        revised.extend(parse_paragraph_translation_output(raw))
-    revised_lookup = {
-        paragraph["paragraph_id"]: paragraph["text"]
-        for paragraph in revised
-        if paragraph["paragraph_id"] in offending_ids
-    }
+            parsed = parse_compression_output(raw)
+            candidate = next(
+                (item for item in parsed if item["paragraph_id"] == paragraph_id),
+                None,
+            )
+            if candidate is None:
+                validation = {
+                    "valid": False,
+                    "reasons": ["provider_json_failure"],
+                    "text": "",
+                    "truncation": {"is_truncated": True, "reasons": ["empty_output"]},
+                    "missing_terms": required_terms_for_pair(pair, glossary),
+                    "dropped_details": [],
+                    "confidence": 0.0,
+                    "over_strict": False,
+                    "paragraph_ratio": 0,
+                    "budget_policy_used": pair.get("budget_policy_used"),
+                    "before_char_count": len(before),
+                    "after_char_count": 0,
+                }
+            else:
+                validation = validate_compression_candidate(
+                    pair=pair,
+                    before=before,
+                    candidate=candidate,
+                    glossary=glossary,
+                )
+            attempts.append({"attempt": attempt, **validation})
+            failure_reasons = validation["reasons"]
+            if validation["valid"]:
+                accepted = validation
+                break
+        if accepted is not None:
+            revised_lookup[paragraph_id] = accepted["text"]
+            final_validation = accepted
+            compression_failure_reason = None
+        else:
+            revised_lookup[paragraph_id] = attempts[-1].get("text") or before
+            final_validation = attempts[-1]
+            compression_failure_reason = ",".join(final_validation.get("reasons", []))
+        entry_lookup[paragraph_id] = {
+            "paragraph_id": paragraph_id,
+            "before_char_count": len(before),
+            "model_after_char_count": len(revised_lookup[paragraph_id]),
+            "after_char_count": len(revised_lookup[paragraph_id]),
+            "target_max": pair["target_max"],
+            "strict_max": pair["strict_max"],
+            "budget_policy_used": pair.get("budget_policy_used"),
+            "still_over_strict_max": len(revised_lookup[paragraph_id]) > pair["strict_max"],
+            "deterministic_clip_applied": False,
+            "deterministic_min_restore_applied": False,
+            "compression_attempts": attempts,
+            "compression_attempt_count": len(attempts),
+            "compression_failure_reason": compression_failure_reason,
+            "provider_json_failures": sum(
+                1 for attempt in attempts if "provider_json_failure" in attempt.get("reasons", [])
+            ),
+            "required_terms_missing": final_validation.get("missing_terms", []),
+            "sentence_completeness_status": "fail"
+            if final_validation.get("truncation", {}).get("is_truncated")
+            else "pass",
+            "unsafe_compression": accepted is None,
+            "truncation_detected": final_validation.get("truncation", {}).get("is_truncated", False),
+            "truncation_reasons": final_validation.get("truncation", {}).get("reasons", []),
+            "before_text": before,
+            "model_after_text": revised_lookup[paragraph_id],
+            "after_text": revised_lookup[paragraph_id],
+        }
     updated = []
     entries = []
     source_lookup = {paragraph["paragraph_id"]: paragraph["text"] for paragraph in paragraphs}
@@ -2379,39 +3104,7 @@ def compress_offending_paragraphs(
         before = paragraph["text"]
         after = revised_lookup.get(paragraph_id, before)
         if paragraph_id in offending_ids:
-            pair = pair_lookup[paragraph_id]
-            model_after = after
-            deterministic_clip_applied = False
-            deterministic_min_restore_applied = False
-            unsafe_compression = False
-            truncation = detect_truncated_vietnamese(
-                after,
-                source_text=pair.get("source_text"),
-                strict_max=pair.get("strict_max"),
-            )
-            if len(after) > pair["strict_max"]:
-                unsafe_compression = True
-            if truncation["is_truncated"]:
-                unsafe_compression = True
-            entries.append(
-                {
-                    "paragraph_id": paragraph_id,
-                    "before_char_count": len(before),
-                    "model_after_char_count": len(model_after),
-                    "after_char_count": len(after),
-                    "target_max": pair["target_max"],
-                    "strict_max": pair["strict_max"],
-                    "still_over_strict_max": len(after) > pair["strict_max"],
-                    "deterministic_clip_applied": deterministic_clip_applied,
-                    "deterministic_min_restore_applied": deterministic_min_restore_applied,
-                    "unsafe_compression": unsafe_compression,
-                    "truncation_detected": truncation["is_truncated"],
-                    "truncation_reasons": truncation["reasons"],
-                    "before_text": before,
-                    "model_after_text": model_after,
-                    "after_text": after,
-                }
-            )
+            entries.append(entry_lookup[paragraph_id])
         updated.append({"paragraph_id": paragraph_id, "text": after})
     return updated, {
         "triggered": True,
@@ -2420,9 +3113,13 @@ def compress_offending_paragraphs(
         "raw_response_char_count": sum(len(raw) for raw in raw_chunks),
         "batch_count": len(raw_chunks),
         "provider_errors": provider_errors,
+        "provider_json_failures": sum(entry.get("provider_json_failures", 0) for entry in entries),
+        "max_attempts_per_paragraph": 2,
         "unchanged_non_offending_ids": [
             paragraph_id for paragraph_id in source_lookup if paragraph_id not in offending_ids
         ],
+        "unit_mode": bool(sample.get("use_translation_units")),
+        "translation_unit_merge_count": sample.get("translation_unit_merge_count", 0),
     }
 
 
@@ -2436,6 +3133,9 @@ def translate_sample(
     target_length_tolerance: float = 0.2,
     enable_paragraph_alignment: bool = True,
     enable_compression_pass: bool = True,
+    merge_tiny_paragraphs: bool = True,
+    tiny_paragraph_threshold: int = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: int = UNIT_TARGET_MIN_CHARS,
     stable_prompt_text: str | None = None,
 ) -> dict[str, Any]:
     result = translate_samples(
@@ -2447,6 +3147,9 @@ def translate_sample(
         target_length_tolerance=target_length_tolerance,
         enable_paragraph_alignment=enable_paragraph_alignment,
         enable_compression_pass=enable_compression_pass,
+        merge_tiny_paragraphs=merge_tiny_paragraphs,
+        tiny_paragraph_threshold=tiny_paragraph_threshold,
+        unit_target_min_chars=unit_target_min_chars,
         sample_limit=1,
         stable_prompt_text=stable_prompt_text,
     )
@@ -2467,6 +3170,9 @@ def translate_samples(
     target_length_tolerance: float,
     enable_paragraph_alignment: bool = True,
     enable_compression_pass: bool = True,
+    merge_tiny_paragraphs: bool = True,
+    tiny_paragraph_threshold: int = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: int = UNIT_TARGET_MIN_CHARS,
     sample_limit: int | None = None,
     prompt_iteration: int = 1,
     stable_prompt_text: str | None = None,
@@ -2480,6 +3186,14 @@ def translate_samples(
     samples = read_selected_samples(run_dir)
     if sample_limit is not None:
         samples = samples[:sample_limit]
+    samples = apply_translation_units(
+        samples,
+        merge_tiny_paragraphs=merge_tiny_paragraphs,
+        tiny_paragraph_threshold=tiny_paragraph_threshold,
+        unit_target_min_chars=unit_target_min_chars,
+    )
+    write_json(run_dir / "translation_units.json", translation_units_report(samples))
+    write_json(run_dir / "unit_alignment_report.json", unit_alignment_report(samples))
     outputs_by_sample: dict[str, dict[str, Any]] = {}
     outputs_by_model: dict[str, Any] = {}
     compression_entries: list[dict[str, Any]] = []
@@ -2519,6 +3233,8 @@ def translate_samples(
             global_ratio_before_compression = None
             best_effort_used = False
             provider_error = None
+            provider_json_failures: list[dict[str, Any]] = []
+            unresolved_provider_json_failures: list[dict[str, Any]] = []
             term_repairs: list[dict[str, Any]] = []
             global_floor_repairs: list[dict[str, Any]] = []
 
@@ -2534,11 +3250,11 @@ def translate_samples(
                 verification_after["pass"] = False
                 verification_after["reasons"].append(provider_error)
                 final = ""
-            elif enable_paragraph_alignment and sample.get("paragraph_pairs"):
+            elif enable_paragraph_alignment and active_eval_pairs(sample):
                 raw_chunks = []
                 parsed = []
                 for batch_index, pair_batch in enumerate(
-                    _chunks(sample["paragraph_pairs"], PARAGRAPH_BATCH_SIZE),
+                    _chunks(active_eval_pairs(sample), PARAGRAPH_BATCH_SIZE),
                     start=1,
                 ):
                     user_prompt = paragraph_translation_user_prompt(
@@ -2569,7 +3285,85 @@ def translate_samples(
                     raw_chunks.append(
                         json_dumps({"batch_index": batch_index, "raw_response": raw_chunk})
                     )
-                    parsed.extend(parse_paragraph_translation_output(raw_chunk))
+                    parsed_chunk = parse_paragraph_translation_output(raw_chunk)
+                    expected_batch_ids = [pair["paragraph_id"] for pair in pair_batch]
+                    parsed_ids = [paragraph["paragraph_id"] for paragraph in parsed_chunk]
+                    if parsed_ids != expected_batch_ids:
+                        first_failure = {
+                            "batch_index": batch_index,
+                            "attempt": 1,
+                            "expected_ids": expected_batch_ids,
+                            "actual_ids": parsed_ids,
+                            "resolved_by_retry": False,
+                        }
+                        provider_json_failures.append(first_failure)
+                        retry_prompt = paragraph_json_retry_prompt(
+                            sample=sample,
+                            paragraph_pairs=pair_batch,
+                            raw_output=raw_chunk,
+                        )
+                        try:
+                            retry_chunk = _chat_completion(
+                                provider,
+                                model=model,
+                                messages=[
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "Return valid JSON only. Include exactly the requested "
+                                            "paragraph_id values. No markdown or explanations."
+                                        ),
+                                    },
+                                    {"role": "user", "content": retry_prompt},
+                                ],
+                                max_tokens=max_tokens_for_paragraph_pairs(pair_batch),
+                            ).strip()
+                        except ValueError as exc:
+                            provider_json_failures.append(
+                                {
+                                    "batch_index": batch_index,
+                                    "attempt": 2,
+                                    "provider_error": str(exc),
+                                    "resolved_by_retry": False,
+                                }
+                            )
+                            unresolved_provider_json_failures.append(
+                                {
+                                    "batch_index": batch_index,
+                                    "reason": "provider_error",
+                                    "error": str(exc),
+                                }
+                            )
+                            parsed_chunk = []
+                        else:
+                            raw_chunks.append(
+                                json_dumps(
+                                    {
+                                        "batch_index": batch_index,
+                                        "retry_json_repair": True,
+                                        "raw_response": retry_chunk,
+                                    }
+                                )
+                            )
+                            parsed_chunk = parse_paragraph_translation_output(retry_chunk)
+                            retry_ids = [paragraph["paragraph_id"] for paragraph in parsed_chunk]
+                            if retry_ids != expected_batch_ids:
+                                second_failure = {
+                                    "batch_index": batch_index,
+                                    "attempt": 2,
+                                    "expected_ids": expected_batch_ids,
+                                    "actual_ids": retry_ids,
+                                    "resolved_by_retry": False,
+                                }
+                                provider_json_failures.append(second_failure)
+                                unresolved_provider_json_failures.append(second_failure)
+                                parsed_chunk = [
+                                    {"paragraph_id": paragraph_id, "text": ""}
+                                    for paragraph_id in expected_batch_ids
+                                ]
+                            else:
+                                first_failure["resolved_by_retry"] = True
+                    parsed.extend(parsed_chunk)
                 initial_raw = "\n".join(raw_chunks)
                 initial_output_char_count = len(initial_raw)
                 initial_path.write_text(initial_raw + "\n", encoding="utf-8")
@@ -2585,6 +3379,8 @@ def translate_samples(
                         parsed = best_effort_paragraph_output(initial_raw, sample)
                     paragraph_validation = validate_paragraph_translation(sample, parsed)
                     paragraph_validation["used_best_effort_rendering"] = True
+                if provider_json_failures:
+                    paragraph_validation["provider_json_failures"] = provider_json_failures
                 (sample_dir / f"{safe_model}_structured_initial.json").write_text(
                     json_dumps({"paragraphs": parsed}) + "\n",
                     encoding="utf-8",
@@ -2613,7 +3409,6 @@ def translate_samples(
                         retry_reason = "paragraph_compression_pass"
                         if compression_result.get("provider_errors"):
                             provider_error = "compression_provider_error"
-                            failed_models.add(model)
                         compression_entries.append(
                             {
                                 "model": model,
@@ -2665,10 +3460,17 @@ def translate_samples(
                 if best_effort_used:
                     verification_after["pass"] = False
                     verification_after["reasons"].append("model_output_failed_paragraph_json_validation")
+                if unresolved_provider_json_failures:
+                    verification_after["pass"] = False
+                    verification_after["reasons"].append("provider_json_failure")
+                    verification_after[
+                        "unresolved_provider_json_failures"
+                    ] = unresolved_provider_json_failures
+                if provider_json_failures:
+                    verification_after["provider_json_failures"] = provider_json_failures
                 if provider_error:
                     verification_after["pass"] = False
                     verification_after["reasons"].append("provider_error")
-                    failed_models.add(model)
                 final = render_paragraph_translation(sample, final_paragraphs)
                 (sample_dir / f"{safe_model}_structured_final.json").write_text(
                     json_dumps({"paragraphs": final_paragraphs}) + "\n",
@@ -2728,8 +3530,15 @@ def translate_samples(
                 "prompt_iteration": prompt_iteration,
                 "paragraph_alignment_enabled": enable_paragraph_alignment,
                 "compression_pass_enabled": enable_compression_pass,
+                "merge_tiny_paragraphs": merge_tiny_paragraphs,
+                "tiny_paragraph_threshold": tiny_paragraph_threshold,
+                "unit_target_min_chars": unit_target_min_chars,
+                "translation_unit_count": len(sample.get("translation_units", [])),
+                "translation_unit_merge_count": sample.get("translation_unit_merge_count", 0),
                 "best_effort_rendering_used": best_effort_used,
                 "provider_error": provider_error,
+                "provider_json_failures": provider_json_failures,
+                "unresolved_provider_json_failures": unresolved_provider_json_failures,
                 "paragraph_validation": paragraph_validation,
                 "verification_before_compression": verification_before,
                 "verification_after_compression": verification_after,
@@ -2760,6 +3569,9 @@ def translate_samples(
         "target_length_tolerance": target_length_tolerance,
         "enable_paragraph_alignment": enable_paragraph_alignment,
         "enable_compression_pass": enable_compression_pass,
+        "merge_tiny_paragraphs": merge_tiny_paragraphs,
+        "tiny_paragraph_threshold": tiny_paragraph_threshold,
+        "unit_target_min_chars": unit_target_min_chars,
         "stable_prompt_sha256": sha256_text(stable_prompt_text) if stable_prompt_text else None,
     }
     write_json(translations_root / "translation_metadata.json", metadata_payload)
@@ -2823,7 +3635,7 @@ def max_tokens_for_sample(
     paragraph_mode: bool = False,
 ) -> int:
     if paragraph_mode:
-        strict_total = sum(pair.get("strict_max", 0) for pair in sample.get("paragraph_pairs", []))
+        strict_total = sum(pair.get("strict_max", 0) for pair in active_eval_pairs(sample))
         return max(600, int(max(strict_total, sample["target_length_max"]) / 3.5))
     divisor = 7.0 if retry else 6.0
     return max(320, int(sample["target_length_max"] / divisor))
@@ -2847,29 +3659,46 @@ def translation_system_prompt(
         "Preserve paragraph, dialogue, and system panel formatting.",
     ]
     if paragraph_mode:
+        unit_mode = bool(sample and sample.get("use_translation_units"))
         lines.extend(
             [
-                "Translate paragraph-by-paragraph using the provided paragraph JSON.",
+                "Translate by merged translation unit when unit JSON is provided; otherwise translate paragraph-by-paragraph.",
                 "Return JSON only, with this shape: {\"paragraphs\":[{\"paragraph_id\":\"p001\",\"text\":\"...\"}]}",
                 "Do not use markdown fences.",
-                "Every source paragraph_id must appear exactly once.",
+                "Every requested paragraph_id/unit_id must appear exactly once.",
                 "Do not add extra paragraph_id values.",
-                "Keep paragraph order exactly as provided.",
-                "Each returned text field must be one compact Vietnamese paragraph.",
-                "The harness will render the JSON paragraphs to plain text after validation.",
+                "Keep order exactly as provided.",
+                "Each returned text field must be one compact complete Vietnamese unit.",
+                "The harness will render the JSON units to plain text after validation.",
             ]
         )
+        if unit_mode:
+            lines.extend(
+                [
+                    "Some paragraph_id values are merged translation units that preserve multiple original paragraph IDs.",
+                    "Do not force the original micro paragraph count inside merged units.",
+                    "Preserve source order, system panels, required terms, names, and numbers inside each unit.",
+                ]
+            )
     else:
         lines.append("Return only the Vietnamese translation.")
     if sample:
+        target_source_ratio = sample.get(
+            "target_source_length_ratio",
+            round(sample.get("target_char_count", 0) / max(sample.get("source_char_count", 1), 1), 3),
+        )
+        paragraph_count_target = sample.get(
+            "paragraph_count_target",
+            len(sample.get("target_paragraphs", [])) or paragraph_count(sample.get("target_text", "")),
+        )
         lines.extend(
             [
                 "Hard length constraint:",
                 f"- Target range: {sample['target_length_min']}-{sample['target_length_max']} Vietnamese characters.",
                 f"- Reference length: {sample['target_char_count']} characters.",
                 f"- Source length: {sample['source_char_count']} characters.",
-                f"- Reference/source ratio: {sample['target_source_length_ratio']}.",
-                f"- Aim for about {sample['paragraph_count_target']} paragraphs.",
+                f"- Reference/source ratio: {target_source_ratio}.",
+                f"- Aim for about {paragraph_count_target} paragraphs.",
                 f"- Do not exceed {sample['target_length_max']} characters unless absolutely necessary.",
                 "- Your answer fails if it is much longer than the target range.",
                 "- Do not preserve every source paragraph or line break.",
@@ -2877,11 +3706,11 @@ def translation_system_prompt(
                 "- Keep only bracket/stat panels as compact standalone lines when useful.",
             ]
         )
-        if paragraph_mode and sample.get("paragraph_pairs"):
+        if paragraph_mode and active_eval_pairs(sample):
             lines.extend(
                 [
-                    "Per-paragraph length budgets are provided in the user JSON as target_max and strict_max.",
-                    "Each paragraph fails validation if it exceeds strict_max after compression.",
+                    "Per-unit length budgets are provided in the user JSON as target_max and strict_max.",
+                    "Each unit fails validation if it exceeds strict_max after compression unless the strict unit gate explicitly allows it.",
                 ]
             )
         if prompt_iteration >= 2:
@@ -3042,12 +3871,38 @@ def _score_translation(
         else None,
         "paragraph_validation": verification.get("paragraph_validation") if verification else None,
         "verification_reasons": verification.get("reasons", []) if verification else [],
+        "allowed_over_budget_paragraphs": verification.get(
+            "allowed_over_budget_paragraphs", []
+        )
+        if verification
+        else [],
+        "unsafe_compression_paragraphs": verification.get(
+            "unsafe_compression_paragraphs", []
+        )
+        if verification
+        else [],
+        "unresolved_provider_json_failures": verification.get(
+            "unresolved_provider_json_failures", []
+        )
+        if verification
+        else [],
         "overlong_paragraph_ids": verification.get("overlong_paragraph_ids", []) if verification else [],
         "truncated_paragraphs": verification.get("truncated_paragraphs", []) if verification else [],
         "alignment_quality": verification.get("alignment_quality") if verification else None,
         "accepted_for_stable_validation": verification.get("accepted_for_stable_validation")
         if verification
         else None,
+        "translation_unit_merge_count": verification.get("translation_unit_merge_count", 0)
+        if verification
+        else 0,
+        "original_paragraph_count_relaxed": verification.get(
+            "original_paragraph_count_relaxed", False
+        )
+        if verification
+        else False,
+        "low_alignment_units": verification.get("low_alignment_units", [])
+        if verification
+        else [],
         "length_penalty_reason": length_warning,
         "terminology_mismatches": terminology_mismatches,
         "final_pass_fail_reason": "pass" if pass_fail else ", ".join(fail_reasons),
@@ -3393,6 +4248,9 @@ def run_full(
     target_length_tolerance: float = 0.2,
     enable_paragraph_alignment: bool = True,
     enable_compression_pass: bool = True,
+    merge_tiny_paragraphs: bool = True,
+    tiny_paragraph_threshold: int = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: int = UNIT_TARGET_MIN_CHARS,
     stable_prompt_text: str | None = None,
 ) -> dict[str, Any]:
     prepared = prepare_parallel(
@@ -3404,6 +4262,9 @@ def run_full(
         max_target_chars=max_target_chars,
         sample_start_ratio=sample_start_ratio,
         sample_count=sample_count,
+        merge_tiny_paragraphs=merge_tiny_paragraphs,
+        tiny_paragraph_threshold=tiny_paragraph_threshold,
+        unit_target_min_chars=unit_target_min_chars,
     )
     style = learn_style(
         project=project,
@@ -3422,6 +4283,9 @@ def run_full(
         target_length_tolerance=target_length_tolerance,
         enable_paragraph_alignment=enable_paragraph_alignment,
         enable_compression_pass=enable_compression_pass,
+        merge_tiny_paragraphs=merge_tiny_paragraphs,
+        tiny_paragraph_threshold=tiny_paragraph_threshold,
+        unit_target_min_chars=unit_target_min_chars,
         prompt_iteration=ACTIVE_PROMPT_ITERATION,
         stable_prompt_text=stable_prompt_text,
     )
@@ -3459,14 +4323,15 @@ def stable_base_prompt_text() -> str:
             "Do not expand, explain, embellish, or paraphrase beyond the source.",
             "Do not add translator notes.",
             "Keep system panel/bracket formatting compact.",
-            "Translate paragraph-by-paragraph using the provided paragraph JSON.",
+            "Translate by merged evaluation unit when the provided JSON contains unit IDs; otherwise translate paragraph-by-paragraph.",
             "Return JSON only, with this shape: {\"paragraphs\":[{\"paragraph_id\":\"p001\",\"text\":\"...\"}]}",
             "Do not use markdown fences.",
-            "Every source paragraph_id must appear exactly once.",
+            "Every requested paragraph_id or unit_id must appear exactly once.",
             "Do not add extra paragraph_id values.",
             "Keep paragraph order exactly as provided.",
-            "Each returned text field must be one compact Vietnamese paragraph.",
-            "Use the per-paragraph target_max and strict_max values from the user JSON.",
+            "Each returned text field must be one compact complete Vietnamese paragraph or merged unit.",
+            "Do not force original micro paragraph breaks inside merged units.",
+            "Use the per-unit target_max and strict_max values from the user JSON.",
             "Compression must rewrite complete Vietnamese sentences; never cut words to fit budget.",
             "Each paragraph fails validation if it exceeds strict_max after compression, has dangling brackets, or looks truncated.",
             "Required glossary mappings when the source term appears: "
@@ -3543,10 +4408,24 @@ def freeze_stable_candidate(
             "target_min_ratio": PARAGRAPH_TARGET_MIN_RATIO,
             "target_max_ratio": PARAGRAPH_TARGET_MAX_RATIO,
             "strict_max_ratio": PARAGRAPH_STRICT_MAX_RATIO,
+            "short_reference_strict_max_ratio": PARAGRAPH_SHORT_STRICT_MAX_RATIO,
+            "short_reference_char_threshold": PARAGRAPH_SHORT_REFERENCE_CHARS,
+        },
+        "translation_unit_settings": {
+            "merge_tiny_paragraphs": settings.get("merge_tiny_paragraphs", True),
+            "tiny_paragraph_threshold": settings.get(
+                "tiny_paragraph_threshold", TINY_PARAGRAPH_THRESHOLD
+            ),
+            "unit_target_min_chars": settings.get("unit_target_min_chars", UNIT_TARGET_MIN_CHARS),
+            "unit_strict_max_ratio": UNIT_STRICT_MAX_RATIO,
+            "unit_short_strict_max_ratio": UNIT_SHORT_STRICT_MAX_RATIO,
+            "high_risk_source_chars": UNIT_HIGH_RISK_SOURCE_CHARS,
+            "high_risk_target_max_chars": UNIT_HIGH_RISK_TARGET_MAX_CHARS,
+            "combined_target_max_chars": UNIT_COMBINED_TARGET_MAX_CHARS,
         },
         "compression_settings": {
             "enabled": settings.get("enable_compression_pass"),
-            "one_model_compression_pass": True,
+            "max_model_compression_attempts_per_paragraph": 2,
             "deterministic_budget_enforcement": False,
             "fixed_term_repair": True,
             "truncation_detection": True,
@@ -3694,6 +4573,9 @@ def run_candidate_validation_once(
     sample_start_ratio: float,
     enable_paragraph_alignment: bool,
     enable_compression_pass: bool,
+    merge_tiny_paragraphs: bool,
+    tiny_paragraph_threshold: int,
+    unit_target_min_chars: int,
     stable_prompt_text: str,
     validation_index: int,
 ) -> dict[str, Any]:
@@ -3706,6 +4588,9 @@ def run_candidate_validation_once(
         max_target_chars=max_target_chars,
         sample_start_ratio=sample_start_ratio,
         sample_count=sample_count,
+        merge_tiny_paragraphs=merge_tiny_paragraphs,
+        tiny_paragraph_threshold=tiny_paragraph_threshold,
+        unit_target_min_chars=unit_target_min_chars,
     )
     run_dir = Path(prepared["run_dir"])
     if any(
@@ -3743,6 +4628,8 @@ def run_candidate_validation_once(
                     "source_char_count": sample["source_char_count"],
                     "target_char_count": sample["target_char_count"],
                     "paragraph_pair_count": len(sample.get("paragraph_pairs", [])),
+                    "translation_unit_count": len(sample.get("translation_units", [])),
+                    "translation_unit_merge_count": sample.get("translation_unit_merge_count", 0),
                     "warnings": sample.get("paragraph_alignment_warnings", []),
                     "alignment_quality": sample.get("alignment_quality"),
                     "alignment_warnings": sample.get("alignment_warnings", []),
@@ -3773,6 +4660,9 @@ def run_candidate_validation_once(
         target_length_tolerance=0.2,
         enable_paragraph_alignment=enable_paragraph_alignment,
         enable_compression_pass=enable_compression_pass,
+        merge_tiny_paragraphs=merge_tiny_paragraphs,
+        tiny_paragraph_threshold=tiny_paragraph_threshold,
+        unit_target_min_chars=unit_target_min_chars,
         prompt_iteration=ACTIVE_PROMPT_ITERATION,
         stable_prompt_text=stable_prompt_text,
     )
@@ -3800,6 +4690,8 @@ def run_candidate_validation_once(
                 "source_char_count": sample["source_char_count"],
                 "target_char_count": sample["target_char_count"],
                 "paragraph_pair_count": len(sample.get("paragraph_pairs", [])),
+                "translation_unit_count": len(sample.get("translation_units", [])),
+                "translation_unit_merge_count": sample.get("translation_unit_merge_count", 0),
                 "warnings": sample.get("paragraph_alignment_warnings", []),
                 "alignment_quality": sample.get("alignment_quality"),
                 "alignment_warnings": sample.get("alignment_warnings", []),
@@ -3872,6 +4764,10 @@ def stable_gate_result(
                 sample_reasons.append("unsafe_compression")
             if "alignment_quality_below_threshold" in verification_reasons:
                 sample_reasons.append("alignment_quality_below_threshold")
+            if "unit_alignment_quality_below_threshold" in verification_reasons or sample.get(
+                "low_alignment_units"
+            ):
+                sample_reasons.append("unit_alignment_quality_below_threshold")
             gates = sample.get("gates", {})
             if gates.get("severe_hallucination"):
                 sample_reasons.append("severe_hallucination")
@@ -3994,7 +4890,7 @@ def write_cached_eval_exports(
             )
             sample_score = score_lookup.get(sample_id, {})
             score_notes = sample_score.get("notes", {})
-            for pair in sample.get("paragraph_pairs", []):
+            for pair in active_eval_pairs(sample):
                 paragraph_id = pair["paragraph_id"]
                 before = initial_lookup.get(paragraph_id, "")
                 after = final_lookup.get(paragraph_id, "")
@@ -4010,6 +4906,12 @@ def write_cached_eval_exports(
                         "sample_id": sample_id,
                         "chapter_id": sample["chapter_id"],
                         "paragraph_id": paragraph_id,
+                        "unit_id": pair.get("unit_id", paragraph_id),
+                        "source_paragraph_ids": pair.get("source_paragraph_ids", [paragraph_id]),
+                        "target_paragraph_ids": pair.get("target_paragraph_ids", [paragraph_id]),
+                        "unit_type": pair.get("unit_type"),
+                        "merge_reason": pair.get("merge_reason"),
+                        "is_merged_unit": pair.get("is_merged_unit", False),
                         "source_paragraph_indexes": pair.get("source_paragraph_indexes"),
                         "target_paragraph_indexes": pair.get("target_paragraph_indexes"),
                         "source_paragraph": pair.get("source_text", ""),
@@ -4022,6 +4924,17 @@ def write_cached_eval_exports(
                         "ratio_before": round(len(before) / max(pair.get("target_char_count", 0), 1), 3),
                         "ratio_after": round(len(after) / max(pair.get("target_char_count", 0), 1), 3),
                         "strict_max": pair.get("strict_max"),
+                        "budget_policy_used": pair.get("budget_policy_used"),
+                        "paragraph_allowed_over_budget_reason": next(
+                            (
+                                item.get("reason")
+                                for item in sample_score.get(
+                                    "allowed_over_budget_paragraphs", []
+                                )
+                                if item.get("paragraph_id") == paragraph_id
+                            ),
+                            None,
+                        ),
                         "truncation_detected": truncation["is_truncated"],
                         "truncation_reasons": truncation["reasons"],
                         "alignment_quality": sample.get("alignment_quality"),
@@ -4052,11 +4965,16 @@ def write_cached_eval_exports(
             [
                 f"## Run {row['validation_index']} / {row['sample_id']} / {row['paragraph_id']}",
                 "",
+                f"- Unit type: `{row.get('unit_type')}`",
+                f"- Source paragraph IDs: `{json_dumps(row.get('source_paragraph_ids', []))}`",
+                f"- Merge reason: `{row.get('merge_reason')}`",
                 f"- Ratio before: `{row['ratio_before']}`",
                 f"- Ratio after: `{row['ratio_after']}`",
                 f"- Score reason: `{row['sample_score'].get('reason')}`",
                 f"- Truncation detected: `{row['truncation_detected']}`",
                 f"- Truncation reasons: `{json_dumps(row['truncation_reasons'])}`",
+                f"- Budget policy: `{row.get('budget_policy_used')}`",
+                f"- Allowed over budget: `{row.get('paragraph_allowed_over_budget_reason')}`",
                 f"- Alignment quality: `{row.get('alignment_quality')}`",
                 f"- Eligible for stable validation: `{row.get('accepted_for_stable_validation')}`",
                 "",
@@ -4086,8 +5004,8 @@ def write_cached_eval_exports(
     table_lines = [
         "# Paragraph Review Table",
         "",
-        "| Run | Sample | Paragraph | Ref Chars | Before | After | Ratio Before | Ratio After | Truncated | Reasons | Align Quality | Eligible | Warnings | Source | Reference | After |",
-        "|---:|---|---|---:|---:|---:|---:|---:|---|---|---:|---|---|---|---|---|",
+        "| Run | Sample | Unit | Original IDs | Ref Chars | Before | After | Ratio Before | Ratio After | Budget | Merge Reason | Allowed Over Budget | Truncated | Reasons | Align Quality | Eligible | Warnings | Source | Reference | After |",
+        "|---:|---|---|---|---:|---:|---:|---:|---:|---|---|---|---|---|---:|---|---|---|---|---|",
     ]
     for row in replay_rows:
         table_lines.append(
@@ -4097,11 +5015,15 @@ def write_cached_eval_exports(
                     str(row["validation_index"]),
                     row["sample_id"],
                     row["paragraph_id"],
+                    _snippet(",".join(row.get("source_paragraph_ids", [])), 80).replace("|", "\\|"),
                     str(row["reference_char_count"]),
                     str(row["before_char_count"]),
                     str(row["after_char_count"]),
                     str(row["ratio_before"]),
                     str(row["ratio_after"]),
+                    str(row.get("budget_policy_used")),
+                    str(row.get("merge_reason")),
+                    str(row.get("paragraph_allowed_over_budget_reason")),
                     str(row["truncation_detected"]),
                     _snippet("; ".join(row["truncation_reasons"]), 80).replace("|", "\\|"),
                     str(row.get("alignment_quality")),
@@ -4214,6 +5136,9 @@ def validate_stable_prompt(
     enable_paragraph_alignment: bool,
     enable_compression_pass: bool,
     stable_run_count: int,
+    merge_tiny_paragraphs: bool = True,
+    tiny_paragraph_threshold: int = TINY_PARAGRAPH_THRESHOLD,
+    unit_target_min_chars: int = UNIT_TARGET_MIN_CHARS,
 ) -> dict[str, Any]:
     if stable_run_count <= 0:
         raise ValueError("--stable-run-count must be greater than 0.")
@@ -4226,6 +5151,9 @@ def validate_stable_prompt(
         "max_target_chars": max_target_chars,
         "enable_paragraph_alignment": enable_paragraph_alignment,
         "enable_compression_pass": enable_compression_pass,
+        "merge_tiny_paragraphs": merge_tiny_paragraphs,
+        "tiny_paragraph_threshold": tiny_paragraph_threshold,
+        "unit_target_min_chars": unit_target_min_chars,
         "stable_run_count": stable_run_count,
     }
     candidate = freeze_stable_candidate(
@@ -4253,6 +5181,9 @@ def validate_stable_prompt(
                 sample_start_ratio=offset,
                 enable_paragraph_alignment=enable_paragraph_alignment,
                 enable_compression_pass=enable_compression_pass,
+                merge_tiny_paragraphs=merge_tiny_paragraphs,
+                tiny_paragraph_threshold=tiny_paragraph_threshold,
+                unit_target_min_chars=unit_target_min_chars,
                 stable_prompt_text=candidate["prompt_text"],
                 validation_index=index,
             )
@@ -4285,6 +5216,17 @@ def validate_stable_prompt(
         provider_key=provider_key,
         model=model,
     )
+    report_paths = {
+        "stable_validation_report": str(validation_root / "stable_validation_report.json"),
+        "cached_eval_replay": replay_exports.get("cached_eval_replay"),
+        "human_review_samples": replay_exports.get("human_review_samples"),
+        "paragraph_review_table": replay_exports.get("paragraph_review_table"),
+        "replay_report": strict_replay.get("replay_report"),
+        "replay_report_md": strict_replay.get("replay_report_md"),
+        "candidate_prompt": str(validation_root / "candidate_prompt.md"),
+        "candidate_prompt_metadata": str(validation_root / "candidate_prompt_metadata.json"),
+        **decision_outputs,
+    }
     report = {
         "schema_version": "stable_prompt_validation_v1",
         "project": project,
@@ -4299,6 +5241,7 @@ def validate_stable_prompt(
         "strict_replay": strict_replay,
         "replay_exports": replay_exports,
         "decision_outputs": decision_outputs,
+        "report_paths": report_paths,
         "pass": gate["pass"],
     }
     write_json(validation_root / "stable_validation_report.json", report)
@@ -4321,7 +5264,132 @@ def validate_stable_prompt(
         ],
         "decision_outputs": decision_outputs,
         "replay_exports": replay_exports,
+        "report_paths": report_paths,
+        "quality_gate": "pass" if gate["pass"] else "fail",
+        "selected_model": model,
+        "output_folder": str(validation_root),
         "stable_validation_report": str(validation_root / "stable_validation_report.json"),
+    }
+
+
+def _stable_validation_counts(report: dict[str, Any]) -> dict[str, Any]:
+    selected_model = report.get("model") or report.get("gate", {}).get("selected_model")
+    truncation_count = 0
+    unsafe_compression_count = 0
+    provider_failures: list[dict[str, Any]] = []
+    provider_json_failure_count = 0
+    compression_attempts: list[dict[str, Any]] = []
+    unit_merge_count = 0
+    for run in report.get("validation_runs", []):
+        validation_index = run.get("validation_index")
+        model_report = run.get("report", {}).get("models", {}).get(selected_model, {})
+        for sample in model_report.get("samples", []):
+            truncation_count += len(sample.get("truncated_paragraphs", []) or [])
+            unit_merge_count += int(sample.get("translation_unit_merge_count") or 0)
+        translations = run.get("translations", {})
+        if not isinstance(translations, dict):
+            continue
+        for sample_id, by_model in translations.items():
+            if not isinstance(by_model, dict):
+                continue
+            metadata = by_model.get(selected_model)
+            if not isinstance(metadata, dict):
+                continue
+            provider_error = metadata.get("provider_error")
+            provider_json_failure_count += len(metadata.get("provider_json_failures", []) or [])
+            unresolved_json = metadata.get("unresolved_provider_json_failures", []) or []
+            if provider_error:
+                provider_failures.append(
+                    {
+                        "validation_index": validation_index,
+                        "sample_id": sample_id,
+                        "kind": "provider_error",
+                        "message": provider_error,
+                    }
+                )
+            for failure in unresolved_json:
+                provider_failures.append(
+                    {
+                        "validation_index": validation_index,
+                        "sample_id": sample_id,
+                        "kind": "provider_json_failure",
+                        **failure,
+                    }
+                )
+            for entry in metadata.get("compression", {}).get("entries", []) or []:
+                provider_json_failure_count += int(entry.get("provider_json_failures") or 0)
+                if entry.get("unsafe_compression"):
+                    unsafe_compression_count += 1
+                compression_attempts.append(
+                    {
+                        "validation_index": validation_index,
+                        "sample_id": sample_id,
+                        "paragraph_id": entry.get("paragraph_id"),
+                        "attempt_count": entry.get("compression_attempt_count", 0),
+                        "unsafe_compression": bool(entry.get("unsafe_compression")),
+                        "failure_reason": entry.get("compression_failure_reason"),
+                    }
+                )
+    strict_replay_summary = report.get("strict_replay", {}).get("quality_summary", {})
+    truncation_count = max(
+        truncation_count,
+        int(strict_replay_summary.get("truncated_paragraph_count") or 0),
+    )
+    attempt_counts = [
+        int(item.get("attempt_count") or 0)
+        for item in compression_attempts
+    ]
+    return {
+        "truncation_count": truncation_count,
+        "unsafe_compression_count": unsafe_compression_count,
+        "provider_failures": provider_failures,
+        "provider_json_failure_count": provider_json_failure_count,
+        "compression_attempts": compression_attempts,
+        "unit_merge_count": unit_merge_count,
+        "compression_attempt_summary": {
+            "paragraph_count": len(compression_attempts),
+            "total_attempts": sum(attempt_counts),
+            "max_attempts": max(attempt_counts) if attempt_counts else 0,
+            "unsafe_count": unsafe_compression_count,
+        },
+    }
+
+
+def compact_stable_validation_result(result: dict[str, Any]) -> dict[str, Any]:
+    report_path = Path(result.get("stable_validation_report") or "")
+    report = read_json(report_path) if report_path.is_file() else result
+    gate = report.get("gate", result.get("gate", {}))
+    counts = _stable_validation_counts(report)
+    selected_model = report.get("model") or result.get("selected_model")
+    return {
+        "validation_root": result.get("validation_root") or report.get("validation_root"),
+        "output_folder": result.get("output_folder") or report.get("validation_root"),
+        "quality_gate": report.get("quality_gate") or result.get("quality_gate"),
+        "pass": bool(report.get("pass", result.get("pass", False))),
+        "stable_prompt_created": bool(
+            report.get("decision_outputs", result.get("decision_outputs", {})).get(
+                "stable_prompt_created",
+                result.get("stable_prompt_created", False),
+            )
+        ),
+        "selected_model": selected_model,
+        "run_count": report.get("stable_run_count") or result.get("stable_run_count"),
+        "run_scores": gate.get("per_run_scores", []),
+        "sample_scores": gate.get("per_sample_scores", []),
+        "ratio_summary": gate.get("ratio_summary", {}),
+        "truncation_count": counts["truncation_count"],
+        "unsafe_compression_count": counts["unsafe_compression_count"],
+        "provider_failures": counts["provider_failures"],
+        "provider_json_failure_count": counts["provider_json_failure_count"],
+        "unit_merge_count": counts["unit_merge_count"],
+        "compression_attempt_summary": counts["compression_attempt_summary"],
+        "gate_reasons": gate.get("reasons", []),
+        "gate": {
+            "selected_model": selected_model,
+            "reasons": gate.get("reasons", []),
+            "ratio_summary": gate.get("ratio_summary", {}),
+        },
+        "report_paths": report.get("report_paths") or result.get("report_paths", {}),
     }
 
 
@@ -4456,6 +5524,12 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 "sample_id": sample_id,
                 "chapter_id": row.get("chapter_id"),
                 "paragraph_id": paragraph_id,
+                "unit_id": row.get("unit_id", paragraph_id),
+                "source_paragraph_ids": row.get("source_paragraph_ids", [paragraph_id]),
+                "target_paragraph_ids": row.get("target_paragraph_ids", [paragraph_id]),
+                "unit_type": row.get("unit_type"),
+                "merge_reason": row.get("merge_reason"),
+                "is_merged_unit": row.get("is_merged_unit", False),
                 "reference_char_count": row.get("reference_char_count"),
                 "before_char_count": row.get("before_char_count"),
                 "after_char_count": row.get("after_char_count"),
@@ -4465,6 +5539,10 @@ def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 "warnings": row.get("warnings", []),
                 "alignment_quality": alignment_quality,
                 "accepted_for_stable_validation": accepted_for_stable,
+                "budget_policy_used": row.get("budget_policy_used"),
+                "paragraph_allowed_over_budget_reason": row.get(
+                    "paragraph_allowed_over_budget_reason"
+                ),
                 "truncation_detected": truncation["is_truncated"],
                 "truncation_reasons": truncation["reasons"],
                 "source_paragraph": row.get("source_paragraph", ""),

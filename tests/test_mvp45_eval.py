@@ -16,6 +16,7 @@ from nts_core.eval_harness import (
     align_blocks_monotonic,
     build_alignment_blocks,
     build_alignment_candidates,
+    build_translation_units,
     compress_offending_paragraphs,
     create_paragraph_alignment,
     detect_truncated_vietnamese,
@@ -28,9 +29,11 @@ from nts_core.eval_harness import (
     normalize_provider_type,
     replay_cached_eval,
     render_paragraph_translation,
+    translation_units_report,
     split_text_paragraphs,
     stable_gate_result,
     stable_prompt_review,
+    translate_samples,
     translation_system_prompt,
     validate_paragraph_translation,
     validate_eval_provider,
@@ -380,6 +383,174 @@ def test_paragraph_validation_and_rendering_preserves_ids_and_count() -> None:
     )
 
 
+def test_tiny_paragraphs_merge_into_translation_unit() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝点头。\n\n他继续修炼。",
+            "target_text": "Hàn Tuyệt gật đầu.\n\nHắn tiếp tục tu luyện.",
+            "target_char_count": len("Hàn Tuyệt gật đầu.\n\nHắn tiếp tục tu luyện."),
+        }
+    )
+
+    units = build_translation_units(sample, tiny_paragraph_threshold=80, unit_target_min_chars=120)
+
+    assert len(units) == 1
+    assert units[0]["source_paragraph_ids"] == ["p001", "p002"]
+    assert units[0]["is_merged_unit"] is True
+    assert units[0]["target_max"] > sample["paragraph_pairs"][0]["target_max"]
+
+
+def test_short_reference_below_unit_min_merges_even_when_not_tiny() -> None:
+    first_ref = "Đoạn tham chiếu đủ dài để đứng riêng trong phần đầu cảnh truyện này."
+    second_ref = "Đoạn ngắn cần nhập với đoạn trước để tránh ngân sách quá gắt."
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "甲继续叙述一段 tương đối dài。\n\n乙也 có một đoạn không quá ngắn nhưng tham chiếu vẫn thấp.",
+            "target_text": f"{first_ref}\n\n{second_ref}",
+            "target_char_count": len(f"{first_ref}\n\n{second_ref}"),
+        }
+    )
+
+    units = build_translation_units(sample, tiny_paragraph_threshold=40, unit_target_min_chars=120)
+
+    assert len(units) == 1
+    assert units[0]["source_paragraph_ids"] == ["p001", "p002"]
+    assert units[0]["reference_char_count"] > sample["paragraph_pairs"][1]["target_char_count"]
+
+
+def test_high_risk_narrative_unit_merges_with_previous_context() -> None:
+    source_one = "甲" * 90
+    source_two = "乙" * 240
+    target_one = "Đoạn tham chiếu trước đủ dài để làm ngữ cảnh an toàn cho cảnh này. " * 4
+    target_two = "Đoạn tham chiếu sau ngắn hơn nhiều so với nguồn nhưng vẫn cùng cảnh."
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": f"{source_one}\n\n{source_two}",
+            "target_text": f"{target_one}\n\n{target_two}",
+            "target_char_count": len(f"{target_one}\n\n{target_two}"),
+        }
+    )
+
+    units = build_translation_units(sample, tiny_paragraph_threshold=40, unit_target_min_chars=120)
+
+    assert len(units) == 1
+    assert units[0]["source_paragraph_ids"] == ["p001", "p002"]
+    assert units[0]["reference_char_count"] > sample["paragraph_pairs"][1]["target_char_count"]
+
+
+def test_system_panel_lines_merge_into_panel_unit() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "【姓名：韩绝】\n\n【修为：无】\n\n韩绝醒来。",
+            "target_text": "【Tính danh: Hàn Tuyệt】\n\n【Tu vi: Không】\n\nHàn Tuyệt tỉnh lại.",
+            "target_char_count": len("【Tính danh: Hàn Tuyệt】\n\n【Tu vi: Không】\n\nHàn Tuyệt tỉnh lại."),
+        }
+    )
+
+    units = build_translation_units(sample, tiny_paragraph_threshold=80, unit_target_min_chars=120)
+
+    assert units[0]["unit_type"] == "panel"
+    assert units[0]["source_paragraph_ids"] == ["p001", "p002"]
+    assert units[0]["merge_reason"] == "consecutive_system_panel_lines"
+
+
+def test_dialogue_fragments_merge_safely() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝：好。\n\n铁老：走吧。",
+            "target_text": "Hàn Tuyệt: Được.\n\nThiết lão: Đi thôi.",
+            "target_char_count": len("Hàn Tuyệt: Được.\n\nThiết lão: Đi thôi."),
+        }
+    )
+
+    units = build_translation_units(sample, tiny_paragraph_threshold=80, unit_target_min_chars=120)
+
+    assert len(units) == 1
+    assert units[0]["unit_type"] == "dialogue"
+    assert units[0]["merge_reason"] == "short_dialogue_fragment_merge"
+
+
+def test_translation_units_do_not_merge_across_scene_boundary() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝点头。\n\n***\n\n他继续修炼。",
+            "target_text": "Hàn Tuyệt gật đầu.\n\n***\n\nHắn tiếp tục tu luyện.",
+            "target_char_count": len("Hàn Tuyệt gật đầu.\n\n***\n\nHắn tiếp tục tu luyện."),
+        }
+    )
+
+    units = build_translation_units(sample, tiny_paragraph_threshold=80, unit_target_min_chars=120)
+
+    assert len(units) >= 2
+    assert all("p002" not in unit["source_paragraph_ids"] or len(unit["source_paragraph_ids"]) == 1 for unit in units)
+
+
+def test_merged_unit_budget_replaces_micro_paragraph_budget() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "甲。\n\n乙。",
+            "target_text": "Một.\n\nHai.",
+            "target_char_count": len("Một.\n\nHai."),
+        }
+    )
+    micro_output = [
+        {"paragraph_id": "p001", "text": "Một câu hoàn chỉnh nhưng quá dài cho một đoạn cực ngắn."},
+        {"paragraph_id": "p002", "text": "Hai."},
+    ]
+    micro_verification = verify_paragraph_output(sample, micro_output, glossary={"fixed_terms": []})
+    assert micro_verification["pass"] is False
+
+    unit_sample = dict(sample)
+    unit_sample["translation_units"] = build_translation_units(
+        sample,
+        tiny_paragraph_threshold=80,
+        unit_target_min_chars=20,
+    )
+    unit_sample["use_translation_units"] = True
+    unit_sample["translation_unit_merge_count"] = 1
+    unit_output = [{"paragraph_id": "u001", "text": "Một. Hai."}]
+    unit_verification = verify_paragraph_output(unit_sample, unit_output, glossary={"fixed_terms": []})
+
+    assert unit_verification["pass"] is True
+    assert render_paragraph_translation(unit_sample, unit_output) == "Một. Hai."
+    assert unit_verification["original_paragraph_count_relaxed"] is True
+
+
+def test_translation_units_report_counts_merges() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "甲。\n\n乙。",
+            "target_text": "Một.\n\nHai.",
+            "target_char_count": len("Một.\n\nHai."),
+        }
+    )
+    sample["translation_units"] = build_translation_units(sample)
+    sample["use_translation_units"] = True
+    sample["translation_unit_merge_count"] = 1
+
+    report = translation_units_report([sample])
+
+    assert report["unit_count"] == 1
+    assert report["paragraph_merge_count"] == 1
+    assert report["samples"][0]["units"][0]["source_paragraph_ids"] == ["p001", "p002"]
+
+
 def test_compression_only_rewrites_offending_paragraph_once() -> None:
     sample = add_paragraph_alignment(
         {
@@ -444,6 +615,334 @@ def test_unsafe_compression_does_not_force_pass() -> None:
     assert output["pass"] is False
     assert "paragraph_truncation_detected" in output["reasons"]
     assert output["truncated_paragraphs"][0]["paragraph_id"] == pair["paragraph_id"]
+
+
+def test_no_hard_clipping_fallback_function_remains() -> None:
+    assert not hasattr(eval_harness_module, "clip_to_char_budget")
+
+
+def test_short_paragraph_uses_relaxed_strict_budget() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝点头。",
+            "target_text": "Hàn Tuyệt gật đầu.",
+            "target_char_count": len("Hàn Tuyệt gật đầu."),
+        }
+    )
+
+    pair = sample["paragraph_pairs"][0]
+
+    assert pair["budget_policy_used"] == "short_paragraph_relaxed"
+    assert pair["strict_max_ratio"] == 1.40
+    assert pair["strict_max"] == max(pair["target_max"], int(pair["target_char_count"] * 1.40))
+
+
+def test_over_budget_paragraph_can_warn_when_global_ratio_is_safe() -> None:
+    reference_one = (
+        "Đoạn tham chiếu đầu tiên đủ dài để kiểm tra ngân sách đoạn văn trong cảnh này."
+    )
+    reference_two = (
+        "Đoạn tham chiếu thứ hai giữ tỷ lệ toàn cục ổn định và không có thuật ngữ bắt buộc."
+    )
+    reference = f"{reference_one}\n\n{reference_two}"
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "甲继续叙述。\n\n乙保持安静。",
+            "target_text": reference,
+            "target_char_count": len(reference),
+        }
+    )
+    pair = sample["paragraph_pairs"][0]
+    over_budget = reference_one + " Hắn im lặng, rồi khẽ gật đầu nữa."
+    assert len(over_budget) > pair["strict_max"]
+    assert len(over_budget) / pair["target_char_count"] <= 1.55
+
+    verification = verify_paragraph_output(
+        sample,
+        [
+            {"paragraph_id": "p001", "text": over_budget},
+            {"paragraph_id": "p002", "text": reference_two},
+        ],
+        glossary={"fixed_terms": []},
+    )
+
+    assert verification["pass"] is True
+    assert verification["allowed_over_budget_paragraphs"][0]["paragraph_id"] == "p001"
+
+
+def test_compression_retries_once_for_missing_required_term(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝继续修炼。",
+            "target_text": "Hàn Tuyệt tiếp tục tu luyện.",
+            "target_char_count": len("Hàn Tuyệt tiếp tục tu luyện."),
+        }
+    )
+    paragraphs = [
+        {
+            "paragraph_id": "p001",
+            "text": "Hàn Tuyệt tiếp tục tu luyện trong yên lặng. " * 6,
+        }
+    ]
+    calls = []
+
+    def fake_chat_completion(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return json.dumps(
+                {
+                    "paragraphs": [
+                        {
+                            "paragraph_id": "p001",
+                            "revised_text": "Hắn tiếp tục tu luyện.",
+                            "preserved_terms": [],
+                            "dropped_details": [],
+                            "confidence": 0.95,
+                            "notes": "missing name",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "paragraphs": [
+                    {
+                        "paragraph_id": "p001",
+                        "revised_text": "Hàn Tuyệt tiếp tục tu luyện.",
+                        "preserved_terms": ["Hàn Tuyệt"],
+                        "dropped_details": [],
+                        "confidence": 0.95,
+                        "notes": "safe",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(eval_harness_module, "_chat_completion", fake_chat_completion)
+    provider = EvalProvider(
+        key="mock",
+        type="mock",
+        base_url="mock://local",
+        api_key_env="MOCK_API_KEY",
+    )
+
+    compressed, log = compress_offending_paragraphs(
+        provider,
+        model="mock-compress",
+        sample=sample,
+        paragraphs=paragraphs,
+        glossary={"fixed_terms": [{"source": "韩绝", "target": "Hàn Tuyệt"}]},
+    )
+
+    assert len(calls) == 2
+    assert compressed[0]["text"] == "Hàn Tuyệt tiếp tục tu luyện."
+    assert log["entries"][0]["compression_attempt_count"] == 2
+    assert log["entries"][0]["unsafe_compression"] is False
+
+
+def test_system_panel_source_label_counts_as_preserved_alias() -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "【天命孤星：寿命增加百年】",
+            "target_text": "【Thiên Mệnh Cô Tinh: thọ mệnh tăng trăm năm】",
+            "target_char_count": len("【Thiên Mệnh Cô Tinh: thọ mệnh tăng trăm năm】"),
+        }
+    )
+    pair = sample["paragraph_pairs"][0]
+
+    missing = eval_harness_module.required_terms_missing(
+        pair,
+        "【天命孤星：寿命增加百年】",
+        {"fixed_terms": []},
+    )
+
+    assert missing == []
+
+
+def test_unsafe_compression_fails_after_two_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝继续修炼。",
+            "target_text": "Hàn Tuyệt tiếp tục tu luyện.",
+            "target_char_count": len("Hàn Tuyệt tiếp tục tu luyện."),
+        }
+    )
+    paragraphs = [
+        {
+            "paragraph_id": "p001",
+            "text": "Hàn Tuyệt tiếp tục tu luyện trong yên lặng. " * 6,
+        }
+    ]
+
+    def fake_chat_completion(*args, **kwargs):
+        return json.dumps(
+            {
+                "paragraphs": [
+                    {
+                        "paragraph_id": "p001",
+                        "revised_text": "【Linh căn:",
+                        "preserved_terms": [],
+                        "dropped_details": [],
+                        "confidence": 0.95,
+                        "notes": "broken",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(eval_harness_module, "_chat_completion", fake_chat_completion)
+    provider = EvalProvider(
+        key="mock",
+        type="mock",
+        base_url="mock://local",
+        api_key_env="MOCK_API_KEY",
+    )
+
+    compressed, log = compress_offending_paragraphs(
+        provider,
+        model="mock-compress",
+        sample=sample,
+        paragraphs=paragraphs,
+        glossary={"fixed_terms": [{"source": "韩绝", "target": "Hàn Tuyệt"}]},
+    )
+
+    assert compressed[0]["text"] == "【Linh căn:"
+    assert log["entries"][0]["compression_attempt_count"] == 2
+    assert log["entries"][0]["unsafe_compression"] is True
+    assert "sentence_completeness_failed" in log["entries"][0]["compression_failure_reason"]
+
+
+def test_compression_fails_complete_output_above_relaxed_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "甲继续叙述。",
+            "target_text": "Một câu chuẩn ngắn.",
+            "target_char_count": len("Một câu chuẩn ngắn."),
+        }
+    )
+    paragraphs = [
+        {
+            "paragraph_id": "p001",
+            "text": "Một câu hoàn chỉnh nhưng quá dài so với đoạn tham chiếu ngắn này. " * 3,
+        }
+    ]
+
+    def fake_chat_completion(*args, **kwargs):
+        return json.dumps(
+            {
+                "paragraphs": [
+                    {
+                        "paragraph_id": "p001",
+                        "revised_text": "Một câu hoàn chỉnh nhưng vẫn quá dài so với đoạn tham chiếu ngắn này.",
+                        "preserved_terms": [],
+                        "dropped_details": [],
+                        "confidence": 0.95,
+                        "notes": "complete but over relaxed budget",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(eval_harness_module, "_chat_completion", fake_chat_completion)
+    provider = EvalProvider(
+        key="mock",
+        type="mock",
+        base_url="mock://local",
+        api_key_env="MOCK_API_KEY",
+    )
+
+    _, log = compress_offending_paragraphs(
+        provider,
+        model="mock-compress",
+        sample=sample,
+        paragraphs=paragraphs,
+        glossary={"fixed_terms": []},
+    )
+
+    assert log["entries"][0]["compression_attempt_count"] == 2
+    assert log["entries"][0]["unsafe_compression"] is True
+    assert "paragraph_exceeds_relaxed_budget" in log["entries"][0]["compression_failure_reason"]
+
+
+def test_translate_samples_retries_invalid_provider_json_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    project = "json-retry-test"
+    run_dir = eval_harness_module.new_run_dir(project, "eval")
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝继续修炼。",
+            "target_text": "Hàn Tuyệt tiếp tục tu luyện.",
+            "target_char_count": len("Hàn Tuyệt tiếp tục tu luyện."),
+            "target_length_min": 20,
+            "target_length_max": 40,
+            "source_char_count": len("韩绝继续修炼。"),
+        }
+    )
+    eval_harness_module.write_json(run_dir / "selected_samples.json", {"samples": [sample]})
+    eval_harness_module.write_json(
+        run_dir / "glossary_candidates.json",
+        {"fixed_terms": [{"source": "韩绝", "target": "Hàn Tuyệt"}]},
+    )
+    calls = []
+
+    def fake_chat_completion(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return "not-json"
+        return json.dumps(
+            {
+                "paragraphs": [
+                    {
+                        "paragraph_id": "p001",
+                        "text": "Hàn Tuyệt tiếp tục tu luyện.",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(eval_harness_module, "_chat_completion", fake_chat_completion)
+
+    result = translate_samples(
+        project=project,
+        provider_key="mock",
+        models=["mock-json"],
+        max_source_chars=200,
+        enable_length_retry=True,
+        target_length_tolerance=0.2,
+        enable_paragraph_alignment=True,
+        enable_compression_pass=False,
+    )
+
+    metadata = result["outputs"]["sample_1"]["mock-json"]
+    assert len(calls) == 2
+    assert metadata["provider_json_failures"][0]["resolved_by_retry"] is True
+    assert metadata["unresolved_provider_json_failures"] == []
+    assert "provider_json_failure" not in metadata["verification_after_compression"]["reasons"]
 
 
 def test_learn_style_translate_compare_mock_outputs_and_score_schema(
@@ -755,7 +1254,7 @@ def test_translation_prompt_includes_length_and_fixed_glossary(
     assert "Keep system panel/bracket formatting compact" in prompt
     assert FIXED_GLOSSARY["韩绝"] in prompt
     assert "Return JSON only" in paragraph_prompt
-    assert "Per-paragraph length budgets" in paragraph_prompt
+    assert "Per-unit length budgets" in paragraph_prompt
     assert "target_max" in paragraph_prompt
 
 
@@ -1378,6 +1877,10 @@ def test_validate_stable_prompt_mock_command_creates_replay_and_failure_report(
 
     assert result.exit_code == 0, result.output
     data = parse_json(result.output)["data"]
+    assert "validation_runs" not in data
+    assert "compression_attempts" not in data
+    assert "compression_attempt_summary" in data
+    assert "report_paths" in data
     root = Path(data["validation_root"])
     assert (root / "candidate_prompt.md").exists()
     assert (root / "candidate_prompt_metadata.json").exists()
@@ -1389,6 +1892,48 @@ def test_validate_stable_prompt_mock_command_creates_replay_and_failure_report(
     else:
         assert not (root / "stable_prompt.md").exists()
         assert (root / "stable_candidate_failure_report.md").exists()
+
+
+def test_validate_stable_prompt_verbose_json_includes_full_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    raw, epub = write_eval_inputs(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "validate-stable-prompt",
+            "--project",
+            "han-jue-stable-verbose-test",
+            "--raw",
+            str(raw),
+            "--translated",
+            str(epub),
+            "--provider",
+            "mock",
+            "--model",
+            "mock-stable",
+            "--max-chapters",
+            "1",
+            "--sample-count",
+            "1",
+            "--max-source-chars",
+            "80",
+            "--max-target-chars",
+            "140",
+            "--stable-run-count",
+            "1",
+            "--json",
+            "--verbose-json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert "validation_runs" in data
+    assert "gate" in data
 
 
 def test_validate_stable_prompt_does_not_call_provider_when_alignment_fails(
