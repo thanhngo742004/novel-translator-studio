@@ -18,7 +18,9 @@ from nts_core.eval_harness import (
     compare_translation,
     learn_style,
     prepare_parallel,
+    replay_cached_eval,
     run_full,
+    stable_prompt_review,
     translate_sample,
     validate_stable_prompt,
 )
@@ -839,6 +841,46 @@ def eval_validate_stable_prompt(
             enable_paragraph_alignment=enable_paragraph_alignment,
             enable_compression_pass=enable_compression_pass,
             stable_run_count=stable_run_count,
+        )
+    except ValueError as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@eval_app.command("replay")
+def eval_replay(
+    run: Annotated[str, typer.Option("--run", help="Evaluation run id or path.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        result = replay_cached_eval(run)
+    except ValueError as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@eval_app.command("review-stable")
+def eval_review_stable(
+    run: Annotated[str, typer.Option("--run", help="Evaluation run id or path.")],
+    approve: Annotated[bool, typer.Option("--approve", help="Approve the stable prompt.")] = False,
+    reject: Annotated[bool, typer.Option("--reject", help="Reject the stable prompt.")] = False,
+    reason: Annotated[
+        Optional[str],
+        typer.Option("--reason", help="Required rejection reason when using --reject."),
+    ] = None,
+    reviewer: Annotated[
+        Optional[str],
+        typer.Option("--reviewer", help="Reviewer name. Defaults to environment user."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        result = stable_prompt_review(
+            run=run,
+            approve=approve,
+            reject=reject,
+            reason=reason,
+            reviewer=reviewer,
         )
     except ValueError as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)

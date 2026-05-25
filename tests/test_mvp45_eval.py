@@ -19,9 +19,11 @@ from nts_core.eval_harness import (
     load_eval_provider,
     mask_api_key,
     normalize_provider_type,
+    replay_cached_eval,
     render_paragraph_translation,
     split_text_paragraphs,
     stable_gate_result,
+    stable_prompt_review,
     translation_system_prompt,
     validate_paragraph_translation,
     validate_eval_provider,
@@ -764,6 +766,198 @@ def test_cached_replay_and_human_review_exports_created(tmp_path: Path) -> None:
     assert (validation_root / "cached_eval_replay.json").exists()
     assert (validation_root / "human_review_samples.md").exists()
     assert (validation_root / "paragraph_review_table.md").exists()
+
+
+def write_stable_review_fixture(tmp_path: Path) -> Path:
+    validation_root = tmp_path / "han-jue_stable_fixture"
+    validation_root.mkdir(parents=True)
+    run_dir = tmp_path / "eval_run_for_review"
+    sample = add_paragraph_alignment(
+        {
+            "sample_id": "sample_1",
+            "chapter_id": 1,
+            "source_text": "韩绝看向玉清宗。\n\n他继续修炼。",
+            "target_text": "Hàn Tuyệt nhìn về phía Ngọc Thanh Tông.\n\nHắn tiếp tục tu luyện.",
+            "target_char_count": len(
+                "Hàn Tuyệt nhìn về phía Ngọc Thanh Tông.\n\nHắn tiếp tục tu luyện."
+            ),
+        }
+    )
+    (run_dir / "translation_outputs" / "sample_1").mkdir(parents=True)
+    (run_dir / "selected_samples.json").write_text(
+        json.dumps({"samples": [sample]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    initial = {
+        "paragraphs": [
+            {
+                "paragraph_id": "p001",
+                "text": "Hàn Tuyệt nhìn về phía Ngọc Thanh Tông rộng lớn.",
+            },
+            {"paragraph_id": "p002", "text": "Hắn tiếp tục tu luyện chăm chỉ."},
+        ]
+    }
+    final = {
+        "paragraphs": [
+            {"paragraph_id": "p001", "text": "Hàn Tuyệt nhìn về phía Ngọc Thanh Tông."},
+            {"paragraph_id": "p002", "text": "Hắn tiếp tục tu luyện."},
+        ]
+    }
+    sample_dir = run_dir / "translation_outputs" / "sample_1"
+    (sample_dir / "gpt-5.4-mini_structured_initial.json").write_text(
+        json.dumps(initial, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (sample_dir / "gpt-5.4-mini_structured_final.json").write_text(
+        json.dumps(final, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    validation_runs = [
+        {
+            "validation_index": 1,
+            "run_dir": str(run_dir),
+            "report": {
+                "models": {
+                    "gpt-5.4-mini": {
+                        "samples": [stable_sample_score("sample_1", total_score=88, ratio=1.0)],
+                    }
+                }
+            },
+        }
+    ]
+    write_cached_eval_exports(
+        validation_root=validation_root,
+        validation_runs=validation_runs,
+        selected_model="gpt-5.4-mini",
+    )
+    (validation_root / "stable_prompt.md").write_text("Frozen prompt\n", encoding="utf-8")
+    (validation_root / "stable_prompt_metadata.json").write_text(
+        json.dumps(
+            {
+                "prompt_id": "stable-test",
+                "prompt_version": "mvp4.8-stable-candidate-v1",
+                "source_eval_run_id": "eval_run_for_review",
+                "model": "gpt-5.4-mini",
+                "provider": "mock",
+                "validation_runs": [{"validation_index": 1}],
+                "per_run_scores": [{"validation_index": 1, "average_score": 88}],
+                "per_sample_scores": [{"sample_id": "sample_1", "total_score": 88}],
+                "average_score": 88,
+                "compression_counts": [1],
+                "ratio_summary": {"min": 0.9, "max": 1.1, "average": 1.0},
+                "created_at": "2026-05-25T00:00:00+00:00",
+                "quality_gate": "pass",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return validation_root
+
+
+def test_eval_replay_regenerates_reports_without_api_calls(tmp_path: Path) -> None:
+    validation_root = write_stable_review_fixture(tmp_path)
+
+    result = replay_cached_eval(validation_root)
+
+    assert Path(result["replay_report"]).exists()
+    assert Path(result["replay_report_md"]).exists()
+    assert result["quality_summary"]["overall_average_score"] == 88.0
+    assert result["quality_summary"]["paragraph_count"] == 2
+    assert result["per_sample"][0]["paragraph_count"] == 2
+
+
+def test_eval_replay_command_outputs_machine_readable_json(tmp_path: Path) -> None:
+    validation_root = write_stable_review_fixture(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["eval", "replay", "--run", str(validation_root), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["quality_summary"]["selected_model"] == "gpt-5.4-mini"
+    assert Path(data["replay_report"]).exists()
+
+
+def test_eval_replay_accepts_run_id_from_eval_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validation_root = write_stable_review_fixture(tmp_path / "artifacts" / "evaluations")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["eval", "replay", "--run", validation_root.name, "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert Path(data["run_dir"]) == validation_root.resolve()
+
+
+def test_review_stable_approve_creates_approval_without_modifying_prompt(tmp_path: Path) -> None:
+    validation_root = write_stable_review_fixture(tmp_path)
+    before = (validation_root / "stable_prompt.md").read_text(encoding="utf-8")
+
+    result = stable_prompt_review(
+        run=validation_root,
+        approve=True,
+        reject=False,
+        reviewer="unit-test",
+    )
+
+    approval_path = Path(result["approval_path"])
+    assert approval_path.exists()
+    approval = json.loads(approval_path.read_text(encoding="utf-8"))
+    assert approval["decision"] == "approved"
+    assert approval["reviewer"] == "unit-test"
+    assert approval["quality_summary"]["average_score"] == 88
+    assert (validation_root / "stable_prompt.md").read_text(encoding="utf-8") == before
+
+
+def test_review_stable_reject_creates_rejection_with_reason(tmp_path: Path) -> None:
+    validation_root = write_stable_review_fixture(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "review-stable",
+            "--run",
+            str(validation_root),
+            "--reject",
+            "--reason",
+            "Needs human terminology review.",
+            "--reviewer",
+            "unit-test",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    rejection = json.loads(Path(data["rejection_path"]).read_text(encoding="utf-8"))
+    assert rejection["decision"] == "rejected"
+    assert rejection["reason"] == "Needs human terminology review."
+    assert rejection["stable_prompt_modified"] is False
+
+
+def test_replay_missing_cached_file_fails_cleanly(tmp_path: Path) -> None:
+    validation_root = tmp_path / "missing-cache"
+    validation_root.mkdir()
+
+    result = runner.invoke(
+        app,
+        ["eval", "replay", "--run", str(validation_root), "--json"],
+    )
+
+    assert result.exit_code == 4
+    payload = parse_json(result.output)
+    assert payload["status"] == "error"
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert "cached_eval_replay.json not found" in payload["error"]["message"]
 
 
 def test_validate_stable_prompt_mock_command_creates_replay_and_failure_report(

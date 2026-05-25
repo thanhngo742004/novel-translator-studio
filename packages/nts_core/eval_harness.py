@@ -3083,6 +3083,394 @@ def validate_stable_prompt(
     }
 
 
+def resolve_eval_run(run: str | Path) -> Path:
+    run_text = str(run).strip()
+    if not run_text:
+        raise ValueError("--run is required.")
+    path = Path(run_text).expanduser()
+    candidates = [path]
+    if not path.is_absolute():
+        candidates.append(repo_root() / path)
+        candidates.append(eval_root() / run_text)
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate.resolve()
+    if not any(separator in run_text for separator in ("/", "\\")):
+        matches = sorted(
+            candidate.resolve()
+            for candidate in eval_root().glob(run_text)
+            if candidate.exists() and candidate.is_dir()
+        )
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous evaluation run id: {run_text}")
+    raise ValueError(f"Evaluation run not found: {run_text}")
+
+
+def _mean(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 3) if values else None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _replay_quality_summary(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "selected_model": report.get("selected_model"),
+        "overall_average_score": report.get("overall", {}).get("average_score"),
+        "run_count": len(report.get("per_run", [])),
+        "sample_count": len(report.get("per_sample", [])),
+        "paragraph_count": len(report.get("paragraph_diagnostics", [])),
+        "ratio_summary": report.get("overall", {}).get("ratio_after_summary"),
+        "all_samples_pass": report.get("overall", {}).get("all_samples_pass"),
+    }
+
+
+def summarize_cached_eval_replay(replay: dict[str, Any]) -> dict[str, Any]:
+    rows = replay.get("rows", [])
+    if not isinstance(rows, list):
+        raise ValueError("cached_eval_replay.json must contain a rows list.")
+
+    sample_map: dict[tuple[int, str], dict[str, Any]] = {}
+    paragraph_diagnostics = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        validation_index = int(row.get("validation_index") or 0)
+        sample_id = str(row.get("sample_id") or "")
+        paragraph_id = str(row.get("paragraph_id") or "")
+        ratio_before = _float_or_none(row.get("ratio_before"))
+        ratio_after = _float_or_none(row.get("ratio_after"))
+        sample_score = row.get("sample_score") if isinstance(row.get("sample_score"), dict) else {}
+        key = (validation_index, sample_id)
+        sample_summary = sample_map.setdefault(
+            key,
+            {
+                "validation_index": validation_index,
+                "sample_id": sample_id,
+                "chapter_id": row.get("chapter_id"),
+                "paragraph_count": 0,
+                "total_score": sample_score.get("total_score"),
+                "pass": sample_score.get("pass"),
+                "reason": sample_score.get("reason"),
+                "warnings": [],
+                "ratio_before_values": [],
+                "ratio_after_values": [],
+            },
+        )
+        sample_summary["paragraph_count"] += 1
+        if ratio_before is not None:
+            sample_summary["ratio_before_values"].append(ratio_before)
+        if ratio_after is not None:
+            sample_summary["ratio_after_values"].append(ratio_after)
+        for warning in row.get("warnings", []) or []:
+            if warning not in sample_summary["warnings"]:
+                sample_summary["warnings"].append(warning)
+        paragraph_diagnostics.append(
+            {
+                "validation_index": validation_index,
+                "sample_id": sample_id,
+                "chapter_id": row.get("chapter_id"),
+                "paragraph_id": paragraph_id,
+                "reference_char_count": row.get("reference_char_count"),
+                "before_char_count": row.get("before_char_count"),
+                "after_char_count": row.get("after_char_count"),
+                "ratio_before": ratio_before,
+                "ratio_after": ratio_after,
+                "score_notes": row.get("score_notes", {}),
+                "warnings": row.get("warnings", []),
+                "source_paragraph": row.get("source_paragraph", ""),
+                "human_reference_paragraph": row.get("human_reference_paragraph", ""),
+                "model_paragraph_before_compression": row.get(
+                    "model_paragraph_before_compression", ""
+                ),
+                "model_paragraph_after_compression": row.get(
+                    "model_paragraph_after_compression", ""
+                ),
+            }
+        )
+
+    per_sample = []
+    for sample in sample_map.values():
+        before_values = sample.pop("ratio_before_values")
+        after_values = sample.pop("ratio_after_values")
+        sample["ratio_before_summary"] = {
+            "min": min(before_values) if before_values else None,
+            "max": max(before_values) if before_values else None,
+            "average": _mean(before_values),
+        }
+        sample["ratio_after_summary"] = {
+            "min": min(after_values) if after_values else None,
+            "max": max(after_values) if after_values else None,
+            "average": _mean(after_values),
+        }
+        per_sample.append(sample)
+    per_sample.sort(key=lambda item: (item["validation_index"], item["sample_id"]))
+
+    run_map: dict[int, dict[str, Any]] = {}
+    for sample in per_sample:
+        run_summary = run_map.setdefault(
+            sample["validation_index"],
+            {
+                "validation_index": sample["validation_index"],
+                "sample_count": 0,
+                "scores": [],
+                "ratio_after_values": [],
+                "all_samples_pass": True,
+                "warnings": [],
+            },
+        )
+        run_summary["sample_count"] += 1
+        if sample.get("total_score") is not None:
+            run_summary["scores"].append(float(sample["total_score"]))
+        average_ratio = sample.get("ratio_after_summary", {}).get("average")
+        if average_ratio is not None:
+            run_summary["ratio_after_values"].append(float(average_ratio))
+        if sample.get("pass") is False:
+            run_summary["all_samples_pass"] = False
+        for warning in sample.get("warnings", []):
+            if warning not in run_summary["warnings"]:
+                run_summary["warnings"].append(warning)
+
+    per_run = []
+    for run_summary in run_map.values():
+        scores = run_summary.pop("scores")
+        ratios = run_summary.pop("ratio_after_values")
+        run_summary["average_score"] = (
+            round(sum(scores) / len(scores), 2) if scores else None
+        )
+        run_summary["ratio_after_summary"] = {
+            "min": min(ratios) if ratios else None,
+            "max": max(ratios) if ratios else None,
+            "average": _mean(ratios),
+        }
+        per_run.append(run_summary)
+    per_run.sort(key=lambda item: item["validation_index"])
+
+    all_scores = [
+        float(sample["total_score"])
+        for sample in per_sample
+        if sample.get("total_score") is not None
+    ]
+    all_after_ratios = [
+        diagnostic["ratio_after"]
+        for diagnostic in paragraph_diagnostics
+        if diagnostic.get("ratio_after") is not None
+    ]
+    overall = {
+        "average_score": round(sum(all_scores) / len(all_scores), 2) if all_scores else None,
+        "all_samples_pass": all(sample.get("pass") is not False for sample in per_sample),
+        "ratio_after_summary": {
+            "min": min(all_after_ratios) if all_after_ratios else None,
+            "max": max(all_after_ratios) if all_after_ratios else None,
+            "average": _mean(all_after_ratios),
+        },
+    }
+    return {
+        "schema_version": "cached_eval_replay_report_v1",
+        "selected_model": replay.get("selected_model"),
+        "row_count": len(rows),
+        "overall": overall,
+        "per_run": per_run,
+        "per_sample": per_sample,
+        "paragraph_diagnostics": paragraph_diagnostics,
+    }
+
+
+def _md_cell(value: Any, limit: int = 120) -> str:
+    return _snippet(str(value or ""), limit).replace("|", "\\|").replace("\n", "<br>")
+
+
+def write_replay_report_md(path: Path, report: dict[str, Any]) -> None:
+    overall = report["overall"]
+    lines = [
+        "# Cached Eval Replay Report",
+        "",
+        f"- Selected model: `{report.get('selected_model')}`",
+        f"- Average score: `{overall.get('average_score')}`",
+        f"- All samples pass: `{overall.get('all_samples_pass')}`",
+        f"- Paragraph rows: `{report.get('row_count')}`",
+        "",
+        "## Runs",
+        "",
+        "| Run | Samples | Average Score | Ratio Min | Ratio Avg | Ratio Max | Pass |",
+        "|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for run in report["per_run"]:
+        ratios = run["ratio_after_summary"]
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(run["validation_index"]),
+                    str(run["sample_count"]),
+                    str(run["average_score"]),
+                    str(ratios["min"]),
+                    str(ratios["average"]),
+                    str(ratios["max"]),
+                    str(run["all_samples_pass"]),
+                ]
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Samples",
+            "",
+            "| Run | Sample | Chapter | Score | Pass | Ratio Avg | Paragraphs | Reason |",
+            "|---:|---|---:|---:|---|---:|---:|---|",
+        ]
+    )
+    for sample in report["per_sample"]:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(sample["validation_index"]),
+                    _md_cell(sample["sample_id"], 60),
+                    str(sample.get("chapter_id")),
+                    str(sample.get("total_score")),
+                    str(sample.get("pass")),
+                    str(sample["ratio_after_summary"]["average"]),
+                    str(sample["paragraph_count"]),
+                    _md_cell(sample.get("reason"), 90),
+                ]
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Paragraph Diagnostics",
+            "",
+            "| Run | Sample | Paragraph | Ref Chars | Before | After | Ratio Before | Ratio After | Source | Reference | Final |",
+            "|---:|---|---|---:|---:|---:|---:|---:|---|---|---|",
+        ]
+    )
+    for diagnostic in report["paragraph_diagnostics"]:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(diagnostic["validation_index"]),
+                    _md_cell(diagnostic["sample_id"], 50),
+                    _md_cell(diagnostic["paragraph_id"], 30),
+                    str(diagnostic.get("reference_char_count")),
+                    str(diagnostic.get("before_char_count")),
+                    str(diagnostic.get("after_char_count")),
+                    str(diagnostic.get("ratio_before")),
+                    str(diagnostic.get("ratio_after")),
+                    _md_cell(diagnostic.get("source_paragraph"), 100),
+                    _md_cell(diagnostic.get("human_reference_paragraph"), 100),
+                    _md_cell(diagnostic.get("model_paragraph_after_compression"), 100),
+                ]
+            )
+            + " |"
+        )
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def replay_cached_eval(run: str | Path) -> dict[str, Any]:
+    run_dir = resolve_eval_run(run)
+    replay_path = run_dir / "cached_eval_replay.json"
+    if not replay_path.exists():
+        raise ValueError(f"cached_eval_replay.json not found in evaluation run: {run_dir}")
+    replay = read_json(replay_path)
+    report = summarize_cached_eval_replay(replay)
+    report["run_dir"] = str(run_dir)
+    report["cached_eval_replay_path"] = str(replay_path)
+    report_json_path = run_dir / "replay_report.json"
+    report_md_path = run_dir / "replay_report.md"
+    write_json(report_json_path, report)
+    write_replay_report_md(report_md_path, report)
+    return {
+        "run_dir": str(run_dir),
+        "replay_report": str(report_json_path),
+        "replay_report_md": str(report_md_path),
+        "quality_summary": _replay_quality_summary(report),
+        "per_run": report["per_run"],
+        "per_sample": report["per_sample"],
+        "paragraph_diagnostics": report["paragraph_diagnostics"],
+    }
+
+
+def stable_prompt_review(
+    *,
+    run: str | Path,
+    approve: bool,
+    reject: bool,
+    reason: str | None = None,
+    reviewer: str | None = None,
+) -> dict[str, Any]:
+    if approve == reject:
+        raise ValueError("Choose exactly one of --approve or --reject.")
+    run_dir = resolve_eval_run(run)
+    prompt_path = run_dir / "stable_prompt.md"
+    metadata_path = run_dir / "stable_prompt_metadata.json"
+    if not prompt_path.exists():
+        raise ValueError(f"stable_prompt.md not found in evaluation run: {run_dir}")
+    if not metadata_path.exists():
+        raise ValueError(f"stable_prompt_metadata.json not found in evaluation run: {run_dir}")
+    replay_result = replay_cached_eval(run_dir)
+    metadata = read_json(metadata_path)
+    quality_summary = {
+        "quality_gate": metadata.get("quality_gate"),
+        "average_score": metadata.get("average_score"),
+        "ratio_summary": metadata.get("ratio_summary"),
+        "compression_counts": metadata.get("compression_counts"),
+        "validation_run_count": len(metadata.get("validation_runs", [])),
+        "replay": replay_result["quality_summary"],
+    }
+    reviewer_name = (
+        reviewer
+        or os.environ.get("NTS_REVIEWER")
+        or os.environ.get("USERNAME")
+        or os.environ.get("USER")
+        or "local-user"
+    )
+    base_payload = {
+        "schema_version": "stable_prompt_human_review_v1",
+        "reviewer": reviewer_name,
+        "timestamp": utc_now(),
+        "run_dir": str(run_dir),
+        "prompt_path": str(prompt_path),
+        "metadata_path": str(metadata_path),
+        "quality_summary": quality_summary,
+        "stable_prompt_modified": False,
+    }
+    if approve:
+        payload = {**base_payload, "decision": "approved"}
+        output_path = run_dir / "stable_prompt_approval.json"
+        write_json(output_path, payload)
+        return {
+            "run_dir": str(run_dir),
+            "decision": "approved",
+            "approval_path": str(output_path),
+            "quality_summary": quality_summary,
+            "stable_prompt_modified": False,
+        }
+    if not reason or not reason.strip():
+        raise ValueError("--reason is required when using --reject.")
+    payload = {**base_payload, "decision": "rejected", "reason": reason.strip()}
+    output_path = run_dir / "stable_prompt_rejection.json"
+    write_json(output_path, payload)
+    return {
+        "run_dir": str(run_dir),
+        "decision": "rejected",
+        "rejection_path": str(output_path),
+        "quality_summary": quality_summary,
+        "stable_prompt_modified": False,
+    }
+
+
 def write_prompt_iteration_log(
     run_dir: Path,
     *,

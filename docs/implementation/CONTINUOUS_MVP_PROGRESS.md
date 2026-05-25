@@ -364,3 +364,37 @@
   - No pytest uses real API calls; tests continue to use mock providers only.
 - Next recommended phase:
   - Add cached report re-scoring/replay command and human-review approval workflow before using the stable prompt for larger translation samples.
+
+## 2026-05-25T09:09:40+07:00
+
+- Completed: MVP4.8.5 cached replay and human review approval workflow only.
+- Implemented:
+  - `nts eval replay --run <eval_run_id_or_path> --json`.
+  - `nts eval review-stable --run <eval_run_id_or_path> --approve --json`.
+  - `nts eval review-stable --run <eval_run_id_or_path> --reject --reason "<reason>" --json`.
+  - Cached replay summary generation from `cached_eval_replay.json` without provider/API calls.
+  - Replay outputs:
+    - `replay_report.json`
+    - `replay_report.md`
+  - Human review outputs:
+    - `stable_prompt_approval.json` on approval.
+    - `stable_prompt_rejection.json` on rejection.
+  - Review payloads include reviewer, timestamp, stable prompt path, metadata path, and quality summary.
+  - Stable prompt files are never modified by replay or review commands.
+- Commands run:
+  - `python -m pytest`
+  - `python -m nts_cli.main eval replay --help`
+  - `python -m nts_cli.main eval review-stable --help`
+  - `python -m nts_cli.main eval replay --run artifacts/evaluations/han-jue_stable_1779650612543 --json`
+- Test result:
+  - `python -m pytest` -> 53 passed.
+- Replay smoke output:
+  - `artifacts/evaluations/han-jue_stable_1779650612543/replay_report.json`
+  - `artifacts/evaluations/han-jue_stable_1779650612543/replay_report.md`
+- Approval status:
+  - No real stable prompt approval was written automatically; approval/rejection behavior is covered by tests and available through the CLI.
+- Known limitations:
+  - Replay summarizes cached scores and paragraph diagnostics; it does not re-run model or evaluator calls.
+  - Cached sample-level pass flags may differ from the MVP4.8 stable gate because stable validation used aggregate stable-gate rules.
+- Next recommended phase:
+  - Add an explicit human review step using `nts eval replay`, inspect the Markdown reports, then approve or reject the stable prompt before any production translation workflow.
