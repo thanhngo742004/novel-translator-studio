@@ -440,3 +440,50 @@
   - No production translation workflow is enabled.
 - Next recommended phase:
   - Build a stronger local paragraph/scene alignment step before attempting another stable-prompt validation run.
+
+## 2026-05-25T10:14:05+07:00
+
+- Completed: MVP4.8.7 stronger local paragraph/scene alignment before stable prompt validation only.
+- Implemented:
+  - Chapter alignment validation with chapter number, length ratio, and deterministic anchor overlap diagnostics.
+  - Chinese/Vietnamese anchor extraction with aliases for names, sects, cultivation/system terms, and system panel labels.
+  - Block grouping for panel, dialogue, narrative, and mixed text blocks.
+  - Monotonic local block alignment using anchor overlap, block type compatibility, relative length, and position proximity.
+  - Aligned block-window candidate generation with accepted/rejected reasons.
+  - Sample selection from accepted aligned block windows only where possible.
+  - Selected samples now include block mapping, block alignment candidate id, alignment quality, warnings, and stable-validation eligibility.
+  - Reports:
+    - `chapter_alignment_report.json`
+    - `chapter_alignment_report.md`
+    - `block_alignment_report.json`
+    - `block_alignment_report.md`
+    - `alignment_candidates.json`
+  - Stable validation still refuses provider calls when selected samples are below alignment threshold.
+- Commands run:
+  - `python -m pytest`
+  - `python -m nts_cli.main eval prepare-parallel --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --project han-jue-align-mvp487 --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --json`
+  - `python -m nts_cli.main eval validate-stable-prompt --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4-mini --max-chapters 3 --sample-count 3 --max-source-chars 1500 --max-target-chars 2500 --enable-paragraph-alignment --enable-compression-pass --stable-run-count 3 --json`
+- Test result:
+  - `python -m pytest` -> 65 passed.
+- Alignment-only Han Jue result:
+  - Output folder: `artifacts/evaluations/han-jue-align-mvp487_eval_1779678094269`
+  - Candidate windows found: 243.
+  - Accepted candidate windows: 200.
+  - Selected samples: 3.
+  - Selected sample alignment qualities:
+    - sample_1: 1.000
+    - sample_2: 1.000
+    - sample_3: 1.000
+- Strict validation result:
+  - Output folder: `artifacts/evaluations/han-jue_stable_1779678143304`
+  - API was called because alignment passed and `.env.local` had the configured key.
+  - Quality gate: fail.
+  - Stable prompt created: false.
+  - Failure reasons: unsafe compression, over-strict paragraphs, cached replay strict gate failure, and one provider/model output failure with truncation.
+  - Cached replay detected 22 truncated paragraphs and no low-alignment samples.
+- Known limitations:
+  - Block alignment is deterministic and anchor-heavy; it does not perform semantic sentence alignment.
+  - Alignment can now pass, but translation/compression quality still fails the strict gate.
+  - The real validation command exceeded the shell timeout while printing the final large JSON payload, but the validation artifacts were written and inspected.
+- Next recommended phase:
+  - Improve the model compression/rewrite protocol and reduce CLI stable-validation output size before rerunning the full real gate.

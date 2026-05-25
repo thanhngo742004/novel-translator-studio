@@ -7,15 +7,20 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import nts_core.eval_harness as eval_harness_module
 from nts_cli.main import app
 from nts_core.eval_harness import (
     EvalProvider,
     FIXED_GLOSSARY,
     add_paragraph_alignment,
+    align_blocks_monotonic,
+    build_alignment_blocks,
+    build_alignment_candidates,
     compress_offending_paragraphs,
     create_paragraph_alignment,
     detect_truncated_vietnamese,
     evaluate_alignment_quality,
+    extract_alignment_anchors,
     freeze_stable_candidate,
     limited_style_prompt,
     load_eval_provider,
@@ -99,6 +104,52 @@ def write_eval_inputs(tmp_path: Path) -> tuple[Path, Path]:
     return raw, epub
 
 
+def write_low_alignment_eval_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    raw = tmp_path / "raw-low.txt"
+    raw.write_text(
+        "\n\n".join(
+            [
+                "第1章 错位",
+                "韩绝获得灵根，准备在玉清宗修炼。",
+                "铁老和王老头都看向他。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    epub = tmp_path / "translated-low.epub"
+    with zipfile.ZipFile(epub, "w") as archive:
+        archive.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>""",
+        )
+        archive.writestr(
+            "OEBPS/content.opf",
+            """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <manifest>
+    <item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c1"/>
+  </spine>
+</package>""",
+        )
+        archive.writestr(
+            "OEBPS/ch1.xhtml",
+            """<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<h1>Chương 1</h1>
+<p>Một người bán hàng đi qua khu chợ và nhặt chiếc đèn cũ.</p>
+<p>Trời mưa rất lâu, không ai nhắc tới tu luyện hay tông môn.</p>
+</body></html>""",
+        )
+    return raw, epub
+
+
 def test_prepare_parallel_extracts_aligns_limits_and_writes_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -148,6 +199,11 @@ def test_prepare_parallel_extracts_aligns_limits_and_writes_files(
     assert (run_dir / "extracted_raw_chapters.json").exists()
     assert (run_dir / "extracted_translated_chapters.json").exists()
     assert (run_dir / "alignment_report.json").exists()
+    assert (run_dir / "chapter_alignment_report.json").exists()
+    assert (run_dir / "chapter_alignment_report.md").exists()
+    assert (run_dir / "block_alignment_report.json").exists()
+    assert (run_dir / "block_alignment_report.md").exists()
+    assert (run_dir / "alignment_candidates.json").exists()
     assert (run_dir / "paragraph_alignment_report.json").exists()
     assert (run_dir / "selected_sample.json").exists()
     assert (run_dir / "selected_samples.json").exists()
@@ -157,6 +213,7 @@ def test_prepare_parallel_extracts_aligns_limits_and_writes_files(
     assert stored_sample["paragraph_pairs"]
     first_pair = stored_sample["paragraph_pairs"][0]
     assert {"paragraph_id", "target_max", "strict_max", "target_source_ratio"}.issubset(first_pair)
+    assert "alignment_quality" in stored_sample
 
 
 def test_paragraph_alignment_pairs_and_mismatch_warning() -> None:
@@ -205,6 +262,94 @@ def test_alignment_quality_below_threshold_excludes_sample() -> None:
 
     assert quality["alignment_quality"] < 0.70
     assert quality["accepted_for_stable_validation"] is False
+
+
+def test_alignment_blocks_group_panels_and_narrative() -> None:
+    chapters = [
+        {
+            "chapter_id": 1,
+            "title": "第1章",
+            "text": "【姓名：韩绝】\n\n【修为：无】\n\n韩绝继续修炼。\n\n他看向玉清宗。",
+        }
+    ]
+
+    blocks = build_alignment_blocks(chapters, lang="zh", max_block_chars=80)
+
+    assert blocks[0]["block_type"] == "panel"
+    assert "han_jue" in blocks[0]["anchors"]
+    assert any(block["block_type"] == "narrative" for block in blocks)
+
+
+def test_anchor_extraction_supports_chinese_vietnamese_aliases() -> None:
+    zh = extract_alignment_anchors("韩绝在玉清宗获得灵根和先天气运。", lang="zh")
+    vi = extract_alignment_anchors(
+        "Hàn Tuyệt ở Ngọc Thanh Tông có linh căn và Tiên Thiên Khí Vận.",
+        lang="vi",
+    )
+    alias = extract_alignment_anchors("Trương Ca nhận linh thạch.", lang="vi")
+
+    assert {"han_jue", "yuqing_zong", "ling_gen", "xiantian_qiyun"}.issubset(zh)
+    assert {"han_jue", "yuqing_zong", "ling_gen", "xiantian_qiyun"}.issubset(vi)
+    assert "zhang_ge" in alias
+
+
+def test_monotonic_block_alignment_and_good_window_selection() -> None:
+    source_chapters = [
+        {
+            "chapter_id": 1,
+            "title": "第1章",
+            "text": (
+                "【姓名：韩绝】\n\n【修为：无】\n\n韩绝在玉清宗继续修炼。\n\n"
+                "铁老看着韩绝，王老头在旁边叹气。\n\n韩绝获得灵根和先天气运。"
+            ),
+        }
+    ]
+    target_chapters = [
+        {
+            "chapter_id": 1,
+            "title": "Chương 1",
+            "text": (
+                "【 Tính danh: Hàn Tuyệt 】\n\n【 Tu vi: Không 】\n\n"
+                "Hàn Tuyệt tiếp tục tu luyện ở Ngọc Thanh Tông.\n\n"
+                "Thiết lão nhìn Hàn Tuyệt, Vương lão đầu thở dài bên cạnh.\n\n"
+                "Hàn Tuyệt có linh căn và Tiên Thiên Khí Vận."
+            ),
+        }
+    ]
+    source_blocks = build_alignment_blocks(source_chapters, lang="zh", max_block_chars=80)
+    target_blocks = build_alignment_blocks(target_chapters, lang="vi", max_block_chars=140)
+
+    pairs = align_blocks_monotonic(source_blocks, target_blocks)
+    candidates = build_alignment_candidates(
+        source_blocks,
+        target_blocks,
+        pairs,
+        max_source_chars=400,
+        max_target_chars=700,
+    )
+
+    assert pairs == sorted(pairs, key=lambda pair: pair["source_block_index"])
+    assert pairs == sorted(pairs, key=lambda pair: pair["target_block_index"])
+    assert candidates
+    assert candidates[0]["accepted"] is True
+    assert candidates[0]["alignment_quality"] >= 0.70
+
+
+def test_low_alignment_block_window_rejected() -> None:
+    source_chapters = [{"chapter_id": 1, "title": "第1章", "text": "韩绝获得灵根。"}]
+    target_chapters = [{"chapter_id": 1, "title": "Chương 1", "text": "Một người xa lạ đi chợ."}]
+    source_blocks = build_alignment_blocks(source_chapters, lang="zh")
+    target_blocks = build_alignment_blocks(target_chapters, lang="vi")
+    pairs = align_blocks_monotonic(source_blocks, target_blocks)
+    candidates = build_alignment_candidates(
+        source_blocks,
+        target_blocks,
+        pairs,
+        max_source_chars=300,
+        max_target_chars=500,
+    )
+
+    assert not candidates or candidates[0]["accepted"] is False
 
 
 def test_paragraph_validation_and_rendering_preserves_ids_and_count() -> None:
@@ -460,6 +605,11 @@ def test_run_full_mock_creates_required_eval_files(
         "extracted_raw_chapters.json",
         "extracted_translated_chapters.json",
         "alignment_report.json",
+        "chapter_alignment_report.json",
+        "chapter_alignment_report.md",
+        "block_alignment_report.json",
+        "block_alignment_report.md",
+        "alignment_candidates.json",
         "paragraph_alignment_report.json",
         "selected_sample.json",
         "selected_samples.json",
@@ -1239,3 +1389,50 @@ def test_validate_stable_prompt_mock_command_creates_replay_and_failure_report(
     else:
         assert not (root / "stable_prompt.md").exists()
         assert (root / "stable_candidate_failure_report.md").exists()
+
+
+def test_validate_stable_prompt_does_not_call_provider_when_alignment_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    raw, epub = write_low_alignment_eval_inputs(tmp_path)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("provider should not be called for low-alignment samples")
+
+    monkeypatch.setattr(eval_harness_module, "_chat_completion", fail_if_called)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "validate-stable-prompt",
+            "--project",
+            "low-align-test",
+            "--raw",
+            str(raw),
+            "--translated",
+            str(epub),
+            "--provider",
+            "mock",
+            "--model",
+            "mock-stable",
+            "--max-chapters",
+            "1",
+            "--sample-count",
+            "1",
+            "--max-source-chars",
+            "400",
+            "--max-target-chars",
+            "600",
+            "--stable-run-count",
+            "1",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["pass"] is False
+    assert data["stable_prompt_created"] is False
+    assert any("alignment_quality_below_threshold" in reason for reason in data["gate"]["reasons"])

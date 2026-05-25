@@ -97,6 +97,89 @@ FIXED_GLOSSARY = {
     "先天气运": "tiên thiên khí vận",
 }
 
+ALIGNMENT_ANCHORS = {
+    "han_jue": {
+        "zh": ["韩绝", "韩觉"],
+        "vi": ["hàn tuyệt", "hàn giác"],
+    },
+    "yuqing_zong": {
+        "zh": ["玉清宗"],
+        "vi": ["ngọc thanh tông"],
+    },
+    "tie_lao": {
+        "zh": ["铁老"],
+        "vi": ["thiết lão"],
+    },
+    "wang_laotou": {
+        "zh": ["王老头", "王老"],
+        "vi": ["vương lão đầu", "vương lão"],
+    },
+    "xing_hongxuan": {
+        "zh": ["邢红璇", "邢师妹"],
+        "vi": ["hình hồng tuyền", "hình hồng huyền", "hình hồng", "tính sư muội"],
+    },
+    "zhang_ge": {
+        "zh": ["张鸽"],
+        "vi": ["trương cáp", "trương ca"],
+    },
+    "ling_gen": {
+        "zh": ["灵根", "灵根资质"],
+        "vi": ["linh căn", "linh căn tư chất"],
+    },
+    "xiu_wei": {
+        "zh": ["修为"],
+        "vi": ["tu vi"],
+    },
+    "lianqi": {
+        "zh": ["炼气境"],
+        "vi": ["luyện khí cảnh", "luyện khí"],
+    },
+    "zhuji": {
+        "zh": ["筑基"],
+        "vi": ["trúc cơ"],
+    },
+    "xiantian_qiyun": {
+        "zh": ["先天气运"],
+        "vi": ["tiên thiên khí vận"],
+    },
+    "gongfa": {
+        "zh": ["功法"],
+        "vi": ["công pháp"],
+    },
+    "fashu": {
+        "zh": ["法术"],
+        "vi": ["pháp thuật"],
+    },
+    "shentong": {
+        "zh": ["神通"],
+        "vi": ["thần thông"],
+    },
+    "faqi": {
+        "zh": ["法器"],
+        "vi": ["pháp khí"],
+    },
+    "lingshi": {
+        "zh": ["灵石"],
+        "vi": ["linh thạch"],
+    },
+    "system_name": {
+        "zh": ["【姓名", "姓名"],
+        "vi": ["tính danh"],
+    },
+    "system_lifespan": {
+        "zh": ["【寿命", "寿命"],
+        "vi": ["thọ mệnh"],
+    },
+    "system_race": {
+        "zh": ["【种族", "种族"],
+        "vi": ["chủng tộc"],
+    },
+    "liudao_gong": {
+        "zh": ["六道轮回功"],
+        "vi": ["lục đạo luân hồi công"],
+    },
+}
+
 TERMINAL_PUNCTUATION = set(".!?…。！？】)]}\"”'")
 OPEN_CLOSE_PAIRS = {"【": "】", "(": ")", "[": "]", "“": "”", '"': '"'}
 SUSPICIOUS_FINAL_FRAGMENTS = {
@@ -412,12 +495,76 @@ def extract_epub_chapters(epub_path: Path, *, max_chapters: int) -> list[dict[st
     return chapters
 
 
+def chapter_number(title: str | None) -> int | None:
+    if not title:
+        return None
+    zh = re.search(r"第\s*(\d+)\s*[章节回]", title)
+    if zh:
+        return int(zh.group(1))
+    vi = re.search(r"\b(?:chương|chuong|chapter)\s+(\d+)\b", title, re.IGNORECASE)
+    if vi:
+        return int(vi.group(1))
+    return None
+
+
+def extract_alignment_anchors(text: str, *, lang: str | None = None) -> list[str]:
+    haystack = text if lang == "zh" else normalize_text(text).lower()
+    anchors = []
+    for anchor_id, aliases in ALIGNMENT_ANCHORS.items():
+        langs = [lang] if lang in {"zh", "vi"} else ["zh", "vi"]
+        for anchor_lang in langs:
+            for alias in aliases.get(anchor_lang, []):
+                needle = alias if anchor_lang == "zh" else alias.lower()
+                if needle and needle in haystack:
+                    anchors.append(anchor_id)
+                    break
+            if anchor_id in anchors:
+                break
+    return sorted(set(anchors))
+
+
+def chapter_alignment_score(raw: dict[str, Any], target: dict[str, Any], raw_index: int, target_index: int) -> dict[str, Any]:
+    raw_number = chapter_number(raw.get("title"))
+    target_number = chapter_number(target.get("title"))
+    raw_anchors = set(extract_alignment_anchors(raw["text"][:1200] + raw["text"][-1200:], lang="zh"))
+    target_anchors = set(extract_alignment_anchors(target["text"][:2200] + target["text"][-2200:], lang="vi"))
+    shared = sorted(raw_anchors & target_anchors)
+    anchor_score = len(shared) / max(len(raw_anchors), 1) if raw_anchors else 0.0
+    number_score = 1.0 if raw_number and target_number and raw_number == target_number else 0.5
+    position_score = max(0.0, 1 - abs(raw_index - target_index) / max(raw_index, target_index, 1))
+    length_ratio = len(target["text"]) / max(len(raw["text"]), 1)
+    length_score = max(0.0, 1 - abs(length_ratio - 2.5) / 2.5)
+    score = round(
+        0.35 * anchor_score + 0.25 * number_score + 0.25 * position_score + 0.15 * length_score,
+        3,
+    )
+    warnings = []
+    if raw_number and target_number and raw_number != target_number:
+        warnings.append(f"chapter_number_mismatch:raw={raw_number},target={target_number}")
+    if length_ratio < 1.0 or length_ratio > 4.5:
+        warnings.append(f"chapter_length_ratio_outlier:{length_ratio:.3f}")
+    if anchor_score < 0.25:
+        warnings.append("low_chapter_anchor_overlap")
+    return {
+        "score": score,
+        "raw_chapter_number": raw_number,
+        "target_chapter_number": target_number,
+        "shared_anchors": shared,
+        "raw_anchors": sorted(raw_anchors),
+        "target_anchors": sorted(target_anchors),
+        "length_ratio": round(length_ratio, 3),
+        "warnings": warnings,
+        "accepted": score >= 0.55 and not warnings[:1],
+    }
+
+
 def align_chapters(raw_chapters: list[dict[str, Any]], target_chapters: list[dict[str, Any]]) -> dict[str, Any]:
     count = min(len(raw_chapters), len(target_chapters))
     pairs = []
     for index in range(count):
         raw = raw_chapters[index]
         target = target_chapters[index]
+        scored = chapter_alignment_score(raw, target, index, index)
         pairs.append(
             {
                 "chapter_id": index + 1,
@@ -427,8 +574,9 @@ def align_chapters(raw_chapters: list[dict[str, Any]], target_chapters: list[dic
                 "target_title": target.get("title"),
                 "raw_chars": len(raw["text"]),
                 "target_chars": len(target["text"]),
-                "confidence": 0.75,
-                "method": "spine_order_index_alignment",
+                "confidence": scored["score"],
+                "method": "spine_order_index_alignment_with_anchor_validation",
+                **scored,
             }
         )
     return {
@@ -463,6 +611,197 @@ def split_text_paragraphs(text: str, *, kind: str) -> list[dict[str, Any]]:
             }
         )
     return paragraphs
+
+
+def classify_alignment_paragraph(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("【") or stripped.endswith("】"):
+        return "panel"
+    if stripped.startswith(("“", '"', "'")) or "：" in stripped[:18] and "”" in stripped:
+        return "dialogue"
+    if stripped.startswith(("-", "—")):
+        return "dialogue"
+    return "narrative"
+
+
+def combine_block_type(types: list[str]) -> str:
+    unique = sorted(set(types))
+    return unique[0] if len(unique) == 1 else "mixed"
+
+
+def build_alignment_blocks(
+    chapters: list[dict[str, Any]],
+    *,
+    lang: str,
+    max_block_chars: int | None = None,
+) -> list[dict[str, Any]]:
+    max_chars = max_block_chars or (260 if lang == "zh" else 620)
+    blocks: list[dict[str, Any]] = []
+    for chapter in chapters:
+        paragraph_rows = split_text_paragraphs(chapter["text"], kind=f"{lang[0]}p")
+        current: list[dict[str, Any]] = []
+        current_types: list[str] = []
+
+        def flush() -> None:
+            nonlocal current, current_types
+            if not current:
+                return
+            text = "\n\n".join(item["text"] for item in current).strip()
+            block_index = len(blocks) + 1
+            block_type = combine_block_type(current_types)
+            blocks.append(
+                {
+                    "block_id": f"{lang}_b{block_index:04d}",
+                    "chapter_id": chapter["chapter_id"],
+                    "chapter_title": chapter.get("title"),
+                    "block_index": block_index,
+                    "block_type": block_type,
+                    "text": text,
+                    "block_char_count": len(text),
+                    "paragraph_indexes": [item["paragraph_index"] for item in current],
+                    "start_offset": current[0]["start_offset"],
+                    "end_offset": current[-1]["end_offset"],
+                    "anchors": extract_alignment_anchors(text, lang=lang),
+                }
+            )
+            current = []
+            current_types = []
+
+        for paragraph in paragraph_rows:
+            paragraph_type = classify_alignment_paragraph(paragraph["text"])
+            projected = (
+                sum(len(item["text"]) for item in current)
+                + (2 * len(current) if current else 0)
+                + len(paragraph["text"])
+            )
+            if not current:
+                current = [paragraph]
+                current_types = [paragraph_type]
+                continue
+            current_type = combine_block_type(current_types)
+            should_flush = False
+            if paragraph_type == "panel" and current_type != "panel":
+                should_flush = True
+            elif current_type == "panel" and paragraph_type != "panel":
+                should_flush = True
+            elif paragraph_type == "dialogue" and current_type not in {"dialogue", "mixed"}:
+                should_flush = True
+            elif projected > max_chars:
+                should_flush = True
+            if should_flush:
+                flush()
+            current.append(paragraph)
+            current_types.append(paragraph_type)
+            if paragraph_type == "panel" and len(current) >= 8:
+                flush()
+        flush()
+    return blocks
+
+
+def block_pair_score(
+    source_block: dict[str, Any],
+    target_block: dict[str, Any],
+    *,
+    source_count: int,
+    target_count: int,
+) -> dict[str, Any]:
+    source_anchors = set(source_block.get("anchors", []))
+    target_anchors = set(target_block.get("anchors", []))
+    shared = sorted(source_anchors & target_anchors)
+    anchor_score = len(shared) / max(len(source_anchors | target_anchors), 1)
+    if shared:
+        anchor_score = max(anchor_score, min(1.0, len(shared) / max(len(source_anchors), 1)))
+    type_pair = (source_block.get("block_type"), target_block.get("block_type"))
+    if type_pair[0] == type_pair[1]:
+        type_score = 1.0
+    elif "mixed" in type_pair:
+        type_score = 0.65
+    elif "panel" in type_pair:
+        type_score = 0.1
+    else:
+        type_score = 0.45
+    length_ratio = target_block["block_char_count"] / max(source_block["block_char_count"], 1)
+    length_score = max(0.0, 1 - abs(length_ratio - 2.5) / 2.7)
+    source_pos = source_block["block_index"] / max(source_count, 1)
+    target_pos = target_block["block_index"] / max(target_count, 1)
+    position_score = max(0.0, 1 - abs(source_pos - target_pos) * 1.5)
+    score = round(
+        0.52 * anchor_score + 0.18 * type_score + 0.15 * length_score + 0.15 * position_score,
+        3,
+    )
+    if not shared and score > 0.52:
+        score = 0.52
+    return {
+        "score": score,
+        "shared_anchors": shared,
+        "source_anchors": sorted(source_anchors),
+        "target_anchors": sorted(target_anchors),
+        "length_ratio": round(length_ratio, 3),
+        "type_score": round(type_score, 3),
+        "length_score": round(length_score, 3),
+        "position_score": round(position_score, 3),
+        "anchor_score": round(anchor_score, 3),
+    }
+
+
+def align_blocks_monotonic(
+    source_blocks: list[dict[str, Any]],
+    target_blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    n = len(source_blocks)
+    m = len(target_blocks)
+    if not n or not m:
+        return []
+    scores = [
+        [
+            block_pair_score(source_blocks[i], target_blocks[j], source_count=n, target_count=m)
+            for j in range(m)
+        ]
+        for i in range(n)
+    ]
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    back: list[list[str | None]] = [[None] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            pair_score = scores[i - 1][j - 1]["score"]
+            match_value = dp[i - 1][j - 1] + (pair_score if pair_score >= 0.38 else -0.15)
+            skip_source = dp[i - 1][j] - 0.02
+            skip_target = dp[i][j - 1] - 0.02
+            best = max(match_value, skip_source, skip_target, 0.0)
+            dp[i][j] = best
+            if best == match_value:
+                back[i][j] = "match"
+            elif best == skip_source:
+                back[i][j] = "skip_source"
+            elif best == skip_target:
+                back[i][j] = "skip_target"
+    matches = []
+    i, j = n, m
+    while i > 0 and j > 0:
+        move = back[i][j]
+        if move == "match":
+            score = scores[i - 1][j - 1]
+            if score["score"] >= 0.38:
+                matches.append(
+                    {
+                        "source_block_id": source_blocks[i - 1]["block_id"],
+                        "target_block_id": target_blocks[j - 1]["block_id"],
+                        "source_block_index": source_blocks[i - 1]["block_index"],
+                        "target_block_index": target_blocks[j - 1]["block_index"],
+                        "source_chapter_id": source_blocks[i - 1]["chapter_id"],
+                        "target_chapter_id": target_blocks[j - 1]["chapter_id"],
+                        **score,
+                    }
+                )
+            i -= 1
+            j -= 1
+        elif move == "skip_source":
+            i -= 1
+        elif move == "skip_target":
+            j -= 1
+        else:
+            break
+    return list(reversed(matches))
 
 
 def _group_indexes(count: int, group_count: int) -> list[list[int]]:
@@ -729,6 +1068,408 @@ def select_sample(
     return add_paragraph_alignment(sample)
 
 
+def _blocks_by_index(blocks: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    return {block["block_index"]: block for block in blocks}
+
+
+def _block_window(blocks: list[dict[str, Any]], start_index: int, end_index: int) -> list[dict[str, Any]]:
+    return [
+        block
+        for block in blocks
+        if start_index <= block["block_index"] <= end_index
+    ]
+
+
+def _blocks_text(blocks: list[dict[str, Any]]) -> str:
+    return "\n\n".join(block["text"] for block in blocks).strip()
+
+
+def _block_panel_ratio(blocks: list[dict[str, Any]]) -> float:
+    chars = sum(block["block_char_count"] for block in blocks)
+    if not chars:
+        return 0.0
+    panel_chars = sum(
+        block["block_char_count"]
+        for block in blocks
+        if block.get("block_type") == "panel"
+    )
+    return round(panel_chars / chars, 3)
+
+
+def block_window_candidate(
+    *,
+    candidate_id: str,
+    source_blocks: list[dict[str, Any]],
+    target_blocks: list[dict[str, Any]],
+    matched_pairs: list[dict[str, Any]],
+    max_source_chars: int,
+    max_target_chars: int,
+) -> dict[str, Any] | None:
+    if not source_blocks or not target_blocks:
+        return None
+    source_text = _blocks_text(source_blocks)
+    target_text = _blocks_text(target_blocks)
+    if not source_text or not target_text:
+        return None
+    if len(source_text) > max_source_chars or len(target_text) > max_target_chars:
+        return None
+    source_anchors = set(extract_alignment_anchors(source_text, lang="zh"))
+    target_anchors = set(extract_alignment_anchors(target_text, lang="vi"))
+    shared = sorted(source_anchors & target_anchors)
+    avg_pair_score = (
+        sum(pair["score"] for pair in matched_pairs) / max(len(matched_pairs), 1)
+    )
+    anchor_score = len(shared) / max(len(source_anchors), 1) if source_anchors else 0.0
+    if shared:
+        anchor_score = max(anchor_score, len(shared) / max(len(source_anchors | target_anchors), 1))
+    length_ratio = len(target_text) / max(len(source_text), 1)
+    length_score = max(0.0, 1 - abs(length_ratio - 2.5) / 2.7)
+    source_span = source_blocks[-1]["block_index"] - source_blocks[0]["block_index"] + 1
+    target_span = target_blocks[-1]["block_index"] - target_blocks[0]["block_index"] + 1
+    gap_ratio = max(
+        0.0,
+        1
+        - (
+            (source_span - len(matched_pairs)) + (target_span - len(matched_pairs))
+        )
+        / max(source_span + target_span, 1),
+    )
+    source_panel_ratio = _block_panel_ratio(source_blocks)
+    target_panel_ratio = _block_panel_ratio(target_blocks)
+    quality = round(
+        min(
+            1.0,
+            0.43 * avg_pair_score
+            + 0.32 * anchor_score
+            + 0.15 * length_score
+            + 0.10 * gap_ratio
+            + (0.08 if len(shared) >= 2 else 0.0),
+        ),
+        3,
+    )
+    rejection_reasons = []
+    if not shared:
+        rejection_reasons.append("no_shared_anchors")
+    if len(source_text) < 40 or len(target_text) < 80:
+        rejection_reasons.append("window_too_short")
+    if length_ratio < 1.1 or length_ratio > 4.2:
+        rejection_reasons.append(f"length_ratio_outlier:{length_ratio:.3f}")
+    if source_panel_ratio > 0.80 or target_panel_ratio > 0.80:
+        rejection_reasons.append("mostly_system_panel_fragment")
+    if quality < ALIGNMENT_QUALITY_THRESHOLD:
+        rejection_reasons.append("alignment_quality_below_threshold")
+    return {
+        "candidate_id": candidate_id,
+        "source_chapter_id": source_blocks[0]["chapter_id"],
+        "target_chapter_id": target_blocks[0]["chapter_id"],
+        "source_block_start": source_blocks[0]["block_index"],
+        "source_block_end": source_blocks[-1]["block_index"],
+        "target_block_start": target_blocks[0]["block_index"],
+        "target_block_end": target_blocks[-1]["block_index"],
+        "source_char_count": len(source_text),
+        "target_char_count": len(target_text),
+        "target_source_length_ratio": round(length_ratio, 3),
+        "source_panel_ratio": source_panel_ratio,
+        "target_panel_ratio": target_panel_ratio,
+        "shared_anchors": shared,
+        "source_anchors": sorted(source_anchors),
+        "target_anchors": sorted(target_anchors),
+        "matched_pair_count": len(matched_pairs),
+        "avg_pair_score": round(avg_pair_score, 3),
+        "gap_score": round(gap_ratio, 3),
+        "alignment_quality": quality,
+        "accepted": not rejection_reasons,
+        "rejection_reasons": rejection_reasons,
+        "source_block_ids": [block["block_id"] for block in source_blocks],
+        "target_block_ids": [block["block_id"] for block in target_blocks],
+        "block_pairs": matched_pairs,
+        "source_blocks": source_blocks,
+        "target_blocks": target_blocks,
+        "source_text": source_text,
+        "target_text": target_text,
+    }
+
+
+def build_alignment_candidates(
+    source_blocks: list[dict[str, Any]],
+    target_blocks: list[dict[str, Any]],
+    block_pairs: list[dict[str, Any]],
+    *,
+    max_source_chars: int,
+    max_target_chars: int,
+) -> list[dict[str, Any]]:
+    source_lookup = _blocks_by_index(source_blocks)
+    target_lookup = _blocks_by_index(target_blocks)
+    candidates: list[dict[str, Any]] = []
+    for start in range(len(block_pairs)):
+        matched: list[dict[str, Any]] = []
+        for end in range(start, min(len(block_pairs), start + 10)):
+            matched.append(block_pairs[end])
+            source_start = min(pair["source_block_index"] for pair in matched)
+            source_end = max(pair["source_block_index"] for pair in matched)
+            target_start = min(pair["target_block_index"] for pair in matched)
+            target_end = max(pair["target_block_index"] for pair in matched)
+            source_window = [
+                source_lookup[index]
+                for index in range(source_start, source_end + 1)
+                if index in source_lookup
+            ]
+            target_window = [
+                target_lookup[index]
+                for index in range(target_start, target_end + 1)
+                if index in target_lookup
+            ]
+            candidate = block_window_candidate(
+                candidate_id=f"cand_{len(candidates) + 1:04d}",
+                source_blocks=source_window,
+                target_blocks=target_window,
+                matched_pairs=matched.copy(),
+                max_source_chars=max_source_chars,
+                max_target_chars=max_target_chars,
+            )
+            if candidate:
+                candidates.append(candidate)
+            if (
+                sum(block["block_char_count"] for block in source_window) > max_source_chars
+                or sum(block["block_char_count"] for block in target_window) > max_target_chars
+            ):
+                break
+    candidates.sort(
+        key=lambda item: (
+            item["accepted"],
+            item["alignment_quality"],
+            len(item["shared_anchors"]),
+            item["source_char_count"],
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def sample_from_alignment_candidate(candidate: dict[str, Any], *, sample_id: str) -> dict[str, Any]:
+    sample = {
+        "sample_id": sample_id,
+        "chapter_id": candidate["source_chapter_id"],
+        "source_start_offset": candidate["source_blocks"][0]["start_offset"],
+        "source_end_offset": candidate["source_blocks"][-1]["end_offset"],
+        "source_char_count": candidate["source_char_count"],
+        "target_start_offset": candidate["target_blocks"][0]["start_offset"],
+        "target_end_offset": candidate["target_blocks"][-1]["end_offset"],
+        "target_char_count": candidate["target_char_count"],
+        "target_source_length_ratio": candidate["target_source_length_ratio"],
+        "paragraph_count_source": paragraph_count(candidate["source_text"]),
+        "paragraph_count_target": paragraph_count(candidate["target_text"]),
+        "target_length_min": int(candidate["target_char_count"] * PROMPT_TARGET_MIN_RATIO),
+        "target_length_max": int(candidate["target_char_count"] * PROMPT_TARGET_MAX_RATIO),
+        "selection_reason": "block_alignment_window_with_shared_anchors",
+        "limits_used": {
+            "max_source_chars": candidate["source_char_count"],
+            "max_target_chars": candidate["target_char_count"],
+            "sample_start_ratio": None,
+        },
+        "source_text": candidate["source_text"],
+        "target_text": candidate["target_text"],
+        "source_blocks": candidate["source_blocks"],
+        "target_blocks": candidate["target_blocks"],
+        "block_pairs": candidate["block_pairs"],
+        "block_alignment_candidate_id": candidate["candidate_id"],
+        "alignment_quality": candidate["alignment_quality"],
+        "alignment_warnings": candidate["rejection_reasons"],
+        "accepted_for_stable_validation": candidate["accepted"],
+    }
+    alignment = create_paragraph_alignment(sample["source_text"], sample["target_text"])
+    sample.update(alignment)
+    sample["paragraph_alignment_warnings"] = alignment["warnings"]
+    for pair in sample.get("paragraph_pairs", []):
+        pair["block_alignment_confidence"] = candidate["alignment_quality"]
+        pair["source_block_ids"] = candidate["source_block_ids"]
+        pair["target_block_ids"] = candidate["target_block_ids"]
+    sample["alignment_quality"] = candidate["alignment_quality"]
+    sample["alignment_warnings"] = sorted(
+        set(candidate["rejection_reasons"] + alignment.get("warnings", []))
+    )
+    sample["accepted_for_stable_validation"] = (
+        candidate["accepted"] and candidate["alignment_quality"] >= ALIGNMENT_QUALITY_THRESHOLD
+    )
+    return sample
+
+
+def select_samples_from_alignment_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    sample_count: int,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    used_source_ranges: list[tuple[int, int]] = []
+    accepted = [candidate for candidate in candidates if candidate["accepted"]]
+    for candidate in accepted:
+        source_range = (candidate["source_block_start"], candidate["source_block_end"])
+        overlaps = any(
+            not (source_range[1] < used[0] or source_range[0] > used[1])
+            for used in used_source_ranges
+        )
+        if overlaps:
+            continue
+        selected.append(
+            sample_from_alignment_candidate(candidate, sample_id=f"sample_{len(selected) + 1}")
+        )
+        used_source_ranges.append(source_range)
+        if len(selected) >= sample_count:
+            break
+    if len(selected) < sample_count:
+        for candidate in candidates:
+            if candidate["accepted"]:
+                continue
+            selected.append(
+                sample_from_alignment_candidate(candidate, sample_id=f"sample_{len(selected) + 1}")
+            )
+            if len(selected) >= sample_count:
+                break
+    return selected[:sample_count]
+
+
+def compact_alignment_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: candidate[key]
+        for key in [
+            "candidate_id",
+            "source_chapter_id",
+            "target_chapter_id",
+            "source_block_start",
+            "source_block_end",
+            "target_block_start",
+            "target_block_end",
+            "source_char_count",
+            "target_char_count",
+            "target_source_length_ratio",
+            "source_panel_ratio",
+            "target_panel_ratio",
+            "shared_anchors",
+            "source_anchors",
+            "target_anchors",
+            "matched_pair_count",
+            "avg_pair_score",
+            "gap_score",
+            "alignment_quality",
+            "accepted",
+            "rejection_reasons",
+            "source_block_ids",
+            "target_block_ids",
+        ]
+    } | {
+        "source_preview": _snippet(candidate["source_text"], 220),
+        "target_preview": _snippet(candidate["target_text"], 220),
+    }
+
+
+def block_alignment_report(
+    *,
+    source_blocks: list[dict[str, Any]],
+    target_blocks: list[dict[str, Any]],
+    block_pairs: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "block_alignment_report_v1",
+        "source_block_count": len(source_blocks),
+        "target_block_count": len(target_blocks),
+        "matched_pair_count": len(block_pairs),
+        "accepted_candidate_count": sum(1 for candidate in candidates if candidate["accepted"]),
+        "source_blocks": [
+            {
+                "block_id": block["block_id"],
+                "chapter_id": block["chapter_id"],
+                "block_index": block["block_index"],
+                "block_type": block["block_type"],
+                "block_char_count": block["block_char_count"],
+                "anchors": block["anchors"],
+                "preview": _snippet(block["text"], 180),
+            }
+            for block in source_blocks
+        ],
+        "target_blocks": [
+            {
+                "block_id": block["block_id"],
+                "chapter_id": block["chapter_id"],
+                "block_index": block["block_index"],
+                "block_type": block["block_type"],
+                "block_char_count": block["block_char_count"],
+                "anchors": block["anchors"],
+                "preview": _snippet(block["text"], 180),
+            }
+            for block in target_blocks
+        ],
+        "block_pairs": block_pairs,
+        "top_candidates": [compact_alignment_candidate(candidate) for candidate in candidates[:40]],
+    }
+
+
+def write_alignment_markdown(run_dir: Path, *, chapter_report: dict[str, Any], block_report: dict[str, Any]) -> None:
+    chapter_lines = [
+        "# Chapter Alignment Report",
+        "",
+        "| Raw | Target | Confidence | Accepted | Length Ratio | Shared Anchors | Warnings |",
+        "|---|---|---:|---|---:|---|---|",
+    ]
+    for pair in chapter_report.get("pairs", []):
+        chapter_lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _md_cell(pair.get("raw_title"), 80),
+                    _md_cell(pair.get("target_title"), 80),
+                    str(pair.get("confidence")),
+                    str(pair.get("accepted")),
+                    str(pair.get("length_ratio")),
+                    _md_cell(", ".join(pair.get("shared_anchors", [])), 80),
+                    _md_cell("; ".join(pair.get("warnings", [])), 100),
+                ]
+            )
+            + " |"
+        )
+    (run_dir / "chapter_alignment_report.md").write_text(
+        "\n".join(chapter_lines) + "\n",
+        encoding="utf-8",
+    )
+
+    block_lines = [
+        "# Block Alignment Report",
+        "",
+        f"- Source blocks: `{block_report['source_block_count']}`",
+        f"- Target blocks: `{block_report['target_block_count']}`",
+        f"- Matched pairs: `{block_report['matched_pair_count']}`",
+        f"- Accepted candidates: `{block_report['accepted_candidate_count']}`",
+        "",
+        "## Top Candidates",
+        "",
+        "| Candidate | Quality | Accepted | Src Blocks | Tgt Blocks | Ratio | Anchors | Reject Reasons | Source | Target |",
+        "|---|---:|---|---|---|---:|---|---|---|---|",
+    ]
+    for candidate in block_report["top_candidates"]:
+        block_lines.append(
+            "| "
+            + " | ".join(
+                [
+                    candidate["candidate_id"],
+                    str(candidate["alignment_quality"]),
+                    str(candidate["accepted"]),
+                    f"{candidate['source_block_start']}-{candidate['source_block_end']}",
+                    f"{candidate['target_block_start']}-{candidate['target_block_end']}",
+                    str(candidate["target_source_length_ratio"]),
+                    _md_cell(", ".join(candidate["shared_anchors"]), 80),
+                    _md_cell("; ".join(candidate["rejection_reasons"]), 120),
+                    _md_cell(candidate["source_preview"], 140),
+                    _md_cell(candidate["target_preview"], 140),
+                ]
+            )
+            + " |"
+        )
+    (run_dir / "block_alignment_report.md").write_text(
+        "\n".join(block_lines) + "\n",
+        encoding="utf-8",
+    )
+
+
 def select_samples(
     raw_chapters: list[dict[str, Any]],
     target_chapters: list[dict[str, Any]],
@@ -831,24 +1572,56 @@ def prepare_parallel(
     raw_chapters = extract_raw_chapters(raw_path, max_chapters=max_chapters)
     target_chapters = extract_epub_chapters(translated_path, max_chapters=max_chapters)
     alignment = align_chapters(raw_chapters, target_chapters)
-    samples = select_samples(
-        raw_chapters,
-        target_chapters,
-        sample_count=sample_count,
+    source_blocks = build_alignment_blocks(raw_chapters, lang="zh")
+    target_blocks = build_alignment_blocks(target_chapters, lang="vi")
+    block_pairs = align_blocks_monotonic(source_blocks, target_blocks)
+    candidates = build_alignment_candidates(
+        source_blocks,
+        target_blocks,
+        block_pairs,
         max_source_chars=max_source_chars,
         max_target_chars=max_target_chars,
-        sample_start_ratio=sample_start_ratio,
     )
+    samples = select_samples_from_alignment_candidates(candidates, sample_count=sample_count)
+    if not samples:
+        samples = select_samples(
+            raw_chapters,
+            target_chapters,
+            sample_count=sample_count,
+            max_source_chars=max_source_chars,
+            max_target_chars=max_target_chars,
+            sample_start_ratio=sample_start_ratio,
+        )
     sample = samples[0]
+    block_report = block_alignment_report(
+        source_blocks=source_blocks,
+        target_blocks=target_blocks,
+        block_pairs=block_pairs,
+        candidates=candidates,
+    )
     write_json(run_dir / "extracted_raw_chapters.json", raw_chapters)
     write_json(run_dir / "extracted_translated_chapters.json", target_chapters)
     write_json(run_dir / "alignment_report.json", alignment)
+    write_json(run_dir / "chapter_alignment_report.json", alignment)
+    write_json(run_dir / "block_alignment_report.json", block_report)
+    write_json(
+        run_dir / "alignment_candidates.json",
+        {
+            "schema_version": "alignment_candidates_v1",
+            "candidate_count": len(candidates),
+            "accepted_candidate_count": sum(1 for candidate in candidates if candidate["accepted"]),
+            "candidates": [compact_alignment_candidate(candidate) for candidate in candidates],
+        },
+    )
     write_json(run_dir / "paragraph_alignment_report.json", paragraph_alignment_report(samples))
     write_json(run_dir / "selected_sample.json", sample)
     write_json(run_dir / "selected_samples.json", {"samples": samples})
+    write_alignment_markdown(run_dir, chapter_report=alignment, block_report=block_report)
     return {
         "run_dir": str(run_dir),
         "alignment": alignment,
+        "block_alignment": block_report,
+        "alignment_candidates": [compact_alignment_candidate(candidate) for candidate in candidates],
         "selected_sample": sample,
         "selected_samples": samples,
     }
