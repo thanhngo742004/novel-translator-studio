@@ -84,7 +84,7 @@ def test_manga_migration_creates_required_tables(tmp_path: Path) -> None:
         "manga_exports",
         "manga_visual_evidence",
     }.issubset(tables)
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
 
 
 def test_import_image_folder_registers_pages_checksum_and_warns_for_unsupported(
@@ -358,4 +358,3 @@ def test_manga_manifest_export_creates_manifest_and_export_row(tmp_path: Path) -
     with closing(sqlite3.connect(workspace / "nts.db")) as conn:
         export_count = conn.execute("SELECT COUNT(*) FROM manga_exports").fetchone()[0]
     assert export_count == 1
-

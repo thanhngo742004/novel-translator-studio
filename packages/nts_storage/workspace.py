@@ -12,6 +12,7 @@ WORKSPACE_DIRS = [
     "artifacts/raw",
     "artifacts/normalized",
     "artifacts/translated",
+    "artifacts/nlp",
     "artifacts/manga",
     "artifacts/exports",
     "artifacts/reports",
@@ -40,6 +41,22 @@ DEFAULT_ROUTING_YAML = """tasks:
       max_cost_usd: 0.001
 """
 
+DEFAULT_NLP_YAML = """nlp:
+  enabled: true
+  provider: ltp_server
+  auto_start: true
+  ltp_server:
+    base_url: "http://127.0.0.1:3003"
+    working_dir: "C:/Users/Admin/tools/ltp-server"
+    start_command: "cargo run --release"
+    executable: null
+    startup_timeout_seconds: 30
+    request_timeout_seconds: 15
+    max_sentences_per_request: 512
+  fallback:
+    enabled: true
+"""
+
 
 class WorkspaceError(RuntimeError):
     pass
@@ -66,10 +83,13 @@ def init_workspace(path: Path) -> Workspace:
 
     providers_path = workspace_path / "config" / "providers.yaml"
     routing_path = workspace_path / "config" / "routing.yaml"
+    nlp_path = workspace_path / "config" / "nlp.yaml"
     if not providers_path.exists():
         providers_path.write_text(DEFAULT_PROVIDERS_YAML, encoding="utf-8")
     if not routing_path.exists():
         routing_path.write_text(DEFAULT_ROUTING_YAML, encoding="utf-8")
+    if not nlp_path.exists():
+        nlp_path.write_text(DEFAULT_NLP_YAML, encoding="utf-8")
 
     initialize_database(workspace_path / "nts.db")
     return Workspace(workspace_path)

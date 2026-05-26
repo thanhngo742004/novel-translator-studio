@@ -1,0 +1,14 @@
+nlp:
+  enabled: true
+  provider: ltp_server
+  auto_start: true
+  ltp_server:
+    base_url: "http://127.0.0.1:3003"
+    working_dir: "C:/Users/Admin/tools/ltp-server"
+    start_command: "cargo run --release"
+    executable: null
+    startup_timeout_seconds: 30
+    request_timeout_seconds: 15
+    max_sentences_per_request: 512
+  fallback:
+    enabled: true

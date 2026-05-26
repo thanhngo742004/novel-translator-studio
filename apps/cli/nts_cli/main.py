@@ -17,6 +17,13 @@ from nts_core.approved_memory_validation import (
     start_approved_memory_validation,
 )
 from nts_core.config import validate_config_files
+from nts_core.chinese_nlp import (
+    analyze_chapter as nlp_analyze_chapter,
+    analyze_text as nlp_analyze_text,
+    cache_build as nlp_cache_build,
+    nlp_status as nlp_status_report,
+    show_cache as nlp_show_cache,
+)
 from nts_core.corrections import (
     learn_corrections,
     records_from_jsonl,
@@ -123,6 +130,7 @@ manga_pages_app = typer.Typer(help="Manga page commands.")
 manga_boxes_app = typer.Typer(help="Manga box commands.")
 manga_manifest_app = typer.Typer(help="Manga manifest commands.")
 eval_app = typer.Typer(help="Evaluation harness commands.")
+nlp_app = typer.Typer(help="Chinese NLP analysis commands.")
 app.add_typer(project_app, name="project")
 app.add_typer(config_app, name="config")
 app.add_typer(model_app, name="model")
@@ -134,6 +142,7 @@ app.add_typer(learn_app, name="learn")
 app.add_typer(export_app, name="export")
 app.add_typer(manga_app, name="manga")
 app.add_typer(eval_app, name="eval")
+app.add_typer(nlp_app, name="nlp")
 text_app.add_typer(text_chapters_app, name="chapters")
 text_app.add_typer(text_segments_app, name="segments")
 memory_app.add_typer(memory_evidence_app, name="evidence")
@@ -177,6 +186,15 @@ def _fail(code: str, message: str, exit_code: int, as_json: bool) -> None:
 
 def _workspace_arg(command_workspace: Path | None = None) -> Path | None:
     return command_workspace or state.workspace
+
+
+AutoStartOption = Annotated[
+    Optional[bool],
+    typer.Option(
+        "--auto-start/--no-auto-start",
+        help="Override NLP sidecar auto-start for this command.",
+    ),
+]
 
 
 def _scope_from_options(ws, project_slug: str | None, scope_json: str | None) -> dict:
@@ -1429,6 +1447,149 @@ def manga_manifest_export(
         result = export_manga_manifest(ws, project_slug=project)
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@nlp_app.command("status")
+def nlp_status_command(
+    workspace: WorkspaceOption = None,
+    project: Annotated[Optional[str], typer.Option("--project", help="Project slug.")] = None,
+    provider: Annotated[
+        str,
+        typer.Option("--provider", help="ltp_server or fallback_simple."),
+    ] = "ltp_server",
+    auto_start: AutoStartOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = None
+        if workspace is not None or project is not None:
+            ws = discover_workspace(_workspace_arg(workspace))
+        result = nlp_status_report(
+            ws,
+            project_slug=project,
+            provider_kind=provider,
+            auto_start=auto_start,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("NLP_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@nlp_app.command("analyze")
+def nlp_analyze_command(
+    workspace: WorkspaceOption = None,
+    text: Annotated[Optional[str], typer.Option("--text", help="Chinese text to analyze.")] = None,
+    file: Annotated[Optional[Path], typer.Option("--file", help="UTF-8 text file to analyze.")] = None,
+    provider: Annotated[
+        str,
+        typer.Option("--provider", help="ltp_server or fallback_simple."),
+    ] = "ltp_server",
+    auto_start: AutoStartOption = None,
+    output: Annotated[Optional[Path], typer.Option("--output", help="Optional artifact path.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        if text is None and file is None:
+            raise ValueError("Use --text or --file.")
+        if text is not None and file is not None:
+            raise ValueError("Use only one of --text or --file.")
+        source_text = text if text is not None else file.read_text(encoding="utf-8")  # type: ignore[union-attr]
+        try:
+            ws = discover_workspace(_workspace_arg(workspace))
+        except WorkspaceError:
+            ws = None
+        result = nlp_analyze_text(
+            ws,
+            text=source_text,
+            provider_kind=provider,
+            auto_start=auto_start,
+        )
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            result = {"analysis": result, "output_path": str(output)}
+    except (OSError, WorkspaceError, ValueError) as exc:
+        _fail("NLP_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@nlp_app.command("analyze-chapter")
+def nlp_analyze_chapter_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    chapter: Annotated[str, typer.Option("--chapter", help="Chapter id or chapter number.")],
+    workspace: WorkspaceOption = None,
+    provider: Annotated[
+        str,
+        typer.Option("--provider", help="ltp_server or fallback_simple."),
+    ] = "ltp_server",
+    auto_start: AutoStartOption = None,
+    force: Annotated[bool, typer.Option("--force", help="Rebuild even if cache is valid.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = nlp_analyze_chapter(
+            ws,
+            project_slug=project,
+            chapter_ref=chapter,
+            provider_kind=provider,
+            auto_start=auto_start,
+            force=force,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("NLP_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@nlp_app.command("cache-build")
+def nlp_cache_build_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    chapters: Annotated[str, typer.Option("--chapters", help="Chapter range, e.g. 1-10.")],
+    workspace: WorkspaceOption = None,
+    missing_only: Annotated[
+        bool,
+        typer.Option("--missing-only", help="Skip valid existing cache entries."),
+    ] = False,
+    force: Annotated[bool, typer.Option("--force", help="Force cache rebuild.")] = False,
+    provider: Annotated[
+        str,
+        typer.Option("--provider", help="ltp_server or fallback_simple."),
+    ] = "ltp_server",
+    auto_start: AutoStartOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = nlp_cache_build(
+            ws,
+            project_slug=project,
+            chapters=chapters,
+            missing_only=missing_only,
+            force=force,
+            provider_kind=provider,
+            auto_start=auto_start,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("NLP_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@nlp_app.command("show-cache")
+def nlp_show_cache_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    chapter: Annotated[
+        Optional[str],
+        typer.Option("--chapter", help="Optional chapter id or number."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = nlp_show_cache(ws, project_slug=project, chapter_ref=chapter)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("NLP_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)
 
 
