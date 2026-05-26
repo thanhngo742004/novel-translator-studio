@@ -218,6 +218,102 @@ def make_fake_validation_run(workspace: Path, approved_memory: list[dict]) -> Pa
     return run_dir
 
 
+def make_fake_chapter_10_regression_run(workspace: Path, approved_memory: list[dict]) -> Path:
+    run_dir = workspace / "artifacts" / "approved_memory_validation" / "fake_mvp5d7_regression"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    sample = {
+        "sample_id": "sample_10",
+        "chapter_id": 10,
+        "source_text": (
+            "韩绝想到雷灵池。\n\n看来还是得利用这些灵池。\n\n"
+            "玉幽峰忽然响起钟声。\n\n曦璇仙子要召见所有弟子。"
+        ),
+        "target_text": (
+            "Hàn Tuyệt nghĩ đến Lôi Linh Trì.\n\n"
+            "Xem ra hắn vẫn phải lợi dụng cái linh trì này.\n\n"
+            "Trên Ngọc U phong bỗng vang chuông.\n\n"
+            "Hi Tuyền tiên tử muốn triệu kiến toàn bộ đệ tử."
+        ),
+    }
+    (run_dir / "selected_samples.json").write_text(
+        json.dumps({"samples": [sample]}, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    delta = {
+        "round": 2,
+        "baseline_score": 90,
+        "memory_score": 83,
+        "score_delta": -7,
+        "sample_deltas": [
+            {
+                "sample_id": "sample_10",
+                "chapter_id": 10,
+                "baseline_score": 90,
+                "memory_score": 83,
+                "delta": -7,
+                "baseline_ratio": 1.05,
+                "memory_ratio": 1.32,
+            }
+        ],
+        "per_chapter_deltas": [
+            {
+                "sample_id": "sample_10",
+                "chapter_id": 10,
+                "baseline_score": 90,
+                "memory_score": 83,
+                "delta": -7,
+                "baseline_ratio": 1.05,
+                "memory_ratio": 1.32,
+            }
+        ],
+        "regressions_over_3": [{"sample_id": "sample_10", "chapter_id": 10, "delta": -7}],
+        "severe_flags": [],
+    }
+    summary = {
+        "schema_version": "approved_memory_validation_summary_v1",
+        "validation_run_id": run_dir.name,
+        "project_slug": "han-jue",
+        "chapters": [10],
+        "provider": "mock",
+        "model": "mock",
+        "approved_memory_ids": [item["id"] for item in approved_memory],
+        "round_results": [delta],
+        "final_decision": "FAIL",
+        "reason": "per_chapter_regression_over_3",
+    }
+    (run_dir / "final_validation_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    (run_dir / "validation_job_state.json").write_text(
+        json.dumps(summary, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    (run_dir / "approved_memory_used.json").write_text(
+        json.dumps({"items": approved_memory}, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    round_dir = run_dir / "round_2"
+    (round_dir / "baseline_outputs" / "sample_10").mkdir(parents=True, exist_ok=True)
+    (round_dir / "memory_outputs" / "sample_10").mkdir(parents=True, exist_ok=True)
+    (round_dir / "baseline_outputs" / "sample_10" / "mock_final.txt").write_text(
+        "Hàn Tuyệt nghĩ đến Lôi Linh Trì. Xem ra vẫn phải tận dụng những linh trì này. "
+        "Trên Ngọc U phong vang chuông. Hi Tuyền tiên tử muốn triệu kiến đệ tử.",
+        encoding="utf-8",
+    )
+    (round_dir / "memory_outputs" / "sample_10" / "mock_final.txt").write_text(
+        "Hàn Tuyệt nghĩ đến Lôi Linh Trì. Xem ra vẫn phải tận dụng mấy linh trì này. "
+        "Có linh trì hỗ trợ, tốc độ tu luyện của hắn mới có thể kéo lên. "
+        "Trên Ngọc U phong vang chuông. Hi Tuyền tiên tử muốn triệu kiến đệ tử.",
+        encoding="utf-8",
+    )
+    (round_dir / "score_delta.json").write_text(
+        json.dumps(delta, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
 def test_ablate_approved_memory_creates_matrix_and_classifications(
     tmp_path: Path,
     monkeypatch,
@@ -469,3 +565,226 @@ def test_approve_mined_memory_candidates_creates_active_memory_and_preserves_uns
     items = parse_json(active_items.output)["data"]["items"]
     created_ids = set(data["created_memory_item_ids"])
     assert created_ids.issubset({item["id"] for item in items})
+
+
+def test_memory_regression_diagnose_ablate_and_rollback_harmful_candidate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    harmful = create_memory(
+        workspace,
+        memory_type="term",
+        source_key="雷灵池",
+        target_text="Lôi Linh Trì",
+        value={
+            "candidate_id": "candidate_c8e5a720bf1b24d0d2d2f69d",
+            "candidate_type": "term_memory",
+            "source_pattern": "雷灵池",
+            "preferred_target": "Lôi Linh Trì",
+            "mining_run_id": "fake_mining",
+        },
+        rules={"preferred_target": "Lôi Linh Trì", "forbidden_variants": ["Lôi linh trì"]},
+    )
+    safe = create_memory(
+        workspace,
+        memory_type="style",
+        source_key="技能",
+        target_text="skills",
+        value={
+            "candidate_id": "candidate_9ac6ad9ee889e2236a0cd82d",
+            "candidate_type": "formatting_rule_memory",
+            "source_pattern": "技能",
+            "preferred_target": "skills",
+            "mining_run_id": "fake_mining",
+        },
+        rules={"preferred_target": "skills", "forbidden_variants": ["kỹ năng"]},
+    )
+    run_dir = make_fake_chapter_10_regression_run(workspace, [harmful, safe])
+
+    diagnosed = runner.invoke(
+        app,
+        [
+            "learn",
+            "diagnose-memory-regression",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--validation-run",
+            str(run_dir),
+            "--chapter",
+            "10",
+            "--json",
+        ],
+    )
+    assert diagnosed.exit_code == 0, diagnosed.output
+    diagnostic = parse_json(diagnosed.output)["data"]
+    assert diagnostic["harmful_candidate_ids"] == ["candidate_c8e5a720bf1b24d0d2d2f69d"]
+    diagnostic_dir = Path(diagnostic["run_dir"])
+    assert (diagnostic_dir / "memory_trigger_trace.json").exists()
+    assert (diagnostic_dir / "prompt_context_diff.md").exists()
+
+    ablated = runner.invoke(
+        app,
+        [
+            "learn",
+            "ablate-memory-regression",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--validation-run",
+            str(run_dir),
+            "--chapter",
+            "10",
+            "--candidate-ids",
+            "candidate_c8e5a720bf1b24d0d2d2f69d,candidate_9ac6ad9ee889e2236a0cd82d",
+            "--json",
+        ],
+    )
+    assert ablated.exit_code == 0, ablated.output
+    ablation = parse_json(ablated.output)["data"]
+    assert ablation["candidate_classifications"]["candidate_c8e5a720bf1b24d0d2d2f69d"] == "harmful"
+    assert "candidate_c8e5a720bf1b24d0d2d2f69d" in ablation["harmful_candidate_ids"]
+    ablation_dir = Path(ablation["run_dir"])
+    assert (ablation_dir / "all_minus_one_report.json").exists()
+    assert (ablation_dir / "safe_subset_recommendation.json").exists()
+
+    rolled_back = runner.invoke(
+        app,
+        [
+            "learn",
+            "rollback-approved-memory",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--candidate-ids",
+            "candidate_c8e5a720bf1b24d0d2d2f69d",
+            "--reason",
+            "chapter 10 regression evidence",
+            "--validation-run",
+            str(run_dir),
+            "--chapter",
+            "10",
+            "--json",
+        ],
+    )
+    assert rolled_back.exit_code == 0, rolled_back.output
+    rollback = parse_json(rolled_back.output)["data"]
+    assert rollback["updated_candidate_ids"] == ["candidate_c8e5a720bf1b24d0d2d2f69d"]
+    rollback_dir = Path(rollback["run_dir"])
+    assert (rollback_dir / "memory_rollback_audit.json").exists()
+    assert (rollback_dir / "memory_rollback_audit.md").exists()
+    assert (rollback_dir / "active_memory_after_rollback.json").exists()
+
+    active_items = runner.invoke(
+        app,
+        ["memory", "list", "--workspace", str(workspace), "--status", "active", "--json"],
+    )
+    assert active_items.exit_code == 0, active_items.output
+    active_ids = {item["id"] for item in parse_json(active_items.output)["data"]["items"]}
+    assert harmful["id"] not in active_ids
+    assert safe["id"] in active_ids
+
+
+def test_active_memory_risk_review_recommends_risky_mined_candidate_rollback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    direct_harmful = create_memory(
+        workspace,
+        memory_type="term",
+        source_key="雷灵池",
+        target_text="Lôi Linh Trì",
+        value={
+            "candidate_id": "candidate_c8e5a720bf1b24d0d2d2f69d",
+            "candidate_type": "term_memory",
+            "source_pattern": "雷灵池",
+            "preferred_target": "Lôi Linh Trì",
+            "mining_run_id": "fake_mining",
+        },
+    )
+    combination_risk = create_memory(
+        workspace,
+        memory_type="term",
+        source_key="玉幽峰",
+        target_text="Ngọc U phong",
+        value={
+            "candidate_id": "candidate_a4d0439dc85a16a2589487f8",
+            "candidate_type": "term_memory",
+            "source_pattern": "玉幽峰",
+            "preferred_target": "Ngọc U phong",
+            "mining_run_id": "fake_mining",
+        },
+    )
+    insufficient = create_memory(
+        workspace,
+        memory_type="style",
+        source_key="技能",
+        target_text="skills",
+        value={
+            "candidate_id": "candidate_9ac6ad9ee889e2236a0cd82d",
+            "candidate_type": "formatting_rule_memory",
+            "source_pattern": "技能",
+            "preferred_target": "skills",
+            "mining_run_id": "fake_mining",
+        },
+    )
+    run_dir = make_fake_chapter_10_regression_run(
+        workspace,
+        [direct_harmful, combination_risk, insufficient],
+    )
+    ablated = runner.invoke(
+        app,
+        [
+            "learn",
+            "ablate-memory-regression",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--validation-run",
+            str(run_dir),
+            "--chapter",
+            "10",
+            "--candidate-ids",
+            ",".join(
+                [
+                    "candidate_c8e5a720bf1b24d0d2d2f69d",
+                    "candidate_a4d0439dc85a16a2589487f8",
+                    "candidate_9ac6ad9ee889e2236a0cd82d",
+                ]
+            ),
+            "--json",
+        ],
+    )
+    assert ablated.exit_code == 0, ablated.output
+
+    reviewed = runner.invoke(
+        app,
+        [
+            "learn",
+            "review-active-memory-risk",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--validation-run",
+            str(run_dir),
+            "--json",
+        ],
+    )
+
+    assert reviewed.exit_code == 0, reviewed.output
+    review = parse_json(reviewed.output)["data"]
+    review_dir = Path(review["run_dir"])
+    assert (review_dir / "active_memory_risk_review.json").exists()
+    assert (review_dir / "negative_evidence_report.md").exists()
+    assert (review_dir / "remaining_mined_candidate_status.md").exists()
+    recommended = set(review["rollback_recommended_candidate_ids"])
+    assert "candidate_c8e5a720bf1b24d0d2d2f69d" in recommended
+    assert "candidate_a4d0439dc85a16a2589487f8" in recommended
+    assert "candidate_9ac6ad9ee889e2236a0cd82d" in recommended

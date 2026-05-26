@@ -1436,6 +1436,34 @@ def _missing_expected_mvp5d6_memory(active_memory: list[dict[str, Any]]) -> dict
     }
 
 
+def _rolled_back_expected_mined_candidate_ids(workspace: Workspace, project: dict[str, Any]) -> set[str]:
+    with connection(workspace.db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, status, scope_json, value_json, confidence_json
+            FROM memory_items
+            WHERE status IN ('deprecated', 'rejected')
+            """
+        ).fetchall()
+    rolled_back: set[str] = set()
+    for row in rows:
+        item = row_to_dict(row, json_fields=("scope_json", "value_json", "confidence_json"))
+        scope = item.get("scope_json") or {}
+        if scope.get("project_id") not in (None, project["id"]):
+            continue
+        if scope.get("project_slug") not in (None, project["slug"]):
+            continue
+        value = item.get("value_json") or {}
+        candidate_id = value.get("candidate_id")
+        if candidate_id in MVP5D6_APPROVED_MINED_CANDIDATE_IDS and (
+            value.get("review_status") == "rejected_after_validation"
+            or value.get("status") == "rejected_after_validation"
+            or (item.get("confidence_json") or {}).get("source") == "mined_memory_candidate"
+        ):
+            rolled_back.add(str(candidate_id))
+    return rolled_back
+
+
 def _write_memory_delta_context(
     run_dir: Path,
     *,
@@ -1515,6 +1543,174 @@ def _validation_prompt(
             ]
         )
     return "\n".join(sections)
+
+
+def _selected_validation_source_text(run_dir: Path) -> str:
+    for name in ("selected_samples.json", "selected_validation_units.json"):
+        path = run_dir / name
+        if not path.exists():
+            continue
+        payload = read_json(path)
+        return "\n\n".join(
+            str(sample.get("source_text") or "")
+            for sample in payload.get("samples", [])
+            if isinstance(sample, dict)
+        )
+    return ""
+
+
+def _is_source_pattern_present(source_text: str, source_pattern: str | None) -> bool:
+    if not source_pattern:
+        return False
+    if any("\u4e00" <= char <= "\u9fff" for char in source_pattern):
+        return source_pattern in source_text
+    return _fold_text(source_pattern) in _fold_text(source_text)
+
+
+def _memory_context_gate(item: dict[str, Any], source_text: str) -> tuple[bool, str | None]:
+    source_pattern = _memory_source_pattern(item)
+    if source_pattern == "技能":
+        panel_match = re.search(r"【[^】]*技能[^】]*】", source_text or "")
+        if not panel_match:
+            return False, "context_gate_failed:skills_requires_system_panel"
+    return True, None
+
+
+def _memory_negative_gate(item: dict[str, Any]) -> tuple[bool, str | None]:
+    value = item.get("value_json") or {}
+    confidence = item.get("confidence_json") or {}
+    blocked_statuses = {
+        "rejected_after_validation",
+        "pending_needs_scoped_review",
+        "harmful",
+        "harmful_only_in_combination",
+        "insufficient_evidence",
+        "pending_review",
+    }
+    for field in ("status", "review_status", "validation_status", "impact_classification"):
+        if str(value.get(field) or "") in blocked_statuses:
+            return False, f"negative_evidence_gate:{field}={value.get(field)}"
+    if str(confidence.get("impact_classification") or "") in blocked_statuses:
+        return False, f"negative_evidence_gate:confidence={confidence.get('impact_classification')}"
+    return True, None
+
+
+def _memory_applicability_rows(
+    *,
+    memory_items: list[dict[str, Any]],
+    source_text: str,
+    phase: str,
+    cap: int = 24,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    included: list[dict[str, Any]] = []
+    for item in memory_items:
+        reasons: list[str] = []
+        include = True
+        if item.get("status") != "active":
+            include = False
+            reasons.append(f"status_gate:{item.get('status')}")
+        source_pattern = _memory_source_pattern(item)
+        if not _is_source_pattern_present(source_text, source_pattern):
+            include = False
+            reasons.append("exact_source_trigger_absent")
+        context_ok, context_reason = _memory_context_gate(item, source_text)
+        if not context_ok:
+            include = False
+            reasons.append(context_reason or "context_gate_failed")
+        negative_ok, negative_reason = _memory_negative_gate(item)
+        if not negative_ok:
+            include = False
+            reasons.append(negative_reason or "negative_evidence_gate")
+        if include and len(included) >= cap:
+            include = False
+            reasons.append("prompt_budget_cap")
+        if include:
+            included.append(item)
+            reasons.append("included")
+        rows.append(
+            {
+                "phase": phase,
+                "memory_id": item.get("id"),
+                "candidate_id": (item.get("value_json") or {}).get("candidate_id"),
+                "memory_type": item.get("memory_type"),
+                "source_pattern": source_pattern,
+                "preferred_target": _memory_preferred_target(item),
+                "status": item.get("status"),
+                "included": include,
+                "reasons": reasons,
+            }
+        )
+    return included, rows
+
+
+def _filter_prompt_memory(
+    run_dir: Path,
+    *,
+    memory_items: list[dict[str, Any]],
+    phase: str,
+) -> list[dict[str, Any]]:
+    source_text = _selected_validation_source_text(run_dir)
+    included, rows = _memory_applicability_rows(
+        memory_items=memory_items,
+        source_text=source_text,
+        phase=phase,
+    )
+    existing_applicability: dict[str, Any] = (
+        read_json(run_dir / "memory_applicability_report.json")
+        if (run_dir / "memory_applicability_report.json").exists()
+        else {
+            "schema_version": "memory_applicability_report_v1",
+            "created_at": utc_now(),
+            "phases": {},
+        }
+    )
+    existing_applicability.setdefault("phases", {})[phase] = {
+        "source_char_count": len(source_text),
+        "input_memory_count": len(memory_items),
+        "included_memory_count": len(included),
+        "excluded_memory_count": len(memory_items) - len(included),
+        "rows": rows,
+    }
+    write_json(run_dir / "memory_applicability_report.json", existing_applicability)
+    filter_report: dict[str, Any] = (
+        read_json(run_dir / "prompt_memory_filter_report.json")
+        if (run_dir / "prompt_memory_filter_report.json").exists()
+        else {
+            "schema_version": "prompt_memory_filter_report_v1",
+            "created_at": utc_now(),
+            "phases": {},
+        }
+    )
+    filter_report.setdefault("phases", {})[phase] = {
+        "included_memory_ids": [item["id"] for item in included],
+        "excluded_memory_ids": [row["memory_id"] for row in rows if not row["included"]],
+        "rows": rows,
+    }
+    write_json(run_dir / "prompt_memory_filter_report.json", filter_report)
+    lines = ["# Memory Applicability Report", ""]
+    for phase_name, payload in existing_applicability.get("phases", {}).items():
+        lines.extend(
+            [
+                f"## {phase_name}",
+                "",
+                f"- Input memory: `{payload.get('input_memory_count')}`",
+                f"- Included: `{payload.get('included_memory_count')}`",
+                f"- Excluded: `{payload.get('excluded_memory_count')}`",
+                "",
+                "| Memory | Candidate | Source | Included | Reasons |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        for row in payload.get("rows", []):
+            lines.append(
+                f"| {row.get('memory_id')} | {row.get('candidate_id') or ''} | "
+                f"{row.get('source_pattern')} | {row.get('included')} | {', '.join(row.get('reasons', []))} |"
+            )
+        lines.append("")
+    _write_text(run_dir / "memory_applicability_report.md", "\n".join(lines) + "\n")
+    _write_text(run_dir / "prompt_memory_filter_report.md", "\n".join(lines).replace("Memory Applicability", "Prompt Memory Filter") + "\n")
+    return included
 
 
 def _planned_stages(rounds: int) -> list[str]:
@@ -2333,20 +2529,19 @@ def replay_approved_memory_validation(workspace: Workspace, *, run: str) -> dict
                     }
                 )
 
-    write_json(
-        run_dir / "failing_samples_report.json",
-        {
-            "schema_version": "approved_memory_validation_failing_samples_replay_v1",
-            "validation_run_id": run_dir.name,
-            "failure_count": len(rows),
-            "root_cause_counts": {
-                cause: sum(1 for row in rows if row["root_cause"] == cause)
-                for cause in sorted({row["root_cause"] for row in rows})
-            },
-            "failures": rows,
-            "created_at": utc_now(),
+    replay_payload = {
+        "schema_version": "approved_memory_validation_failing_samples_replay_v1",
+        "validation_run_id": run_dir.name,
+        "failure_count": len(rows),
+        "root_cause_counts": {
+            cause: sum(1 for row in rows if row["root_cause"] == cause)
+            for cause in sorted({row["root_cause"] for row in rows})
         },
-    )
+        "failures": rows,
+        "created_at": utc_now(),
+    }
+    write_json(run_dir / "failing_samples_report.json", replay_payload)
+    write_json(run_dir / "latest_safety_replay.json", replay_payload)
     with (run_dir / "safety_failure_table.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
@@ -2427,7 +2622,9 @@ def replay_approved_memory_validation(workspace: Workspace, *, run: str) -> dict
                 "",
             ]
         )
-    _write_text(run_dir / "failing_samples_report.md", "\n".join(lines) + "\n")
+    replay_markdown = "\n".join(lines) + "\n"
+    _write_text(run_dir / "failing_samples_report.md", replay_markdown)
+    _write_text(run_dir / "latest_safety_replay.md", replay_markdown)
     targeted = [
         row
         for row in rows
@@ -2544,6 +2741,8 @@ def replay_approved_memory_validation(workspace: Workspace, *, run: str) -> dict
             "csv": str(run_dir / "safety_failure_table.csv"),
             "targeted_json": str(run_dir / "targeted_failure_report.json"),
             "targeted_markdown": str(run_dir / "targeted_failure_report.md"),
+            "latest_safety_json": str(run_dir / "latest_safety_replay.json"),
+            "latest_safety_markdown": str(run_dir / "latest_safety_replay.md"),
             "exclusions": str(run_dir / "validation_candidate_exclusions.json"),
         },
     }
@@ -2988,12 +3187,19 @@ def start_approved_memory_validation(
         _block(run_dir, state, "approved_learning_memory_missing", can_resume=False)
         return _finalize_result(workspace, run_dir, state)
     missing_expected = _missing_expected_mvp5d6_memory(approved_memory)
+    rolled_back_mined = _rolled_back_expected_mined_candidate_ids(workspace, project)
+    missing_expected["missing_mined_candidate_ids"] = [
+        candidate_id
+        for candidate_id in missing_expected["missing_mined_candidate_ids"]
+        if candidate_id not in rolled_back_mined
+    ]
     if missing_expected["missing_original_memory_ids"] or missing_expected["missing_mined_candidate_ids"]:
         write_json(
             run_dir / "active_memory_snapshot_missing_expected.json",
             {
                 "schema_version": "mvp5d6_expected_memory_check_v1",
                 **missing_expected,
+                "rolled_back_mined_candidate_ids": sorted(rolled_back_mined),
                 "created_at": utc_now(),
             },
         )
@@ -3055,11 +3261,22 @@ def resume_approved_memory_validation(
         or state.get("approved_memory_ids", [])
     )
     baseline_memory = [item for item in all_active_memory if item["id"] not in baseline_excluded_ids]
+    memory_pass_memory = list(all_active_memory)
     try:
         if "prepare_dataset" not in state.get("completed_stages", []):
             _mark_stage(run_dir, state, "prepare_dataset", "running")
             _prepare_dataset(run_dir, state)
             _mark_stage(run_dir, state, "prepare_dataset", "completed")
+        baseline_memory = _filter_prompt_memory(
+            run_dir,
+            memory_items=baseline_memory,
+            phase="baseline",
+        )
+        memory_pass_memory = _filter_prompt_memory(
+            run_dir,
+            memory_items=memory_pass_memory,
+            phase="approved_memory",
+        )
         eval_run = Path(read_json(run_dir / "validation_manifest.json")["eval_run_dir"])
         model = str(state.get("active_model") or state.get("model"))
         round_results = list(state.get("round_results", []))
@@ -3125,7 +3342,7 @@ def resume_approved_memory_validation(
                 _mark_stage(run_dir, state, f"round_{round_index}_memory_evaluate", "running")
                 prompt = _validation_prompt(
                     stable_prompt,
-                    included_memory=all_active_memory,
+                    included_memory=memory_pass_memory,
                     excluded_memory=[],
                     phase=f"round_{round_index}_approved_memory",
                 )

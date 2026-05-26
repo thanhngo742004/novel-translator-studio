@@ -5,7 +5,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from nts_core.approved_memory_validation import _chapter_title_target_map
+from nts_core.approved_memory_validation import _chapter_title_target_map, _memory_applicability_rows
 from nts_cli.main import app
 from nts_core.eval_harness import detect_truncated_vietnamese
 
@@ -343,6 +343,64 @@ def test_validate_approved_memory_snapshot_splits_new_mined_candidates(
     assert all(row.get("candidate_id") != "candidate_pending_mined" for row in snapshot["active_memory"])
 
 
+def test_memory_applicability_gates_exact_context_and_negative_evidence() -> None:
+    source_text = "韩绝在玉清宗修炼。这里提到技能，但不是系统面板。"
+    active_relevant = {
+        "id": "memory_relevant",
+        "status": "active",
+        "memory_type": "term",
+        "source_key": "玉清宗",
+        "target_text": "Ngọc Thanh Tông",
+        "value_json": {"candidate_id": "candidate_relevant"},
+        "rules_json": {},
+    }
+    absent = {
+        "id": "memory_absent",
+        "status": "active",
+        "memory_type": "term",
+        "source_key": "雷灵池",
+        "target_text": "Lôi Linh Trì",
+        "value_json": {"candidate_id": "candidate_absent"},
+        "rules_json": {},
+    }
+    unsafe_context = {
+        "id": "memory_skill",
+        "status": "active",
+        "memory_type": "formatting",
+        "source_key": "技能",
+        "target_text": "skills",
+        "value_json": {"candidate_id": "candidate_skill"},
+        "rules_json": {},
+    }
+    negative = {
+        "id": "memory_negative",
+        "status": "active",
+        "memory_type": "term",
+        "source_key": "韩绝",
+        "target_text": "Hàn Tuyệt",
+        "value_json": {
+            "candidate_id": "candidate_negative",
+            "impact_classification": "harmful_only_in_combination",
+        },
+        "rules_json": {},
+    }
+
+    included, rows = _memory_applicability_rows(
+        memory_items=[active_relevant, absent, unsafe_context, negative],
+        source_text=source_text,
+        phase="approved_memory",
+    )
+
+    assert [item["id"] for item in included] == ["memory_relevant"]
+    by_id = {row["memory_id"]: row for row in rows}
+    assert "exact_source_trigger_absent" in by_id["memory_absent"]["reasons"]
+    assert "context_gate_failed:skills_requires_system_panel" in by_id["memory_skill"]["reasons"]
+    assert any(
+        reason.startswith("negative_evidence_gate")
+        for reason in by_id["memory_negative"]["reasons"]
+    )
+
+
 def test_validate_approved_memory_status_command(tmp_path: Path, monkeypatch) -> None:
     workspace = init_workspace(tmp_path, monkeypatch)
     result = validate_command(workspace)
@@ -465,6 +523,8 @@ def test_replay_approved_memory_validation_reports_cached_failures_without_api(
     assert data["failure_count"] >= 1
     assert (run_dir / "failing_samples_report.json").exists()
     assert (run_dir / "failing_samples_report.md").exists()
+    assert (run_dir / "latest_safety_replay.json").exists()
+    assert (run_dir / "latest_safety_replay.md").exists()
     assert (run_dir / "safety_failure_table.csv").exists()
     assert (run_dir / "targeted_failure_report.json").exists()
     assert (run_dir / "targeted_failure_report.md").exists()
