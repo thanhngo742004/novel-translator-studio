@@ -81,6 +81,19 @@ DATASET_DIAGNOSTIC_FILES = (
 DEFAULT_CHAPTER_MATCH_WINDOW = 3
 STRONG_CHAPTER_MATCH_THRESHOLD = 0.75
 TENTATIVE_CHAPTER_MATCH_THRESHOLD = 0.60
+MVP5D6_ORIGINAL_APPROVED_MEMORY_IDS = {
+    "memory_5190e5ee3320419992bc8833ffd45fcc",
+    "memory_ee0e5afb1b8f4180b9d7b1907de1385c",
+    "memory_9ae91c19082341ae85626f5f74e2cf3f",
+    "memory_bc32c4066a624090918af5e0f89ddda7",
+    "memory_160c0cae68964045bdc25b691f469bc4",
+}
+MVP5D6_APPROVED_MINED_CANDIDATE_IDS = {
+    "candidate_a4d0439dc85a16a2589487f8",
+    "candidate_f46deb2e55950a845fcbe4f8",
+    "candidate_c8e5a720bf1b24d0d2d2f69d",
+    "candidate_9ac6ad9ee889e2236a0cd82d",
+}
 
 
 def approved_memory_validation_root(workspace: Workspace) -> Path:
@@ -1304,6 +1317,158 @@ def _approved_learning_memory(workspace: Workspace, project: dict[str, Any]) -> 
         if item.get("layer") == "learning_candidate"
         or (item.get("value_json") or {}).get("learning_run_id")
     ]
+
+
+def _is_mined_approved_memory(item: dict[str, Any]) -> bool:
+    value = item.get("value_json") or {}
+    confidence = item.get("confidence_json") or {}
+    return bool(
+        value.get("mining_run_id")
+        or value.get("candidate_id")
+        or confidence.get("source") == "mined_memory_candidate"
+    )
+
+
+def _memory_source_pattern(item: dict[str, Any]) -> str | None:
+    value = item.get("value_json") or {}
+    return item.get("source_key") or value.get("source_pattern")
+
+
+def _memory_preferred_target(item: dict[str, Any]) -> str | None:
+    value = item.get("value_json") or {}
+    rules = item.get("rules_json") or {}
+    return item.get("target_text") or value.get("preferred_target") or rules.get("preferred_target")
+
+
+def _memory_origin(item: dict[str, Any]) -> str:
+    value = item.get("value_json") or {}
+    if value.get("mining_run_id") or value.get("candidate_id"):
+        return "MVP5D.5 mining"
+    if value.get("learning_run_id"):
+        return "MVP5C learning"
+    return "active_memory"
+
+
+def _memory_provenance(item: dict[str, Any]) -> str | None:
+    value = item.get("value_json") or {}
+    confidence = item.get("confidence_json") or {}
+    return value.get("mining_run_id") or value.get("learning_run_id") or confidence.get("source")
+
+
+def _snapshot_memory_row(item: dict[str, Any]) -> dict[str, Any]:
+    value = item.get("value_json") or {}
+    return {
+        "id": item.get("id"),
+        "candidate_id": value.get("candidate_id"),
+        "memory_type": item.get("memory_type"),
+        "source_pattern": _memory_source_pattern(item),
+        "preferred_target": _memory_preferred_target(item),
+        "status": item.get("status"),
+        "provenance": _memory_provenance(item),
+        "origin": _memory_origin(item),
+        "confidence_score": item.get("confidence_score"),
+    }
+
+
+def _write_active_memory_snapshot(
+    run_dir: Path,
+    *,
+    active_memory: list[dict[str, Any]],
+    baseline_memory: list[dict[str, Any]],
+    memory_pass: list[dict[str, Any]],
+    baseline_excluded: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rows = [_snapshot_memory_row(item) for item in active_memory]
+    baseline_ids = {item["id"] for item in baseline_memory}
+    memory_pass_ids = {item["id"] for item in memory_pass}
+    excluded_ids = {item["id"] for item in baseline_excluded}
+    for row in rows:
+        row["included_in_baseline_pass"] = row["id"] in baseline_ids
+        row["included_in_memory_pass"] = row["id"] in memory_pass_ids
+        row["excluded_from_baseline"] = row["id"] in excluded_ids
+    payload = {
+        "schema_version": "approved_memory_active_snapshot_v1",
+        "created_at": utc_now(),
+        "active_memory_count": len(rows),
+        "baseline_memory_count": len(baseline_memory),
+        "memory_pass_count": len(memory_pass),
+        "baseline_excluded_count": len(baseline_excluded),
+        "active_memory": rows,
+    }
+    write_json(run_dir / "active_memory_snapshot.json", payload)
+    lines = [
+        "# Active Memory Snapshot",
+        "",
+        f"- Active memory count: `{len(rows)}`",
+        f"- Baseline memory count: `{len(baseline_memory)}`",
+        f"- Memory pass count: `{len(memory_pass)}`",
+        f"- Baseline excluded count: `{len(baseline_excluded)}`",
+        "",
+        "| ID | Candidate | Type | Source | Preferred | Status | Origin | Baseline | Memory pass |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row.get('id')} | {row.get('candidate_id') or ''} | {row.get('memory_type')} | "
+            f"{row.get('source_pattern')} | {row.get('preferred_target')} | {row.get('status')} | "
+            f"{row.get('origin')} | {row.get('included_in_baseline_pass')} | {row.get('included_in_memory_pass')} |"
+        )
+    _write_text(run_dir / "active_memory_snapshot.md", "\n".join(lines) + "\n")
+    return payload
+
+
+def _missing_expected_mvp5d6_memory(active_memory: list[dict[str, Any]]) -> dict[str, list[str]]:
+    memory_ids = {str(item.get("id")) for item in active_memory}
+    candidate_ids = {
+        str((item.get("value_json") or {}).get("candidate_id"))
+        for item in active_memory
+        if (item.get("value_json") or {}).get("candidate_id")
+    }
+    has_any_expected = bool(
+        memory_ids & MVP5D6_ORIGINAL_APPROVED_MEMORY_IDS
+        or candidate_ids & MVP5D6_APPROVED_MINED_CANDIDATE_IDS
+    )
+    if not has_any_expected:
+        return {"missing_original_memory_ids": [], "missing_mined_candidate_ids": []}
+    return {
+        "missing_original_memory_ids": sorted(MVP5D6_ORIGINAL_APPROVED_MEMORY_IDS - memory_ids),
+        "missing_mined_candidate_ids": sorted(MVP5D6_APPROVED_MINED_CANDIDATE_IDS - candidate_ids),
+    }
+
+
+def _write_memory_delta_context(
+    run_dir: Path,
+    *,
+    approved_memory: list[dict[str, Any]],
+    baseline_memory: list[dict[str, Any]],
+    mined_memory: list[dict[str, Any]],
+    baseline_excluded: list[dict[str, Any]],
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": "approved_memory_delta_context_v1",
+        "created_at": utc_now(),
+        "comparison_mode": (
+            "newly_mined_memory_delta"
+            if mined_memory
+            else "legacy_all_approved_memory_delta"
+        ),
+        "approved_memory_ids": [item["id"] for item in approved_memory],
+        "baseline_memory_ids": [item["id"] for item in baseline_memory],
+        "newly_approved_mined_memory_ids": [item["id"] for item in mined_memory],
+        "newly_approved_mined_candidate_ids": [
+            (item.get("value_json") or {}).get("candidate_id")
+            for item in mined_memory
+            if (item.get("value_json") or {}).get("candidate_id")
+        ],
+        "baseline_excluded_memory_ids": [item["id"] for item in baseline_excluded],
+        "baseline_excluded_candidate_ids": [
+            (item.get("value_json") or {}).get("candidate_id")
+            for item in baseline_excluded
+            if (item.get("value_json") or {}).get("candidate_id")
+        ],
+    }
+    write_json(run_dir / "memory_delta_context.json", payload)
+    return payload
 
 
 def _memory_prompt_section(memory_items: list[dict[str, Any]], *, title: str) -> str:
@@ -2748,6 +2913,14 @@ def start_approved_memory_validation(
     project = get_project_by_slug(workspace, project_slug)
     stable_prompt = load_approved_stable_prompt(workspace)
     approved_memory = _approved_learning_memory(workspace, project)
+    all_active_memory = _active_memory_rows(workspace, project["id"], project["slug"])
+    mined_approved_memory = [item for item in approved_memory if _is_mined_approved_memory(item)]
+    baseline_excluded_memory = mined_approved_memory if mined_approved_memory else approved_memory
+    baseline_memory = [
+        item
+        for item in all_active_memory
+        if item["id"] not in {excluded["id"] for excluded in baseline_excluded_memory}
+    ]
     run_dir = (output_dir.resolve() if output_dir else new_validation_run_dir(workspace, project_slug))
     run_dir.mkdir(parents=True, exist_ok=True)
     state = _initial_state(
@@ -2774,15 +2947,62 @@ def start_approved_memory_validation(
         allow_skip_unsafe_chapter_sample=allow_skip_unsafe_chapter_sample,
     )
     state["approved_memory_ids"] = [item["id"] for item in approved_memory]
+    state["baseline_excluded_memory_ids"] = [item["id"] for item in baseline_excluded_memory]
+    state["newly_approved_mined_memory_ids"] = [item["id"] for item in mined_approved_memory]
+    state["newly_approved_mined_candidate_ids"] = [
+        (item.get("value_json") or {}).get("candidate_id")
+        for item in mined_approved_memory
+        if (item.get("value_json") or {}).get("candidate_id")
+    ]
     state["stable_prompt_path"] = stable_prompt.prompt_path
     _init_validation_files(run_dir, state)
     write_json(run_dir / "approved_memory_used.json", {"items": approved_memory})
     write_json(
         run_dir / "baseline_memory_exclusion.json",
-        {"excluded_memory_ids": state["approved_memory_ids"], "excluded_items": approved_memory},
+        {
+            "excluded_memory_ids": state["baseline_excluded_memory_ids"],
+            "excluded_candidate_ids": state["newly_approved_mined_candidate_ids"],
+            "excluded_items": baseline_excluded_memory,
+            "comparison_mode": (
+                "newly_mined_memory_delta"
+                if mined_approved_memory
+                else "legacy_all_approved_memory_delta"
+            ),
+        },
+    )
+    _write_memory_delta_context(
+        run_dir,
+        approved_memory=approved_memory,
+        baseline_memory=baseline_memory,
+        mined_memory=mined_approved_memory,
+        baseline_excluded=baseline_excluded_memory,
+    )
+    _write_active_memory_snapshot(
+        run_dir,
+        active_memory=all_active_memory,
+        baseline_memory=baseline_memory,
+        memory_pass=all_active_memory,
+        baseline_excluded=baseline_excluded_memory,
     )
     if not approved_memory:
         _block(run_dir, state, "approved_learning_memory_missing", can_resume=False)
+        return _finalize_result(workspace, run_dir, state)
+    missing_expected = _missing_expected_mvp5d6_memory(approved_memory)
+    if missing_expected["missing_original_memory_ids"] or missing_expected["missing_mined_candidate_ids"]:
+        write_json(
+            run_dir / "active_memory_snapshot_missing_expected.json",
+            {
+                "schema_version": "mvp5d6_expected_memory_check_v1",
+                **missing_expected,
+                "created_at": utc_now(),
+            },
+        )
+        _block(
+            run_dir,
+            state,
+            "expected_approved_memory_missing",
+            can_resume=False,
+        )
         return _finalize_result(workspace, run_dir, state)
     if dry_run:
         state["status"] = "dry_run"
@@ -2829,7 +3049,12 @@ def resume_approved_memory_validation(
         str(state["project_id"]),
         str(state["project_slug"]),
     )
-    baseline_memory = [item for item in all_active_memory if item["id"] not in set(state.get("approved_memory_ids", []))]
+    baseline_excluded_ids = set(
+        state.get("baseline_excluded_memory_ids")
+        or [item.get("id") for item in baseline_excluded]
+        or state.get("approved_memory_ids", [])
+    )
+    baseline_memory = [item for item in all_active_memory if item["id"] not in baseline_excluded_ids]
     try:
         if "prepare_dataset" not in state.get("completed_stages", []):
             _mark_stage(run_dir, state, "prepare_dataset", "running")

@@ -249,6 +249,100 @@ def test_validate_approved_memory_checkpoint_resume_and_memory_sets(
     assert excluded["excluded_memory_ids"] == [used["items"][0]["id"]]
 
 
+def test_validate_approved_memory_snapshot_splits_new_mined_candidates(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    mined = runner.invoke(
+        app,
+        [
+            "memory",
+            "create",
+            "--workspace",
+            str(workspace),
+            "--type",
+            "term",
+            "--status",
+            "active",
+            "--layer",
+            "learning_candidate",
+            "--project",
+            "han-jue",
+            "--source-key",
+            "雷灵池",
+            "--target-text",
+            "Lôi Linh Trì",
+            "--value-json",
+            json.dumps(
+                {
+                    "candidate_id": "candidate_test_mined",
+                    "candidate_type": "term_memory",
+                    "mining_run_id": "test_mining_run",
+                    "source_pattern": "雷灵池",
+                    "preferred_target": "Lôi Linh Trì",
+                    "review_status": "approved_by_human",
+                },
+                ensure_ascii=False,
+            ),
+            "--confidence-score",
+            "0.9",
+            "--json",
+        ],
+    )
+    assert mined.exit_code == 0, mined.output
+    pending = runner.invoke(
+        app,
+        [
+            "memory",
+            "create",
+            "--workspace",
+            str(workspace),
+            "--type",
+            "term",
+            "--status",
+            "pending",
+            "--layer",
+            "learning_candidate",
+            "--project",
+            "han-jue",
+            "--source-key",
+            "pending_mined",
+            "--target-text",
+            "Pending mined",
+            "--value-json",
+            json.dumps(
+                {
+                    "candidate_id": "candidate_pending_mined",
+                    "mining_run_id": "test_mining_run",
+                },
+                ensure_ascii=False,
+            ),
+            "--confidence-score",
+            "0.9",
+            "--json",
+        ],
+    )
+    assert pending.exit_code == 0, pending.output
+
+    result = validate_command(workspace, extra=["--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    run_dir = Path(parse_json(result.output)["data"]["run_dir"])
+    snapshot = json.loads((run_dir / "active_memory_snapshot.json").read_text(encoding="utf-8"))
+    context = json.loads((run_dir / "memory_delta_context.json").read_text(encoding="utf-8"))
+    excluded = json.loads((run_dir / "baseline_memory_exclusion.json").read_text(encoding="utf-8"))
+    mined_row = next(row for row in snapshot["active_memory"] if row.get("candidate_id") == "candidate_test_mined")
+    original_row = next(row for row in snapshot["active_memory"] if row.get("source_pattern") == "term_source")
+    assert mined_row["origin"] == "MVP5D.5 mining"
+    assert mined_row["included_in_baseline_pass"] is False
+    assert mined_row["included_in_memory_pass"] is True
+    assert original_row["included_in_baseline_pass"] is True
+    assert "candidate_test_mined" in context["newly_approved_mined_candidate_ids"]
+    assert "candidate_test_mined" in excluded["excluded_candidate_ids"]
+    assert all(row.get("candidate_id") != "candidate_pending_mined" for row in snapshot["active_memory"])
+
+
 def test_validate_approved_memory_status_command(tmp_path: Path, monkeypatch) -> None:
     workspace = init_workspace(tmp_path, monkeypatch)
     result = validate_command(workspace)
