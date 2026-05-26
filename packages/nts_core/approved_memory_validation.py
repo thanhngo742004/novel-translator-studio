@@ -9,6 +9,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
+from nts_core.dictionary import build_dictionary_prompt_support, load_project_dictionary
 from nts_core.eval_harness import (
     ALIGNMENT_QUALITY_THRESHOLD,
     apply_translation_units,
@@ -1528,10 +1529,16 @@ def _validation_prompt(
     included_memory: list[dict[str, Any]],
     excluded_memory: list[dict[str, Any]],
     phase: str,
+    dictionary_block: str | None = None,
 ) -> str:
     sections = [
         stable_prompt.prompt_text,
         "",
+    ]
+    if dictionary_block:
+        sections.extend([dictionary_block, ""])
+    sections.extend(
+        [
         "Approved-memory validation mode:",
         "- Translate with the approved stable prompt.",
         "- Preserve concise Vietnamese webnovel style.",
@@ -1539,7 +1546,8 @@ def _validation_prompt(
         f"- Validation phase: {phase}.",
         "",
         _memory_prompt_section(included_memory, title="Active approved memory supplied to this phase:"),
-    ]
+        ]
+    )
     if excluded_memory:
         sections.extend(
             [
@@ -1550,6 +1558,99 @@ def _validation_prompt(
             ]
         )
     return "\n".join(sections)
+
+
+def _dictionary_prompt_empty_context(project_slug: str, source_text: str) -> dict[str, Any]:
+    source_hash = sha256_text(source_text)
+    return {
+        "schema_version": "dictionary_prompt_context_bundle_v1",
+        "project_slug": project_slug,
+        "source_sha256": source_hash,
+        "block_text": "",
+        "block_rendered": False,
+        "selected_hits": [],
+        "dropped_hits": [],
+        "excluded_pending_rejected_entries": [],
+        "budget_report": {
+            "schema_version": "dictionary_prompt_budget_report_v1",
+            "max_dictionary_entries": 0,
+            "max_dictionary_chars": 0,
+            "eligible_hit_count": 0,
+            "selected_hit_count": 0,
+            "dropped_hit_count": 0,
+            "support_chars": 0,
+            "block_rendered": False,
+        },
+        "retrieval_report": {
+            "schema_version": "dictionary_prompt_retrieval_report_v1",
+            "project_slug": project_slug,
+            "exact_source_match_required": True,
+            "active_approved_only": True,
+            "selected_hits": [],
+            "dropped_hits": [],
+            "excluded_pending_rejected_entries": [],
+        },
+    }
+
+
+def _read_prompt_artifact(path: Path, schema_version: str) -> dict[str, Any]:
+    if path.exists():
+        return read_json(path)
+    return {"schema_version": schema_version, "created_at": utc_now(), "phases": {}}
+
+
+def _record_dictionary_prompt_artifacts(
+    run_dir: Path,
+    *,
+    phase: str,
+    sample: dict[str, Any],
+    context: dict[str, Any],
+    prompt_text: str,
+) -> None:
+    sample_id = str(sample.get("sample_id") or "")
+    chapter_id = sample.get("chapter_id")
+    prompt_sha = sha256_text(prompt_text)
+    context_row = {
+        "source_chunk_id": sample_id,
+        "chapter_id": chapter_id,
+        "source_sha256": context.get("source_sha256"),
+        "block_rendered": context.get("block_rendered", False),
+        "dictionary_hits_selected": context.get("selected_hits", []),
+        "dictionary_hits_dropped_due_budget": context.get("dropped_hits", []),
+        "pending_rejected_entries_excluded": context.get("excluded_pending_rejected_entries", []),
+        "prompt_sha256": prompt_sha,
+    }
+    context_path = run_dir / "prompt_context_bundle.json"
+    budget_path = run_dir / "prompt_budget_report.json"
+    retrieval_path = run_dir / "prompt_retrieval_report.json"
+    context_payload = _read_prompt_artifact(context_path, "dictionary_prompt_context_bundle_collection_v1")
+    budget_payload = _read_prompt_artifact(budget_path, "dictionary_prompt_budget_report_collection_v1")
+    retrieval_payload = _read_prompt_artifact(retrieval_path, "dictionary_prompt_retrieval_report_collection_v1")
+    context_payload.setdefault("phases", {}).setdefault(phase, {})[sample_id] = context_row
+    budget_row = dict(context.get("budget_report") or {})
+    budget_row.update({"source_chunk_id": sample_id, "chapter_id": chapter_id, "prompt_sha256": prompt_sha})
+    budget_payload.setdefault("phases", {}).setdefault(phase, {})[sample_id] = budget_row
+    retrieval_row = dict(context.get("retrieval_report") or {})
+    retrieval_row.update({"source_chunk_id": sample_id, "chapter_id": chapter_id, "prompt_sha256": prompt_sha})
+    retrieval_payload.setdefault("phases", {}).setdefault(phase, {})[sample_id] = retrieval_row
+    write_json(context_path, context_payload)
+    write_json(budget_path, budget_payload)
+    write_json(retrieval_path, retrieval_payload)
+    prompt_path = run_dir / "prompt_used.md"
+    existing = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else "# Prompt Samples\n\n"
+    marker = f"## {phase} / {sample_id}\n"
+    section = (
+        marker
+        + "\n"
+        + f"- Chapter: `{chapter_id}`\n"
+        + f"- Dictionary block rendered: `{context.get('block_rendered', False)}`\n"
+        + f"- Prompt sha256: `{prompt_sha}`\n\n"
+        + "```text\n"
+        + prompt_text.replace("```", "'''")
+        + "\n```\n\n"
+    )
+    if marker not in existing:
+        prompt_path.write_text(existing + section, encoding="utf-8")
 
 
 def _selected_validation_source_text(run_dir: Path) -> str:
@@ -1785,10 +1886,15 @@ def _filter_prompt_memory(
 def _validation_prompts_by_sample(
     run_dir: Path,
     *,
+    workspace: Workspace | None = None,
     stable_prompt: StablePromptRecord,
     memory_items: list[dict[str, Any]],
     excluded_memory: list[dict[str, Any]],
     phase: str,
+    dictionary_enabled: bool = False,
+    dictionary_max_entries: int = 8,
+    dictionary_max_chars: int = 500,
+    emit_prompt_artifacts: bool = False,
 ) -> dict[str, str]:
     samples_path = run_dir / "selected_samples.json"
     if not samples_path.exists():
@@ -1814,12 +1920,37 @@ def _validation_prompts_by_sample(
             source_text=str(sample.get("source_text") or ""),
             chapters=chapters,
         )
-        prompts[sample_id] = _validation_prompt(
+        source_text = str(sample.get("source_text") or "")
+        dictionary_context = (
+            build_dictionary_prompt_support(
+                workspace,
+                str(read_json(run_dir / "validation_job_state.json").get("project_slug") or ""),
+                source_text,
+                max_entries=dictionary_max_entries,
+                max_chars=dictionary_max_chars,
+            )
+            if dictionary_enabled and workspace is not None
+            else _dictionary_prompt_empty_context(
+                str(read_json(run_dir / "validation_job_state.json").get("project_slug") or ""),
+                source_text,
+            )
+        )
+        prompt = _validation_prompt(
             stable_prompt,
             included_memory=included,
             excluded_memory=excluded_memory,
             phase=f"{phase}:{sample_id}",
+            dictionary_block=dictionary_context.get("block_text") if dictionary_enabled else None,
         )
+        if dictionary_enabled or emit_prompt_artifacts:
+            _record_dictionary_prompt_artifacts(
+                run_dir,
+                phase=f"{phase}:{sample_id}",
+                sample=sample,
+                context=dictionary_context,
+                prompt_text=prompt,
+            )
+        prompts[sample_id] = prompt
     return prompts
 
 
@@ -1938,6 +2069,10 @@ def _initial_state(
     candidate_ablation_top_n: int,
     prefer_no_compression_window: bool,
     allow_skip_unsafe_chapter_sample: bool,
+    use_approved_dictionary: bool,
+    dictionary_max_entries: int,
+    dictionary_max_chars: int,
+    emit_prompt_artifacts: bool,
 ) -> dict[str, Any]:
     selected_chapters = parse_chapter_selection(chapters)
     return {
@@ -1970,6 +2105,11 @@ def _initial_state(
         "candidate_ablation_top_n": candidate_ablation_top_n,
         "prefer_no_compression_window": prefer_no_compression_window,
         "allow_skip_unsafe_chapter_sample": allow_skip_unsafe_chapter_sample,
+        "use_approved_dictionary": use_approved_dictionary,
+        "dictionary_max_entries": dictionary_max_entries,
+        "dictionary_max_chars": dictionary_max_chars,
+        "emit_prompt_artifacts": emit_prompt_artifacts,
+        "comparison_mode": "approved_dictionary_prompt_support" if use_approved_dictionary else "approved_memory",
         "current_stage": "initialized",
         "current_round": 0,
         "completed_stages": [],
@@ -2860,16 +3000,17 @@ def replay_approved_memory_validation(workspace: Workspace, *, run: str) -> dict
 
 def _write_round_comparison(round_dir: Path, round_index: int, delta: dict[str, Any]) -> None:
     write_json(round_dir / "score_delta.json", delta)
+    comparison_label = "Dictionary" if delta.get("comparison_mode") == "approved_dictionary_prompt_support" else "Memory"
     lines = [
         f"# Round {round_index} Comparison",
         "",
         f"- Baseline score: `{delta['baseline_score']}`",
-        f"- Approved-memory score: `{delta['memory_score']}`",
+        f"- {comparison_label} score: `{delta['memory_score']}`",
         f"- Delta: `{delta['score_delta']}`",
         f"- Regressions > 3: `{len(delta['regressions_over_3'])}`",
         f"- Severe flags: `{len(delta['severe_flags'])}`",
         "",
-        "| Sample | Chapter | Baseline | Memory | Delta |",
+        f"| Sample | Chapter | Baseline | {comparison_label} | Delta |",
         "| --- | --- | ---: | ---: | ---: |",
     ]
     for row in delta["sample_deltas"]:
@@ -2878,6 +3019,185 @@ def _write_round_comparison(round_dir: Path, round_index: int, delta: dict[str, 
             f"{row.get('memory_score')} | {row['delta']} |"
         )
     _write_text(round_dir / "comparison_report.md", "\n".join(lines) + "\n")
+
+
+def _flatten_prompt_phase_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for phase, samples in (payload.get("phases") or {}).items():
+        if not isinstance(samples, dict):
+            continue
+        for sample_id, row in samples.items():
+            if isinstance(row, dict):
+                rows.append({"phase": phase, "sample_id": sample_id, **row})
+    return rows
+
+
+def _write_dictionary_prompt_review_package(run_dir: Path, state: dict[str, Any]) -> str | None:
+    if not state.get("use_approved_dictionary"):
+        return None
+    review_dir = (
+        Path(state["workspace"])
+        / "artifacts"
+        / "dictionaries"
+        / str(state["validation_run_id"])
+        / "dictionary_prompt_review"
+    )
+    review_dir.mkdir(parents=True, exist_ok=True)
+    context_payload = read_json(run_dir / "prompt_context_bundle.json") if (run_dir / "prompt_context_bundle.json").exists() else {"phases": {}}
+    budget_payload = read_json(run_dir / "prompt_budget_report.json") if (run_dir / "prompt_budget_report.json").exists() else {"phases": {}}
+    retrieval_payload = read_json(run_dir / "prompt_retrieval_report.json") if (run_dir / "prompt_retrieval_report.json").exists() else {"phases": {}}
+    dictionary_used = read_json(run_dir / "approved_dictionary_used.json") if (run_dir / "approved_dictionary_used.json").exists() else {"entry_count": 0, "entries": []}
+    context_rows = _flatten_prompt_phase_rows(context_payload)
+    budget_rows = _flatten_prompt_phase_rows(budget_payload)
+    retrieval_rows = _flatten_prompt_phase_rows(retrieval_payload)
+    selected_rows: list[dict[str, Any]] = []
+    dropped_rows: list[dict[str, Any]] = []
+    for row in context_rows:
+        for hit in row.get("dictionary_hits_selected", []) or []:
+            selected_rows.append(
+                {
+                    "phase": row.get("phase"),
+                    "sample_id": row.get("sample_id"),
+                    "chapter_id": row.get("chapter_id"),
+                    **hit,
+                }
+            )
+        for hit in row.get("dictionary_hits_dropped_due_budget", []) or []:
+            dropped_rows.append(
+                {
+                    "phase": row.get("phase"),
+                    "sample_id": row.get("sample_id"),
+                    "chapter_id": row.get("chapter_id"),
+                    **hit,
+                }
+            )
+    unique_used = {
+        str(row.get("entry_id")): row
+        for row in selected_rows
+        if row.get("entry_id")
+    }
+    rounds = state.get("round_results", [])
+    severe_count = sum(len(row.get("severe_flags", []) or []) for row in rounds)
+    regressions = [
+        regression
+        for row in rounds
+        for regression in row.get("regressions_over_3", []) or []
+    ]
+    unsafe_count = sum(
+        1
+        for row in rounds
+        for flag in row.get("severe_flags", []) or []
+        if flag.get("reason") == "unsafe_compression"
+    )
+    truncation_count = sum(
+        1
+        for row in rounds
+        for flag in row.get("severe_flags", []) or []
+        if flag.get("reason") == "truncation"
+    )
+    with (review_dir / "selected_dictionary_hits.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "phase",
+                "sample_id",
+                "chapter_id",
+                "entry_id",
+                "source_text",
+                "target_text",
+                "entry_type",
+                "confidence",
+            ],
+        )
+        writer.writeheader()
+        for row in selected_rows:
+            writer.writerow({field: row.get(field, "") for field in writer.fieldnames})
+    with (review_dir / "dropped_dictionary_hits.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "phase",
+                "sample_id",
+                "chapter_id",
+                "entry_id",
+                "source_text",
+                "target_text",
+                "entry_type",
+                "confidence",
+                "drop_reason",
+            ],
+        )
+        writer.writeheader()
+        for row in dropped_rows:
+            writer.writerow({field: row.get(field, "") for field in writer.fieldnames})
+    round_lines = [
+        "# Validation Rounds Summary",
+        "",
+        "| Round | Baseline | Dictionary | Delta |",
+        "| ---: | ---: | ---: | ---: |",
+    ]
+    for row in rounds:
+        round_lines.append(
+            f"| {row.get('round')} | {row.get('baseline_score')} | {row.get('memory_score')} | {row.get('score_delta')} |"
+        )
+    _write_text(review_dir / "validation_rounds_summary.md", "\n".join(round_lines) + "\n")
+    _write_text(
+        review_dir / "dictionary_effect_summary.md",
+        "# Dictionary Effect Summary\n\n"
+        f"- Approved dictionary entries: `{dictionary_used.get('entry_count', 0)}`\n"
+        f"- Entries used in validation: `{len(unique_used)}`\n"
+        f"- Selected hit rows: `{len(selected_rows)}`\n"
+        f"- Dropped hit rows: `{len(dropped_rows)}`\n"
+        f"- Final decision: `{state.get('final_decision')}`\n"
+        f"- Last error: `{state.get('last_error')}`\n",
+    )
+    budget_lines = ["# Prompt Budget Summary", ""]
+    for row in budget_rows[:80]:
+        budget_lines.append(
+            "- "
+            f"{row.get('phase')} / {row.get('sample_id')}: "
+            f"selected={row.get('selected_hit_count', 0)}, "
+            f"dropped={row.get('dropped_hit_count', 0)}, "
+            f"chars={row.get('support_chars', 0)}"
+        )
+    _write_text(review_dir / "prompt_budget_summary.md", "\n".join(budget_lines) + "\n")
+    retrieval_lines = ["# Prompt Retrieval Examples", ""]
+    for row in retrieval_rows[:12]:
+        retrieval_lines.append(f"## {row.get('phase')} / {row.get('sample_id')}")
+        for hit in row.get("selected_hits", []) or []:
+            retrieval_lines.append(f"- {hit.get('source_text')} => {hit.get('target_text')}")
+        if not row.get("selected_hits"):
+            retrieval_lines.append("- No dictionary hit rendered.")
+        retrieval_lines.append("")
+    _write_text(review_dir / "prompt_retrieval_examples.md", "\n".join(retrieval_lines) + "\n")
+    prompt_samples = (run_dir / "prompt_used.md").read_text(encoding="utf-8") if (run_dir / "prompt_used.md").exists() else "# Prompt Samples\n\nNo prompt artifacts were emitted.\n"
+    _write_text(review_dir / "prompt_samples.md", prompt_samples)
+    human_lines = [
+        "# Dictionary Prompt Human Review Summary",
+        "",
+        f"- Approved dictionary entry count: `{dictionary_used.get('entry_count', 0)}`",
+        f"- Dictionary entries used in validation: `{len(unique_used)}`",
+        f"- Top exact hits: `{', '.join(row.get('source_text', '') for row in list(unique_used.values())[:12])}`",
+    ]
+    for row in rounds:
+        human_lines.append(
+            f"- Round {row.get('round')}: baseline `{row.get('baseline_score')}`, dictionary `{row.get('memory_score')}`, delta `{row.get('score_delta')}`"
+        )
+    human_lines.extend(
+        [
+            f"- Severe flag count: `{severe_count}`",
+            f"- Unsafe compression count: `{unsafe_count}`",
+            f"- Truncation count: `{truncation_count}`",
+            f"- Chapter regressions over 3: `{len(regressions)}`",
+            f"- Recommendation: `{'PROCEED_TO_FULL_MVP5H' if state.get('final_decision') == 'PASS' else 'REVIEW_DICTIONARY_PROMPT_EFFECT'}`",
+            "",
+            "No pending or rejected dictionary candidates are rendered by the prompt support block.",
+            "Raw NLP cache is not injected into prompts.",
+        ]
+    )
+    _write_text(review_dir / "human_review_summary.md", "\n".join(human_lines) + "\n")
+    state["dictionary_prompt_review_path"] = str(review_dir)
+    return str(review_dir)
 
 
 def _mock_memory_report(report: dict[str, Any], model: str, round_index: int) -> dict[str, Any]:
@@ -3046,6 +3366,9 @@ def _validation_result(run_dir: Path, state: dict[str, Any], task_run_id: str | 
         "api_calls_used": state.get("api_calls_used", 0),
         "fallback_model_used": state.get("fallback_model_used", False),
         "approved_memory_ids": state.get("approved_memory_ids", []),
+        "comparison_mode": state.get("comparison_mode"),
+        "use_approved_dictionary": bool(state.get("use_approved_dictionary")),
+        "dictionary_prompt_review_path": state.get("dictionary_prompt_review_path"),
         "last_error": state.get("last_error"),
         "task_run_id": task_run_id,
     }
@@ -3106,6 +3429,9 @@ def _fail_validation(run_dir: Path, state: dict[str, Any], reason: str) -> None:
 
 def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -> None:
     rounds = state.get("round_results", [])
+    comparison_mode = state.get("comparison_mode", "approved_memory")
+    comparison_label = "Dictionary" if comparison_mode == "approved_dictionary_prompt_support" else "Memory"
+    review_path = _write_dictionary_prompt_review_package(run_dir, state)
     final_summary = {
         "schema_version": "approved_memory_validation_summary_v1",
         "validation_run_id": state["validation_run_id"],
@@ -3117,6 +3443,9 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
         "fallback_model_used": state.get("fallback_model_used", False),
         "stable_prompt_path": state.get("stable_prompt_path"),
         "approved_memory_ids": state.get("approved_memory_ids", []),
+        "comparison_mode": comparison_mode,
+        "use_approved_dictionary": bool(state.get("use_approved_dictionary")),
+        "dictionary_prompt_review_path": review_path,
         "round_results": rounds,
         "final_decision": state.get("final_decision"),
         "reason": reason,
@@ -3131,10 +3460,12 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
         f"- Fallback used: `{state.get('fallback_model_used', False)}`",
         f"- Stable prompt path: `{state.get('stable_prompt_path')}`",
         f"- Approved memory IDs: `{', '.join(state.get('approved_memory_ids', []))}`",
+        f"- Comparison mode: `{comparison_mode}`",
+        f"- Dictionary prompt review: `{review_path}`",
         f"- Final decision: `{state.get('final_decision')}`",
         f"- Reason: `{reason}`",
         "",
-        "| Round | Baseline | Memory | Delta |",
+        f"| Round | Baseline | {comparison_label} | Delta |",
         "| ---: | ---: | ---: | ---: |",
     ]
     for row in rounds:
@@ -3143,14 +3474,19 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
         )
     _write_text(run_dir / "final_validation_summary.md", "\n".join(lines) + "\n")
     _write_text(
-        run_dir / "memory_effect_report.md",
-        "# Memory Effect Report\n\n"
+        run_dir / ("dictionary_effect_report.md" if comparison_label == "Dictionary" else "memory_effect_report.md"),
+        f"# {comparison_label} Effect Report\n\n"
         + "\n".join(
             f"- Round {row['round']}: delta={row['score_delta']}, terminology_delta={row.get('terminology_error_delta')}"
             for row in rounds
         )
         + "\n",
     )
+    if comparison_label == "Dictionary":
+        _write_text(
+            run_dir / "memory_effect_report.md",
+            "# Memory Effect Report\n\nDictionary prompt support mode used; see dictionary_effect_report.md.\n",
+        )
     regressions = [
         regression
         for row in rounds
@@ -3186,6 +3522,11 @@ def _final_decision(state: dict[str, Any], *, require_consecutive_improvement: b
     return "PASS", "consecutive_rounds_improved"
 
 
+def _state_min_improvement(state: dict[str, Any]) -> float:
+    value = state.get("min_improvement")
+    return 1.0 if value is None else float(value)
+
+
 def start_approved_memory_validation(
     workspace: Workspace,
     *,
@@ -3211,6 +3552,10 @@ def start_approved_memory_validation(
     candidate_ablation_top_n: int = 5,
     prefer_no_compression_window: bool = True,
     allow_skip_unsafe_chapter_sample: bool = False,
+    use_approved_dictionary: bool = False,
+    dictionary_max_entries: int = 8,
+    dictionary_max_chars: int = 500,
+    emit_prompt_artifacts: bool = False,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
         raise ValueError("--use-stable-prompt is required.")
@@ -3225,13 +3570,19 @@ def start_approved_memory_validation(
     stable_prompt = load_approved_stable_prompt(workspace)
     approved_memory = _approved_learning_memory(workspace, project)
     all_active_memory = _active_memory_rows(workspace, project["id"], project["slug"])
+    approved_dictionary_entries = load_project_dictionary(workspace, project_slug) if use_approved_dictionary else []
     mined_approved_memory = [item for item in approved_memory if _is_mined_approved_memory(item)]
-    baseline_excluded_memory = mined_approved_memory if mined_approved_memory else approved_memory
-    baseline_memory = [
-        item
-        for item in all_active_memory
-        if item["id"] not in {excluded["id"] for excluded in baseline_excluded_memory}
-    ]
+    if use_approved_dictionary:
+        baseline_excluded_memory = []
+        baseline_memory = list(all_active_memory)
+        min_improvement = 0.0
+    else:
+        baseline_excluded_memory = mined_approved_memory if mined_approved_memory else approved_memory
+        baseline_memory = [
+            item
+            for item in all_active_memory
+            if item["id"] not in {excluded["id"] for excluded in baseline_excluded_memory}
+        ]
     run_dir = (output_dir.resolve() if output_dir else new_validation_run_dir(workspace, project_slug))
     run_dir.mkdir(parents=True, exist_ok=True)
     state = _initial_state(
@@ -3256,6 +3607,10 @@ def start_approved_memory_validation(
         candidate_ablation_top_n=candidate_ablation_top_n,
         prefer_no_compression_window=prefer_no_compression_window,
         allow_skip_unsafe_chapter_sample=allow_skip_unsafe_chapter_sample,
+        use_approved_dictionary=use_approved_dictionary,
+        dictionary_max_entries=dictionary_max_entries,
+        dictionary_max_chars=dictionary_max_chars,
+        emit_prompt_artifacts=emit_prompt_artifacts,
     )
     state["approved_memory_ids"] = [item["id"] for item in approved_memory]
     state["baseline_excluded_memory_ids"] = [item["id"] for item in baseline_excluded_memory]
@@ -3268,6 +3623,19 @@ def start_approved_memory_validation(
     state["stable_prompt_path"] = stable_prompt.prompt_path
     _init_validation_files(run_dir, state)
     write_json(run_dir / "approved_memory_used.json", {"items": approved_memory})
+    if use_approved_dictionary:
+        write_json(
+            run_dir / "approved_dictionary_used.json",
+            {
+                "schema_version": "approved_dictionary_used_v1",
+                "project_slug": project_slug,
+                "entry_count": len(approved_dictionary_entries),
+                "entries": approved_dictionary_entries,
+                "max_dictionary_entries": dictionary_max_entries,
+                "max_dictionary_chars": dictionary_max_chars,
+                "created_at": utc_now(),
+            },
+        )
     write_json(
         run_dir / "baseline_memory_exclusion.json",
         {
@@ -3275,6 +3643,9 @@ def start_approved_memory_validation(
             "excluded_candidate_ids": state["newly_approved_mined_candidate_ids"],
             "excluded_items": baseline_excluded_memory,
             "comparison_mode": (
+                "approved_dictionary_prompt_support"
+                if use_approved_dictionary
+                else
                 "newly_mined_memory_delta"
                 if mined_approved_memory
                 else "legacy_all_approved_memory_delta"
@@ -3295,7 +3666,10 @@ def start_approved_memory_validation(
         memory_pass=all_active_memory,
         baseline_excluded=baseline_excluded_memory,
     )
-    if not approved_memory:
+    if use_approved_dictionary and not approved_dictionary_entries:
+        _block(run_dir, state, "approved_project_dictionary_missing", can_resume=False)
+        return _finalize_result(workspace, run_dir, state)
+    if not use_approved_dictionary and not approved_memory:
         _block(run_dir, state, "approved_learning_memory_missing", can_resume=False)
         return _finalize_result(workspace, run_dir, state)
     missing_expected = _missing_expected_mvp5d6_memory(approved_memory)
@@ -3351,6 +3725,22 @@ def resume_approved_memory_validation(
     run_dir = resolve_validation_run(workspace, run)
     state = read_json(run_dir / "validation_job_state.json")
     if state.get("final_decision"):
+        if (
+            state.get("use_approved_dictionary")
+            and state.get("final_decision") == "FAIL"
+            and state.get("last_error") == "minimum_improvement_not_reached"
+        ):
+            decision, reason = _final_decision(
+                state,
+                require_consecutive_improvement=bool(state.get("require_consecutive_improvement")),
+                min_improvement=_state_min_improvement(state),
+            )
+            if decision != state.get("final_decision"):
+                state["final_decision"] = decision
+                state["status"] = "completed" if decision == "PASS" else "failed"
+                state["can_resume"] = False
+                state["last_error"] = None if decision == "PASS" else reason
+                _write_final_summary(run_dir, state, reason=reason)
         return _finalize_result(workspace, run_dir, state)
     if max_real_calls is not None:
         state["max_real_calls"] = max_real_calls
@@ -3372,7 +3762,11 @@ def resume_approved_memory_validation(
         or [item.get("id") for item in baseline_excluded]
         or state.get("approved_memory_ids", [])
     )
-    baseline_memory = [item for item in all_active_memory if item["id"] not in baseline_excluded_ids]
+    if state.get("use_approved_dictionary"):
+        baseline_memory = list(all_active_memory)
+        baseline_excluded = []
+    else:
+        baseline_memory = [item for item in all_active_memory if item["id"] not in baseline_excluded_ids]
     memory_pass_memory = list(all_active_memory)
     try:
         if "prepare_dataset" not in state.get("completed_stages", []):
@@ -3427,10 +3821,15 @@ def resume_approved_memory_validation(
                 )
                 prompt_by_sample = _validation_prompts_by_sample(
                     run_dir,
+                    workspace=workspace,
                     stable_prompt=stable_prompt,
                     memory_items=baseline_memory,
                     excluded_memory=baseline_excluded,
                     phase=f"round_{round_index}_baseline",
+                    dictionary_enabled=False,
+                    dictionary_max_entries=int(state.get("dictionary_max_entries") or 8),
+                    dictionary_max_chars=int(state.get("dictionary_max_chars") or 500),
+                    emit_prompt_artifacts=bool(state.get("emit_prompt_artifacts")),
                 )
                 baseline_report, eval_run = _run_phase(
                     run_dir=run_dir,
@@ -3475,10 +3874,15 @@ def resume_approved_memory_validation(
                 )
                 prompt_by_sample = _validation_prompts_by_sample(
                     run_dir,
+                    workspace=workspace,
                     stable_prompt=stable_prompt,
                     memory_items=memory_pass_memory,
                     excluded_memory=[],
                     phase=f"round_{round_index}_approved_memory",
+                    dictionary_enabled=bool(state.get("use_approved_dictionary")),
+                    dictionary_max_entries=int(state.get("dictionary_max_entries") or 8),
+                    dictionary_max_chars=int(state.get("dictionary_max_chars") or 500),
+                    emit_prompt_artifacts=bool(state.get("emit_prompt_artifacts")),
                 )
                 memory_report, eval_run = _run_phase(
                     run_dir=run_dir,
@@ -3509,6 +3913,7 @@ def resume_approved_memory_validation(
                     model=model,
                 )
                 delta["round"] = round_index
+                delta["comparison_mode"] = state.get("comparison_mode", "approved_memory")
                 _write_round_comparison(round_dir, round_index, delta)
                 if not any(row.get("round") == round_index for row in round_results):
                     round_results.append(delta)
@@ -3518,7 +3923,7 @@ def resume_approved_memory_validation(
         decision, reason = _final_decision(
             state,
             require_consecutive_improvement=bool(state.get("require_consecutive_improvement")),
-            min_improvement=float(state.get("min_improvement") or 1.0),
+            min_improvement=_state_min_improvement(state),
         )
         state["final_decision"] = decision
         state["status"] = "completed" if decision == "PASS" else "failed"

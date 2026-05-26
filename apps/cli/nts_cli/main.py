@@ -553,6 +553,9 @@ def translate_text(
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     output_dir: Annotated[Optional[Path], typer.Option("--output-dir")] = None,
     force: Annotated[bool, typer.Option("--force")] = False,
+    use_approved_dictionary: Annotated[bool, typer.Option("--use-approved-dictionary")] = False,
+    dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
+    emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
@@ -572,6 +575,9 @@ def translate_text(
             dry_run=dry_run,
             output_dir=output_dir,
             force=force,
+            use_approved_dictionary=use_approved_dictionary,
+            dictionary_max_entries=dictionary_max_entries,
+            emit_prompt_artifacts=emit_prompt_artifacts,
         )
     except StablePromptBlocker as exc:
         _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
@@ -629,6 +635,9 @@ def translate_batch(
     output_dir: Annotated[Optional[Path], typer.Option("--output-dir")] = None,
     export_combined: Annotated[bool, typer.Option("--export-combined")] = False,
     stop_on_error: Annotated[bool, typer.Option("--stop-on-error")] = False,
+    use_approved_dictionary: Annotated[bool, typer.Option("--use-approved-dictionary")] = False,
+    dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
+    emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
@@ -657,6 +666,9 @@ def translate_batch(
             output_dir=output_dir,
             export_combined=export_combined,
             stop_on_error=stop_on_error,
+            use_approved_dictionary=use_approved_dictionary,
+            dictionary_max_entries=dictionary_max_entries,
+            emit_prompt_artifacts=emit_prompt_artifacts,
         )
     except StablePromptBlocker as exc:
         _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
@@ -1007,6 +1019,9 @@ def learn_validate_approved_memory(
         bool,
         typer.Option("--allow-skip-unsafe-chapter-sample/--no-allow-skip-unsafe-chapter-sample"),
     ] = False,
+    use_approved_dictionary: Annotated[bool, typer.Option("--use-approved-dictionary")] = False,
+    dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
+    emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
@@ -1035,6 +1050,9 @@ def learn_validate_approved_memory(
             candidate_ablation_top_n=candidate_ablation_top_n,
             prefer_no_compression_window=prefer_no_compression_window,
             allow_skip_unsafe_chapter_sample=allow_skip_unsafe_chapter_sample,
+            use_approved_dictionary=use_approved_dictionary,
+            dictionary_max_entries=dictionary_max_entries,
+            emit_prompt_artifacts=emit_prompt_artifacts,
         )
     except StablePromptBlocker as exc:
         _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)

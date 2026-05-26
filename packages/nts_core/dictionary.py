@@ -1312,6 +1312,165 @@ def retrieve_dictionary_hits(
     return hits[:max_entries]
 
 
+def _compact_provenance_summary(entry: dict[str, Any]) -> dict[str, Any]:
+    provenance = entry.get("provenance_json") or {}
+    if not isinstance(provenance, dict):
+        return {"summary": str(provenance)[:160]}
+    keys = (
+        "source_run_id",
+        "dict_run_id",
+        "candidate_id",
+        "memory_id",
+        "target_provenance",
+        "source_kinds",
+    )
+    compact = {key: provenance.get(key) for key in keys if provenance.get(key)}
+    if not compact and provenance:
+        compact = {key: provenance.get(key) for key in sorted(provenance)[:4]}
+    return compact
+
+
+def _inactive_dictionary_matches(
+    workspace: Workspace,
+    project_slug: str,
+    source_text: str,
+) -> list[dict[str, Any]]:
+    initialize_database(workspace.db_path)
+    rows: list[dict[str, Any]] = []
+    with connection(workspace.db_path) as conn:
+        candidate_rows = conn.execute(
+            """
+            SELECT id, entry_type, source_text, target_text, status, confidence_score
+            FROM dictionary_candidates
+            WHERE project_slug = ? AND status NOT IN ('approved_by_human')
+            """,
+            (project_slug,),
+        ).fetchall()
+        entry_rows = conn.execute(
+            """
+            SELECT id, entry_type, source_text, target_text, status, confidence_score
+            FROM project_dictionary_entries
+            WHERE project_slug = ? AND status != 'active'
+            """,
+            (project_slug,),
+        ).fetchall()
+    for row in candidate_rows:
+        item = row_to_dict(row)
+        if item.get("source_text") and str(item["source_text"]) in source_text:
+            item["record_kind"] = "dictionary_candidate"
+            rows.append(item)
+    for row in entry_rows:
+        item = row_to_dict(row)
+        if item.get("source_text") and str(item["source_text"]) in source_text:
+            item["record_kind"] = "project_dictionary_entry"
+            rows.append(item)
+    return rows
+
+
+def build_dictionary_prompt_support(
+    workspace: Workspace,
+    project_slug: str,
+    source_text: str,
+    *,
+    max_entries: int = 8,
+    max_chars: int = 500,
+) -> dict[str, Any]:
+    """Build a compact approved-dictionary support block for one source chunk.
+
+    Only active project_dictionary_entries are eligible. Pending/rejected candidates
+    are reported as excluded evidence and are never rendered into the prompt block.
+    """
+
+    if max_entries <= 0:
+        raise ValueError("max_entries must be greater than 0.")
+    if max_chars <= 0:
+        raise ValueError("max_chars must be greater than 0.")
+    all_hits = retrieve_dictionary_hits(
+        workspace,
+        project_slug,
+        source_text,
+        max_entries=1000,
+    )
+    inactive_matches = _inactive_dictionary_matches(workspace, project_slug, source_text)
+    header_lines = [
+        "Approved project dictionary for this source:",
+    ]
+    rule_lines = [
+        "Rules:",
+        "- Keep these approved translations when the exact Chinese source appears.",
+        "- Do not apply dictionary entries that do not appear in the source.",
+    ]
+    selected_hits: list[dict[str, Any]] = []
+    dropped_hits: list[dict[str, Any]] = []
+    body_lines: list[str] = []
+
+    def row_for_hit(hit: dict[str, Any], *, reason: str | None = None) -> dict[str, Any]:
+        payload = {
+            "entry_id": hit.get("id"),
+            "source_text": hit.get("source_text"),
+            "target_text": hit.get("target_text"),
+            "entry_type": hit.get("entry_type"),
+            "confidence": hit.get("confidence_score"),
+            "provenance_summary": _compact_provenance_summary(hit),
+        }
+        if reason:
+            payload["drop_reason"] = reason
+        return payload
+
+    for index, hit in enumerate(all_hits):
+        if index >= max_entries:
+            dropped_hits.append(row_for_hit(hit, reason="max_dictionary_entries"))
+            continue
+        line = f"- {hit['source_text']} => {hit['target_text']}"
+        tentative_lines = [*header_lines, *body_lines, line, *rule_lines]
+        tentative_text = "\n".join(tentative_lines)
+        if len(tentative_text) > max_chars:
+            dropped_hits.append(row_for_hit(hit, reason="max_dictionary_chars"))
+            continue
+        body_lines.append(line)
+        selected_hits.append(row_for_hit(hit))
+
+    block_text = ""
+    if selected_hits:
+        block_text = "\n".join([*header_lines, *body_lines, *rule_lines])
+    budget_report = {
+        "schema_version": "dictionary_prompt_budget_report_v1",
+        "max_dictionary_entries": max_entries,
+        "max_dictionary_chars": max_chars,
+        "eligible_hit_count": len(all_hits),
+        "selected_hit_count": len(selected_hits),
+        "dropped_hit_count": len(dropped_hits),
+        "support_chars": len(block_text),
+        "block_rendered": bool(block_text),
+        "dropped_due_entry_budget": sum(1 for hit in dropped_hits if hit.get("drop_reason") == "max_dictionary_entries"),
+        "dropped_due_char_budget": sum(1 for hit in dropped_hits if hit.get("drop_reason") == "max_dictionary_chars"),
+    }
+    retrieval_report = {
+        "schema_version": "dictionary_prompt_retrieval_report_v1",
+        "project_slug": project_slug,
+        "source_sha256": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+        "exact_source_match_required": True,
+        "active_approved_only": True,
+        "eligible_hits": selected_hits + dropped_hits,
+        "selected_hits": selected_hits,
+        "dropped_hits": dropped_hits,
+        "excluded_pending_rejected_count": len(inactive_matches),
+        "excluded_pending_rejected_entries": inactive_matches[:50],
+    }
+    return {
+        "schema_version": "dictionary_prompt_context_bundle_v1",
+        "project_slug": project_slug,
+        "source_sha256": retrieval_report["source_sha256"],
+        "block_text": block_text,
+        "block_rendered": bool(block_text),
+        "selected_hits": selected_hits,
+        "dropped_hits": dropped_hits,
+        "excluded_pending_rejected_entries": inactive_matches[:50],
+        "budget_report": budget_report,
+        "retrieval_report": retrieval_report,
+    }
+
+
 def get_forbidden_variants(workspace: Workspace, project_slug: str, source_text: str) -> list[str]:
     variants = []
     for entry in retrieve_dictionary_hits(workspace, project_slug, source_text, max_entries=50):

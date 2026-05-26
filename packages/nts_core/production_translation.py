@@ -12,6 +12,7 @@ from typing import Any
 
 import yaml
 
+from nts_core.dictionary import build_dictionary_prompt_support
 from nts_core.eval_harness import (
     EvalProvider,
     active_eval_pairs,
@@ -278,11 +279,13 @@ def build_production_prompt(
     sample: dict[str, Any],
     memory_bundle: dict[str, Any],
     glossary: dict[str, Any],
+    dictionary_block: str | None = None,
 ) -> tuple[str, str]:
-    system_prompt = "\n".join(
+    system_sections = [stable_prompt.prompt_text, ""]
+    if dictionary_block:
+        system_sections.extend([dictionary_block, ""])
+    system_sections.extend(
         [
-            stable_prompt.prompt_text,
-            "",
             "Production translation mode:",
             "- Translate Chinese source into Vietnamese.",
             "- Use concise Vietnamese webnovel style.",
@@ -292,6 +295,7 @@ def build_production_prompt(
             "- There is no human reference; use conservative length budgets and avoid over-expansion.",
         ]
     )
+    system_prompt = "\n".join(system_sections)
     pairs = [
         {
             "paragraph_id": pair["paragraph_id"],
@@ -455,6 +459,10 @@ def translate_chapter_stable(
     artifact_run_id: str | None = None,
     source_override: str | None = None,
     save_translation_row: bool = True,
+    use_approved_dictionary: bool = False,
+    dictionary_max_entries: int = 8,
+    dictionary_max_chars: int = 500,
+    emit_prompt_artifacts: bool = False,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
         from nts_core.translation import translate_chapter_mock
@@ -477,11 +485,23 @@ def translate_chapter_stable(
     bundle = build_bundle(workspace, project_id=project["id"], text=source_text, top_k=30)
     glossary = _bundle_glossary(bundle)
     sample = _production_sample(chapter=chapter, source_text=source_text, merge_tiny_paragraphs=merge_tiny_paragraphs)
+    dictionary_context = (
+        build_dictionary_prompt_support(
+            workspace,
+            project["slug"],
+            source_text,
+            max_entries=dictionary_max_entries,
+            max_chars=dictionary_max_chars,
+        )
+        if use_approved_dictionary
+        else None
+    )
     system_prompt, user_prompt = build_production_prompt(
         stable_prompt=stable_prompt,
         sample=sample,
         memory_bundle=bundle,
         glossary=glossary,
+        dictionary_block=(dictionary_context or {}).get("block_text"),
     )
     full_prompt = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
     prompt_path = artifact_dir / "prompt_used.md"
@@ -494,6 +514,48 @@ def translate_chapter_stable(
     source_path.write_text(source_text + "\n", encoding="utf-8")
     bundle_path.write_text(json_dumps(bundle) + "\n", encoding="utf-8")
     prompt_path.write_text(full_prompt + "\n", encoding="utf-8")
+    if use_approved_dictionary or emit_prompt_artifacts:
+        context_payload = dictionary_context or {
+            "schema_version": "dictionary_prompt_context_bundle_v1",
+            "project_slug": project["slug"],
+            "source_sha256": _sha256_hex(source_text),
+            "block_text": "",
+            "block_rendered": False,
+            "selected_hits": [],
+            "dropped_hits": [],
+            "budget_report": {
+                "schema_version": "dictionary_prompt_budget_report_v1",
+                "max_dictionary_entries": dictionary_max_entries,
+                "max_dictionary_chars": dictionary_max_chars,
+                "eligible_hit_count": 0,
+                "selected_hit_count": 0,
+                "dropped_hit_count": 0,
+                "support_chars": 0,
+                "block_rendered": False,
+            },
+            "retrieval_report": {
+                "schema_version": "dictionary_prompt_retrieval_report_v1",
+                "project_slug": project["slug"],
+                "exact_source_match_required": True,
+                "active_approved_only": True,
+                "selected_hits": [],
+                "dropped_hits": [],
+            },
+        }
+        context_payload["source_chunk_id"] = chapter_id
+        context_payload["prompt_sha256"] = _sha256_hex(full_prompt)
+        (artifact_dir / "prompt_context_bundle.json").write_text(
+            json_dumps(context_payload) + "\n",
+            encoding="utf-8",
+        )
+        (artifact_dir / "prompt_budget_report.json").write_text(
+            json_dumps(context_payload.get("budget_report") or {}) + "\n",
+            encoding="utf-8",
+        )
+        (artifact_dir / "prompt_retrieval_report.json").write_text(
+            json_dumps(context_payload.get("retrieval_report") or {}) + "\n",
+            encoding="utf-8",
+        )
 
     with connection(workspace.db_path) as conn:
         if not force and save_translation_row and _existing_current_translation(conn, chapter_id):
@@ -510,6 +572,8 @@ def translate_chapter_stable(
                 "model": model,
                 "prompt_id": stable_prompt.prompt_id,
                 "dry_run": dry_run,
+                "use_approved_dictionary": use_approved_dictionary,
+                "dictionary_max_entries": dictionary_max_entries,
             },
             result_data={},
         )
@@ -708,6 +772,9 @@ def translate_chapter_stable(
         "task_run_id": task_id,
         "model_run_id": model_run_id,
         "translation_id": translation_id,
+        "use_approved_dictionary": use_approved_dictionary,
+        "dictionary_prompt_block_rendered": bool((dictionary_context or {}).get("block_rendered")),
+        "dictionary_selected_hit_count": len((dictionary_context or {}).get("selected_hits") or []),
     }
     manifest_path.write_text(json_dumps(manifest) + "\n", encoding="utf-8")
     if status == "quality_failed":
@@ -731,6 +798,8 @@ def translate_chapter_stable(
         "status": status,
         "dry_run": dry_run,
         "warnings": warnings,
+        "use_approved_dictionary": use_approved_dictionary,
+        "dictionary_selected_hit_count": len((dictionary_context or {}).get("selected_hits") or []),
     }
 
 
@@ -853,6 +922,9 @@ def translate_batch_stable(
     export_combined: bool = False,
     stop_on_error: bool = False,
     prompt_id: str | None = None,
+    use_approved_dictionary: bool = False,
+    dictionary_max_entries: int = 8,
+    emit_prompt_artifacts: bool = False,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
         raise ValueError("--use-stable-prompt is required for MVP5A batch translation.")
@@ -978,6 +1050,9 @@ def translate_batch_stable(
                     artifact_run_id=f"{batch_run_id}_{chapter_id}_chunk_{index:03d}",
                     source_override=chunk,
                     save_translation_row=False,
+                    use_approved_dictionary=use_approved_dictionary,
+                    dictionary_max_entries=dictionary_max_entries,
+                    emit_prompt_artifacts=emit_prompt_artifacts,
                 )
                 actual_api_calls += 1
                 chunk_text = Path(chunk_result["output_path"]).read_text(encoding="utf-8")
@@ -1085,6 +1160,8 @@ def translate_batch_stable(
         "prompt_id": stable_prompt.prompt_id if stable_prompt else None,
         "prompt_version": stable_prompt.prompt_version if stable_prompt else None,
         "approval_path": stable_prompt.approval_path if stable_prompt else None,
+        "use_approved_dictionary": use_approved_dictionary,
+        "dictionary_max_entries": dictionary_max_entries,
         "started_at": started_at,
         "completed_at": completed_at,
         "status": status,
