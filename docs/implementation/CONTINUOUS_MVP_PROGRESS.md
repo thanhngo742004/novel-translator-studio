@@ -1028,3 +1028,51 @@
   - FAIL. The exclusion/ablation path works and avoids real API calls when targeted safety cannot be satisfied, but chapter 10 lacks a safe alternate candidate under current rules.
 - Next recommended phase:
   - Repair chapter 10 alignment/reference extraction at the source, likely by improving split-EPUB chapter grouping or allowing validated smaller intra-chapter windows with stronger semantic anchor checks.
+
+## 2026-05-26T12:15:00+07:00
+
+- Completed code work: MVP5D.4 chapter 10 raw/reference alignment and split-EPUB grouping repair.
+- Implemented:
+  - Added `nts learn diagnose-chapter-alignment` no-API diagnostics.
+  - Added multi-signal chapter matching with title tokens, anchor overlap, head/tail anchors, length ratio, and monotonic position.
+  - Added adjacent translated-section joining when raw chapter tail anchors continue in the next EPUB section.
+  - Chapter 10 now maps to translated sections 13 and 14 instead of section 13 only.
+  - Added chapter 10 rebuilt alignment artifacts:
+    - `chapter_10_rebuilt_alignment.json`
+    - `chapter_10_rebuilt_alignment.md`
+    - `chapter_10_rebuilt_unit_candidate_ranking.json`
+    - `chapter_10_rebuilt_unit_candidate_ranking.md`
+    - `chapter_10_selected_safe_unit.json`
+  - Added tests for diagnostic reports, title-different fallback matching, shifted/adjacent split matching, and low-confidence rejection.
+- Commands run:
+  - `.venv\Scripts\python.exe -m pytest tests\test_mvp5d_approved_memory_validation.py -q`
+  - `.venv\Scripts\python.exe -m pytest -q`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn diagnose-chapter-alignment --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --chapters 1-10 --json`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn validate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 8,10 --rounds 2 --require-consecutive-improvement --use-stable-prompt --resumable --max-real-calls 12 --json`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn replay-approved-memory-validation --workspace workspace_mvp5c_smoke_20260525210758 --run workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779770581448 --json`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn validate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 8,10 --rounds 2 --require-consecutive-improvement --use-stable-prompt --resumable --max-real-calls 12 --json`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn validate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 1-10 --rounds 2 --require-consecutive-improvement --use-stable-prompt --resumable --dry-run --json`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn validate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 1-10 --rounds 2 --require-consecutive-improvement --use-stable-prompt --resumable --max-real-calls 12 --json`
+  - Two automatic resumes of `han-jue_amv_1779771310284` with `--max-real-calls 12`.
+  - `.venv\Scripts\python.exe -m nts_cli.main learn replay-approved-memory-validation --workspace workspace_mvp5c_smoke_20260525210758 --run workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779771310284 --json`
+- Test result:
+  - Focused MVP5D tests: 14 passed.
+  - Full suite: 129 passed.
+- Alignment diagnostic:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/alignment_diagnostics/han-jue_align_1779770419862`
+  - Chapter 10 match: translated sections 13 + 14.
+  - Split decision: raw tail anchors `han_jue`, `lianqi`, `yuqing_zong`, and `zhuji` continue in translated section 14.
+- Targeted 8/10 validation:
+  - First targeted run after chapter 10 repair: `han-jue_amv_1779770581448`; safety failed on chapter 8 and replay excluded the failing chapter 8 candidate.
+  - Second targeted run: `han-jue_amv_1779770977427`; safety passed with zero severe flags, zero truncations, and zero unsafe-compression flags, but score deltas were negative, so the targeted command decision remained FAIL.
+- Full 10-chapter validation:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779771310284`
+  - Round 1: baseline 90.4, approved memory 91.1, delta +0.7.
+  - Round 2: baseline 90.5, approved memory 90.6, delta +0.1.
+  - Severe flags: 0.
+  - Replay failure count: 0.
+  - Automatic resumes performed: 2.
+- Final MVP5D.4 decision:
+  - FAIL. Chapter 10 alignment and split-EPUB grouping are repaired and the full run has no safety failures, but the configured approved-memory validation gate still fails because neither round reaches the minimum improvement threshold.
+- Next recommended phase:
+  - Investigate whether the five approved memory candidates are too weak for broad 10-chapter uplift; run memory-impact ablation or approve additional evidence-backed candidates before another 10-chapter validation.

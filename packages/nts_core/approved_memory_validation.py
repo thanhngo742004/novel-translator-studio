@@ -15,8 +15,10 @@ from nts_core.eval_harness import (
     align_blocks_monotonic,
     build_alignment_blocks,
     build_alignment_candidates,
+    chapter_number,
     compare_translation,
     detect_truncated_vietnamese,
+    extract_alignment_anchors,
     extract_epub_chapters,
     extract_raw_chapters,
     json_dumps,
@@ -70,11 +72,30 @@ DATASET_DIAGNOSTIC_FILES = (
     "chapter_8_window_ablation.md",
     "chapter_10_window_ablation.json",
     "chapter_10_window_ablation.md",
+    "chapter_10_rebuilt_alignment.json",
+    "chapter_10_rebuilt_alignment.md",
+    "chapter_10_rebuilt_unit_candidate_ranking.json",
+    "chapter_10_rebuilt_unit_candidate_ranking.md",
+    "chapter_10_selected_safe_unit.json",
 )
+DEFAULT_CHAPTER_MATCH_WINDOW = 3
+STRONG_CHAPTER_MATCH_THRESHOLD = 0.75
+TENTATIVE_CHAPTER_MATCH_THRESHOLD = 0.60
 
 
 def approved_memory_validation_root(workspace: Workspace) -> Path:
     return workspace.path / "artifacts" / "approved_memory_validation"
+
+
+def alignment_diagnostics_root(workspace: Workspace) -> Path:
+    return workspace.path / "artifacts" / "alignment_diagnostics"
+
+
+def new_alignment_diagnostics_run_dir(workspace: Workspace, project_slug: str) -> Path:
+    run_id = f"{project_slug}_align_{int(time.time() * 1000)}"
+    run_dir = alignment_diagnostics_root(workspace) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 
 def validation_candidate_exclusions_path(workspace: Workspace | Path) -> Path:
@@ -220,16 +241,249 @@ def _target_title_groups(target_chapters: list[dict[str, Any]]) -> list[dict[str
     return groups
 
 
+def _chapter_numbers(text: str) -> list[str]:
+    return sorted(set(re.findall(r"\d+", text or "")))
+
+
+def _chapter_index_row(chapter: dict[str, Any], *, lang: str) -> dict[str, Any]:
+    text = str(chapter.get("text") or "")
+    title = str(chapter.get("title") or "")
+    return {
+        "chapter_id": int(chapter.get("chapter_id") or 0),
+        "chapter_number": chapter_number(title),
+        "title": title,
+        "normalized_title": _fold_text(title),
+        "title_tokens": sorted(_title_tokens(title, lang=lang)),
+        "source_length": len(text),
+        "first_300_chars": text[:300],
+        "last_300_chars": text[-300:],
+        "anchors": extract_alignment_anchors(text[:1200] + text[-1200:], lang=lang),
+        "head_anchors": extract_alignment_anchors(text[:1200], lang=lang),
+        "tail_anchors": extract_alignment_anchors(text[-1200:], lang=lang),
+        "numbers": _chapter_numbers(title + "\n" + text[:1200] + "\n" + text[-1200:]),
+        "panel_marker_count": text.count("【"),
+        "confidence_signals": {
+            "has_title_number": chapter_number(title) is not None,
+            "anchor_count": len(extract_alignment_anchors(text[:1200] + text[-1200:], lang=lang)),
+            "title_token_count": len(_title_tokens(title, lang=lang)),
+        },
+    }
+
+
+def _target_group_text(group: dict[str, Any], target_by_id: dict[int, dict[str, Any]]) -> str:
+    return "\n\n".join(
+        str(target_by_id[chapter_id]["text"])
+        for chapter_id in group.get("chapter_ids", [])
+        if chapter_id in target_by_id
+    )
+
+
+def _target_group_title(group: dict[str, Any], target_by_id: dict[int, dict[str, Any]]) -> str:
+    titles = [
+        str(target_by_id[chapter_id].get("title") or "")
+        for chapter_id in group.get("chapter_ids", [])
+        if chapter_id in target_by_id
+    ]
+    return " / ".join(title for title in titles if title)
+
+
+def _target_group_summary(
+    group: dict[str, Any],
+    target_by_id: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    text = _target_group_text(group, target_by_id)
+    title = _target_group_title(group, target_by_id)
+    return {
+        "group_index": int(group.get("group_index") or 0),
+        "chapter_ids": list(group.get("chapter_ids") or []),
+        "title": title,
+        "normalized_title": _fold_text(title),
+        "title_tokens": sorted(set(group.get("tokens") or [])),
+        "source_length": len(text),
+        "first_300_chars": text[:300],
+        "last_300_chars": text[-300:],
+        "anchors": extract_alignment_anchors(text[:2200] + text[-2200:], lang="vi"),
+        "head_anchors": extract_alignment_anchors(text[:2200], lang="vi"),
+        "tail_anchors": extract_alignment_anchors(text[-2200:], lang="vi"),
+        "numbers": _chapter_numbers(title + "\n" + text[:2200] + "\n" + text[-2200:]),
+        "panel_marker_count": text.count("【"),
+    }
+
+
+def _overlap_ratio(source: set[str], target: set[str]) -> float:
+    if not source:
+        return 0.0
+    return len(source & target) / max(len(source), 1)
+
+
+def _chapter_match_score(
+    raw_summary: dict[str, Any],
+    target_summary: dict[str, Any],
+    *,
+    raw_index: int,
+    expected_group_index: int,
+) -> dict[str, Any]:
+    source_title_tokens = set(raw_summary.get("title_tokens") or [])
+    target_title_tokens = set(target_summary.get("title_tokens") or [])
+    source_anchors = set(raw_summary.get("anchors") or [])
+    target_anchors = set(target_summary.get("anchors") or [])
+    source_head = set(raw_summary.get("head_anchors") or [])
+    target_head = set(target_summary.get("head_anchors") or [])
+    source_tail = set(raw_summary.get("tail_anchors") or [])
+    target_tail = set(target_summary.get("tail_anchors") or [])
+    title_score = _overlap_ratio(source_title_tokens, target_title_tokens)
+    anchor_score = _overlap_ratio(source_anchors, target_anchors)
+    head_score = _overlap_ratio(source_head, target_head)
+    tail_score = _overlap_ratio(source_tail, target_tail)
+    target_len = int(target_summary.get("source_length") or 0)
+    raw_len = int(raw_summary.get("source_length") or 0)
+    length_ratio = target_len / max(raw_len, 1)
+    length_score = max(0.0, 1 - abs(length_ratio - 2.6) / 3.2)
+    position_score = max(
+        0.0,
+        1 - abs(int(target_summary.get("group_index") or 0) - expected_group_index) / max(raw_index + 3, 1),
+    )
+    raw_number = raw_summary.get("chapter_number")
+    target_numbers = [
+        int(number)
+        for number in target_summary.get("numbers", [])
+        if str(number).isdigit()
+    ]
+    number_score = 1.0 if raw_number and raw_number in target_numbers else 0.0
+    score = round(
+        min(
+            1.0,
+            0.25 * title_score
+            + 0.28 * anchor_score
+            + 0.13 * head_score
+            + 0.14 * tail_score
+            + 0.10 * length_score
+            + 0.07 * position_score
+            + 0.03 * number_score,
+        ),
+        3,
+    )
+    warnings: list[str] = []
+    if title_score == 0 and source_title_tokens:
+        warnings.append("title_token_mismatch")
+    if anchor_score < 0.35:
+        warnings.append("low_anchor_overlap")
+    if length_ratio < 1.0 or length_ratio > 6.5:
+        warnings.append(f"length_ratio_outlier:{length_ratio:.3f}")
+    return {
+        "confidence": score,
+        "title_similarity": round(title_score, 3),
+        "anchor_overlap": round(anchor_score, 3),
+        "first_anchor_overlap": round(head_score, 3),
+        "last_anchor_overlap": round(tail_score, 3),
+        "length_ratio": round(length_ratio, 3),
+        "position_score": round(position_score, 3),
+        "number_score": round(number_score, 3),
+        "shared_title_tokens": sorted(source_title_tokens & target_title_tokens),
+        "shared_anchors": sorted(source_anchors & target_anchors),
+        "warnings": warnings,
+    }
+
+
+def _adjacent_split_decision(
+    *,
+    raw_chapters: list[dict[str, Any]],
+    raw_index: int,
+    target_group: dict[str, Any],
+    target_groups: list[dict[str, Any]],
+    target_by_id: dict[int, dict[str, Any]],
+) -> dict[str, Any] | None:
+    group_index = int(target_group.get("group_index") or 0)
+    next_group = target_groups[group_index + 1] if group_index + 1 < len(target_groups) else None
+    if not next_group:
+        return None
+    raw_text = str(raw_chapters[raw_index].get("text") or "")
+    raw_tail = set(extract_alignment_anchors(raw_text[-1200:], lang="zh"))
+    current_tail_text = "\n\n".join(
+        str(target_by_id[chapter_id]["text"])
+        for chapter_id in target_group.get("chapter_ids", [])
+        if chapter_id in target_by_id
+    )[-2200:]
+    next_chapter_id = int((next_group.get("chapter_ids") or [0])[0])
+    next_text = str(target_by_id.get(next_chapter_id, {}).get("text") or "")
+    current_tail = set(extract_alignment_anchors(current_tail_text, lang="vi"))
+    next_head = set(extract_alignment_anchors(next_text[:2200], lang="vi"))
+    next_raw_head: set[str] = set()
+    if raw_index + 1 < len(raw_chapters):
+        next_raw_head = set(
+            extract_alignment_anchors(str(raw_chapters[raw_index + 1].get("text") or "")[:1200], lang="zh")
+        )
+    current_overlap = len(raw_tail & current_tail)
+    next_overlap = len(raw_tail & next_head)
+    next_raw_overlap = len(next_raw_head & next_head)
+    should_join = (
+        next_overlap >= 3
+        and next_overlap >= current_overlap + 2
+        and next_overlap > next_raw_overlap + 1
+    )
+    return {
+        "should_join": should_join,
+        "next_chapter_id": next_chapter_id,
+        "current_tail_overlap": current_overlap,
+        "next_head_overlap": next_overlap,
+        "next_raw_head_overlap": next_raw_overlap,
+        "shared_tail_next_head_anchors": sorted(raw_tail & next_head),
+        "reason": "raw_tail_anchors_continue_in_next_translated_section" if should_join else "no_adjacent_split_join_needed",
+    }
+
+
+def _fallback_target_group(
+    raw_summary: dict[str, Any],
+    groups: list[dict[str, Any]],
+    target_by_id: dict[int, dict[str, Any]],
+    *,
+    raw_index: int,
+    expected_group_index: int,
+    match_window: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, list[dict[str, Any]]]:
+    start = max(0, expected_group_index - match_window)
+    end = min(len(groups), expected_group_index + match_window + 1)
+    scored: list[dict[str, Any]] = []
+    for group in groups[start:end]:
+        summary = _target_group_summary(group, target_by_id)
+        score = _chapter_match_score(
+            raw_summary,
+            summary,
+            raw_index=raw_index,
+            expected_group_index=expected_group_index,
+        )
+        scored.append(
+            {
+                "target_chapter_ids": list(group.get("chapter_ids") or []),
+                "target_titles": list(group.get("titles") or []),
+                "group_index": group.get("group_index"),
+                **score,
+            }
+        )
+    scored.sort(key=lambda row: (row["confidence"], row["anchor_overlap"], row["title_similarity"]), reverse=True)
+    if not scored:
+        return None, None, []
+    best = scored[0]
+    if float(best["confidence"]) < TENTATIVE_CHAPTER_MATCH_THRESHOLD:
+        return None, best, scored
+    best_group = next(group for group in groups if group.get("group_index") == best.get("group_index"))
+    return best_group, best, scored
+
+
 def _chapter_title_target_map(
     raw_chapters: list[dict[str, Any]],
     target_chapters: list[dict[str, Any]],
+    *,
+    match_window: int = DEFAULT_CHAPTER_MATCH_WINDOW,
 ) -> tuple[dict[int, list[int]], list[dict[str, Any]]]:
     groups = _target_title_groups(target_chapters)
+    target_by_id = {int(chapter["chapter_id"]): chapter for chapter in target_chapters}
     mapping: dict[int, list[int]] = {}
     report_rows: list[dict[str, Any]] = []
     min_group_index = 0
-    for raw_chapter in raw_chapters:
+    for raw_index, raw_chapter in enumerate(raw_chapters):
         chapter_id = int(raw_chapter["chapter_id"])
+        raw_summary = _chapter_index_row(raw_chapter, lang="zh")
         source_tokens = _title_tokens(str(raw_chapter.get("title") or ""), lang="zh")
         scored: list[tuple[int, int, dict[str, Any], set[str]]] = []
         for group in groups[min_group_index:]:
@@ -248,34 +502,327 @@ def _chapter_title_target_map(
         if scored:
             scored.sort(reverse=True, key=lambda item: (item[0], item[1]))
             overlap_count, _distance, group, overlap = scored[0]
-            mapping[chapter_id] = list(group["chapter_ids"])
+            match_summary = _target_group_summary(group, target_by_id)
+            match_score = _chapter_match_score(
+                raw_summary,
+                match_summary,
+                raw_index=raw_index,
+                expected_group_index=min_group_index,
+            )
+            target_ids = list(group["chapter_ids"])
+            split_decision = _adjacent_split_decision(
+                raw_chapters=raw_chapters,
+                raw_index=raw_index,
+                target_group=group,
+                target_groups=groups,
+                target_by_id=target_by_id,
+            )
+            status = "mapped"
+            if split_decision and split_decision["should_join"]:
+                next_id = int(split_decision["next_chapter_id"])
+                if next_id not in target_ids:
+                    target_ids.append(next_id)
+                status = "mapped_joined_adjacent_split"
+            mapping[chapter_id] = target_ids
             min_group_index = int(group["group_index"]) + 1
             report_rows.append(
                 {
                     "source_chapter_id": chapter_id,
                     "source_title": raw_chapter.get("title"),
+                    "source_chapter_number": raw_summary.get("chapter_number"),
                     "source_title_tokens": sorted(source_tokens),
-                    "target_chapter_ids": list(group["chapter_ids"]),
+                    "target_chapter_ids": target_ids,
                     "target_titles": group["titles"],
                     "shared_title_tokens": sorted(overlap),
                     "overlap_count": overlap_count,
-                    "status": "mapped",
+                    "match_confidence": match_score["confidence"],
+                    "title_similarity": match_score["title_similarity"],
+                    "anchor_overlap": match_score["anchor_overlap"],
+                    "first_anchor_overlap": match_score["first_anchor_overlap"],
+                    "last_anchor_overlap": match_score["last_anchor_overlap"],
+                    "length_ratio": match_score["length_ratio"],
+                    "split_decision": split_decision,
+                    "status": status,
                 }
             )
         else:
+            fallback_group, fallback_score, fallback_candidates = _fallback_target_group(
+                raw_summary,
+                groups,
+                target_by_id,
+                raw_index=raw_index,
+                expected_group_index=min_group_index,
+                match_window=match_window,
+            )
+            if fallback_group and fallback_score:
+                target_ids = list(fallback_group["chapter_ids"])
+                split_decision = _adjacent_split_decision(
+                    raw_chapters=raw_chapters,
+                    raw_index=raw_index,
+                    target_group=fallback_group,
+                    target_groups=groups,
+                    target_by_id=target_by_id,
+                )
+                status = "mapped_by_anchor_fallback"
+                if split_decision and split_decision["should_join"]:
+                    next_id = int(split_decision["next_chapter_id"])
+                    if next_id not in target_ids:
+                        target_ids.append(next_id)
+                    status = "mapped_by_anchor_fallback_joined_adjacent_split"
+                mapping[chapter_id] = target_ids
+                min_group_index = int(fallback_group["group_index"]) + 1
+                report_rows.append(
+                    {
+                        "source_chapter_id": chapter_id,
+                        "source_title": raw_chapter.get("title"),
+                        "source_chapter_number": raw_summary.get("chapter_number"),
+                        "source_title_tokens": sorted(source_tokens),
+                        "target_chapter_ids": target_ids,
+                        "target_titles": fallback_group["titles"],
+                        "shared_title_tokens": fallback_score.get("shared_title_tokens", []),
+                        "overlap_count": len(fallback_score.get("shared_title_tokens", [])),
+                        "match_confidence": fallback_score["confidence"],
+                        "title_similarity": fallback_score["title_similarity"],
+                        "anchor_overlap": fallback_score["anchor_overlap"],
+                        "first_anchor_overlap": fallback_score["first_anchor_overlap"],
+                        "last_anchor_overlap": fallback_score["last_anchor_overlap"],
+                        "length_ratio": fallback_score["length_ratio"],
+                        "split_decision": split_decision,
+                        "fallback_candidates": fallback_candidates[:8],
+                        "status": status,
+                    }
+                )
+                continue
             report_rows.append(
                 {
                     "source_chapter_id": chapter_id,
                     "source_title": raw_chapter.get("title"),
+                    "source_chapter_number": raw_summary.get("chapter_number"),
                     "source_title_tokens": sorted(source_tokens),
                     "target_chapter_ids": [],
                     "target_titles": [],
                     "shared_title_tokens": [],
                     "overlap_count": 0,
+                    "match_confidence": float((fallback_score or {}).get("confidence") or 0),
+                    "fallback_candidates": fallback_candidates[:8],
                     "status": "unmapped",
                 }
             )
     return mapping, report_rows
+
+
+def _chapter_diagnostic_candidates(
+    raw_chapter: dict[str, Any],
+    raw_chapters: list[dict[str, Any]],
+    target_chapters: list[dict[str, Any]],
+    *,
+    match_window: int,
+) -> list[dict[str, Any]]:
+    groups = _target_title_groups(target_chapters)
+    target_by_id = {int(chapter["chapter_id"]): chapter for chapter in target_chapters}
+    raw_summary = _chapter_index_row(raw_chapter, lang="zh")
+    source_tokens = set(raw_summary.get("title_tokens") or [])
+    title_group_index = None
+    for group in groups:
+        if source_tokens and source_tokens & set(group.get("tokens") or []):
+            title_group_index = int(group["group_index"])
+            break
+    expected_index = title_group_index if title_group_index is not None else max(0, int(raw_chapter["chapter_id"]) - 1)
+    start = max(0, expected_index - match_window)
+    end = min(len(groups), expected_index + match_window + 1)
+    rows: list[dict[str, Any]] = []
+    raw_index = max(0, int(raw_chapter["chapter_id"]) - 1)
+    for group_index in range(start, end):
+        group = groups[group_index]
+        candidate_groups = [group]
+        if group_index + 1 < len(groups):
+            joined = dict(group)
+            joined["chapter_ids"] = [
+                *list(group.get("chapter_ids") or []),
+                int((groups[group_index + 1].get("chapter_ids") or [0])[0]),
+            ]
+            joined["titles"] = [
+                *list(group.get("titles") or []),
+                str((groups[group_index + 1].get("titles") or [""])[0]),
+            ]
+            joined["tokens"] = set(group.get("tokens") or []) | set(groups[group_index + 1].get("tokens") or [])
+            candidate_groups.append(joined)
+        for candidate_group in candidate_groups:
+            summary = _target_group_summary(candidate_group, target_by_id)
+            score = _chapter_match_score(
+                raw_summary,
+                summary,
+                raw_index=raw_index,
+                expected_group_index=expected_index,
+            )
+            split_decision = _adjacent_split_decision(
+                raw_chapters=raw_chapters,
+                raw_index=raw_index,
+                target_group=group,
+                target_groups=groups,
+                target_by_id=target_by_id,
+            )
+            confidence = float(score["confidence"])
+            rows.append(
+                {
+                    "target_chapter_ids": list(candidate_group.get("chapter_ids") or []),
+                    "target_titles": list(candidate_group.get("titles") or []),
+                    "group_index": group.get("group_index"),
+                    "candidate_kind": "joined_adjacent" if candidate_group is not group else "single_or_title_group",
+                    "accepted": confidence >= TENTATIVE_CHAPTER_MATCH_THRESHOLD,
+                    "match_strength": "strong" if confidence >= STRONG_CHAPTER_MATCH_THRESHOLD else "tentative" if confidence >= TENTATIVE_CHAPTER_MATCH_THRESHOLD else "reject",
+                    "split_decision": split_decision if candidate_group is group else None,
+                    **score,
+                }
+            )
+    rows.sort(
+        key=lambda row: (
+            row["accepted"],
+            row["confidence"],
+            row["anchor_overlap"],
+            row["last_anchor_overlap"],
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+def _write_chapter_alignment_diagnostics(
+    run_dir: Path,
+    *,
+    project_slug: str,
+    raw_path: Path,
+    translated_path: Path,
+    chapters: list[int],
+    raw_chapters: list[dict[str, Any]],
+    target_chapters: list[dict[str, Any]],
+    chapter_map_rows: list[dict[str, Any]],
+    match_window: int,
+) -> None:
+    raw_index = [_chapter_index_row(chapter, lang="zh") for chapter in raw_chapters]
+    target_index = [_chapter_index_row(chapter, lang="vi") for chapter in target_chapters]
+    chapter_10 = next((chapter for chapter in raw_chapters if int(chapter["chapter_id"]) == 10), None)
+    chapter_10_candidates = (
+        _chapter_diagnostic_candidates(
+            chapter_10,
+            raw_chapters,
+            target_chapters,
+            match_window=match_window,
+        )
+        if chapter_10
+        else []
+    )
+    payload = {
+        "schema_version": "chapter_alignment_diagnostics_v1",
+        "project": project_slug,
+        "raw_path": str(raw_path),
+        "translated_path": str(translated_path),
+        "requested_chapters": chapters,
+        "match_window": match_window,
+        "raw_chapter_count": len(raw_chapters),
+        "translated_chapter_count": len(target_chapters),
+        "chapter_match_rows": chapter_map_rows,
+        "created_at": utc_now(),
+    }
+    write_json(run_dir / "chapter_alignment_diagnostics.json", payload)
+    write_json(run_dir / "raw_chapter_index.json", {"chapters": raw_index, "created_at": utc_now()})
+    write_json(run_dir / "translated_chapter_index.json", {"chapters": target_index, "created_at": utc_now()})
+    write_json(
+        run_dir / "chapter_10_alignment_candidates.json",
+        {
+            "schema_version": "chapter_10_alignment_candidates_v1",
+            "candidate_count": len(chapter_10_candidates),
+            "candidates": chapter_10_candidates,
+            "created_at": utc_now(),
+        },
+    )
+    lines = [
+        "# Chapter Alignment Diagnostics",
+        "",
+        f"- Project: `{project_slug}`",
+        f"- Requested chapters: `{chapters}`",
+        f"- Raw chapters: `{len(raw_chapters)}`",
+        f"- Translated sections: `{len(target_chapters)}`",
+        "",
+        "| Raw | Status | Target IDs | Confidence | Title | Anchor | Tail | Split decision |",
+        "| ---: | --- | --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in chapter_map_rows:
+        split = row.get("split_decision") or {}
+        lines.append(
+            f"| {row.get('source_chapter_id')} | {row.get('status')} | "
+            f"{','.join(str(item) for item in row.get('target_chapter_ids', []))} | "
+            f"{row.get('match_confidence')} | {row.get('title_similarity')} | "
+            f"{row.get('anchor_overlap')} | {row.get('last_anchor_overlap')} | "
+            f"{split.get('reason', '')} |"
+        )
+    _write_text(run_dir / "chapter_alignment_diagnostics.md", "\n".join(lines) + "\n")
+
+    c10_lines = [
+        "# Chapter 10 Alignment Candidates",
+        "",
+        "| Target IDs | Kind | Strength | Confidence | Title | Anchor | Head | Tail | Length | Warnings |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in chapter_10_candidates:
+        c10_lines.append(
+            f"| {','.join(str(item) for item in row.get('target_chapter_ids', []))} | "
+            f"{row.get('candidate_kind')} | {row.get('match_strength')} | {row.get('confidence')} | "
+            f"{row.get('title_similarity')} | {row.get('anchor_overlap')} | "
+            f"{row.get('first_anchor_overlap')} | {row.get('last_anchor_overlap')} | "
+            f"{row.get('length_ratio')} | {', '.join(row.get('warnings', []))} |"
+        )
+    _write_text(run_dir / "chapter_10_alignment_candidates.md", "\n".join(c10_lines) + "\n")
+
+
+def diagnose_chapter_alignment(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    raw_path: Path,
+    translated_path: Path,
+    chapters: str,
+    match_window: int = DEFAULT_CHAPTER_MATCH_WINDOW,
+) -> dict[str, Any]:
+    get_project_by_slug(workspace, project_slug)
+    selected_chapters = parse_chapter_selection(chapters)
+    raw_chapters = extract_raw_chapters(raw_path, max_chapters=max(selected_chapters))
+    target_chapters = extract_epub_chapters(
+        translated_path,
+        max_chapters=max(selected_chapters) * 3 + match_window + 3,
+    )
+    mapping, report_rows = _chapter_title_target_map(
+        raw_chapters,
+        target_chapters,
+        match_window=match_window,
+    )
+    run_dir = new_alignment_diagnostics_run_dir(workspace, project_slug)
+    _write_chapter_alignment_diagnostics(
+        run_dir,
+        project_slug=project_slug,
+        raw_path=raw_path,
+        translated_path=translated_path,
+        chapters=selected_chapters,
+        raw_chapters=raw_chapters,
+        target_chapters=target_chapters,
+        chapter_map_rows=report_rows,
+        match_window=match_window,
+    )
+    chapter_10_row = next((row for row in report_rows if int(row.get("source_chapter_id") or 0) == 10), None)
+    return {
+        "run_dir": str(run_dir),
+        "requested_chapters": selected_chapters,
+        "chapter_10_match": chapter_10_row,
+        "matched_chapter_count": len(mapping),
+        "report_paths": {
+            "diagnostics_json": str(run_dir / "chapter_alignment_diagnostics.json"),
+            "diagnostics_md": str(run_dir / "chapter_alignment_diagnostics.md"),
+            "raw_index": str(run_dir / "raw_chapter_index.json"),
+            "translated_index": str(run_dir / "translated_chapter_index.json"),
+            "chapter_10_candidates_json": str(run_dir / "chapter_10_alignment_candidates.json"),
+            "chapter_10_candidates_md": str(run_dir / "chapter_10_alignment_candidates.md"),
+        },
+    }
 
 
 def _validation_unit_safety(sample: dict[str, Any]) -> dict[str, Any]:
@@ -660,6 +1207,71 @@ def _write_chapter_ablation_report(
     _write_text(run_dir / f"chapter_{chapter}_window_ablation.md", "\n".join(lines) + "\n")
 
 
+def _write_chapter_10_rebuild_report(
+    run_dir: Path,
+    *,
+    source_chapter: dict[str, Any] | None,
+    target_subset: list[dict[str, Any]],
+    match_row: dict[str, Any] | None,
+    rows: list[dict[str, Any]],
+    selected_candidate_id: str | None,
+    selected_sample: dict[str, Any] | None,
+) -> None:
+    payload = {
+        "schema_version": "approved_memory_validation_chapter_10_rebuilt_alignment_v1",
+        "source_chapter": _chapter_index_row(source_chapter, lang="zh") if source_chapter else None,
+        "target_chapters": [_chapter_index_row(chapter, lang="vi") for chapter in target_subset],
+        "match_decision": match_row or {},
+        "selected_candidate_id": selected_candidate_id,
+        "safe_candidate_count": sum(1 for row in rows if row.get("accepted")),
+        "candidate_count": len(rows),
+        "created_at": utc_now(),
+    }
+    write_json(run_dir / "chapter_10_rebuilt_alignment.json", payload)
+    write_json(
+        run_dir / "chapter_10_rebuilt_unit_candidate_ranking.json",
+        {
+            "schema_version": "approved_memory_validation_chapter_10_rebuilt_unit_candidate_ranking_v1",
+            "candidate_count": len(rows),
+            "accepted_candidate_count": sum(1 for row in rows if row.get("accepted")),
+            "selected_candidate_id": selected_candidate_id,
+            "candidates": rows,
+            "created_at": utc_now(),
+        },
+    )
+    if selected_sample:
+        write_json(
+            run_dir / "chapter_10_selected_safe_unit.json",
+            {
+                "schema_version": "approved_memory_validation_chapter_10_selected_safe_unit_v1",
+                "selected_candidate_id": selected_candidate_id,
+                "sample": selected_sample,
+                "created_at": utc_now(),
+            },
+        )
+    lines = [
+        "# Chapter 10 Rebuilt Alignment",
+        "",
+        f"- Source title: `{source_chapter.get('title') if source_chapter else None}`",
+        f"- Target sections: `{', '.join(str(chapter.get('chapter_id')) for chapter in target_subset)}`",
+        f"- Match status: `{(match_row or {}).get('status')}`",
+        f"- Selected candidate: `{selected_candidate_id}`",
+        f"- Safe candidates: `{sum(1 for row in rows if row.get('accepted'))}`",
+        "",
+        "| Candidate | Accepted | Selected | Risk | Align | Source | Ref | Ratio | Reasons |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in rows[:20]:
+        lines.append(
+            f"| {row.get('candidate_id')} | {row.get('accepted')} | {row.get('selected')} | "
+            f"{row.get('risk_score')} | {row.get('alignment_quality')} | "
+            f"{row.get('source_chars')} | {row.get('reference_chars')} | "
+            f"{row.get('ratio')} | {', '.join(row.get('rejected_reasons', [])[:4])} |"
+        )
+    _write_text(run_dir / "chapter_10_rebuilt_alignment.md", "\n".join(lines) + "\n")
+    _write_text(run_dir / "chapter_10_rebuilt_unit_candidate_ranking.md", "\n".join(lines) + "\n")
+
+
 def _active_memory_rows(workspace: Workspace, project_id: str, project_slug: str) -> list[dict[str, Any]]:
     with connection(workspace.db_path) as conn:
         rows = conn.execute(
@@ -979,6 +1591,10 @@ def _select_requested_chapter_samples(
         max_chapters=max(chapters) * 3,
     )
     title_target_map, title_map_rows = _chapter_title_target_map(raw_chapters, target_chapters)
+    title_map_by_chapter = {
+        int(row.get("source_chapter_id") or 0): row
+        for row in title_map_rows
+    }
     raw_by_id = {int(chapter["chapter_id"]): chapter for chapter in raw_chapters}
     target_by_id = {int(chapter["chapter_id"]): chapter for chapter in target_chapters}
     all_candidates: list[dict[str, Any]] = []
@@ -1083,6 +1699,16 @@ def _select_requested_chapter_samples(
                     previous_exclusions=all_exclusions,
                     top_n=candidate_ablation_top_n,
                 )
+            if int(chapter) == 10:
+                _write_chapter_10_rebuild_report(
+                    eval_run,
+                    source_chapter=source_chapter,
+                    target_subset=target_subset,
+                    match_row=title_map_by_chapter.get(10),
+                    rows=chapter_rows,
+                    selected_candidate_id=None,
+                    selected_sample=None,
+                )
             _write_unit_candidate_ranking(eval_run, ranking_rows)
             _write_selected_validation_units(eval_run, selected)
             write_json(
@@ -1140,6 +1766,16 @@ def _select_requested_chapter_samples(
                 previous_exclusions=all_exclusions,
                 top_n=candidate_ablation_top_n,
             )
+            if int(chapter) == 10:
+                _write_chapter_10_rebuild_report(
+                    eval_run,
+                    source_chapter=source_chapter,
+                    target_subset=target_subset,
+                    match_row=title_map_by_chapter.get(10),
+                    rows=chapter_rows,
+                    selected_candidate_id=str(selected_candidate.get("candidate_id")),
+                    selected_sample=selected_sample,
+                )
     write_json(eval_run / "selected_samples.json", {"samples": selected})
     write_json(eval_run / "translation_units.json", translation_units_report(selected))
     write_json(eval_run / "unit_alignment_report.json", unit_alignment_report(selected))

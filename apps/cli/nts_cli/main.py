@@ -11,6 +11,7 @@ from nts_core.approved_memory_validation import (
     DEFAULT_APPROVED_MEMORY_VALIDATION_CHAPTERS,
     DEFAULT_APPROVED_MEMORY_VALIDATION_ROUNDS,
     approved_memory_validation_status,
+    diagnose_chapter_alignment,
     replay_approved_memory_validation,
     resume_approved_memory_validation,
     start_approved_memory_validation,
@@ -898,6 +899,31 @@ def learn_ablate_candidates(
     try:
         ws = discover_workspace(_workspace_arg(workspace))
         result = ablate_learning_candidates(ws, run=run)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("diagnose-chapter-alignment")
+def learn_diagnose_chapter_alignment(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    raw: Annotated[Path, typer.Option("--raw", help="Chinese raw text file.")],
+    translated: Annotated[Path, typer.Option("--translated", help="Human translated EPUB.")],
+    workspace: WorkspaceOption = None,
+    chapters: Annotated[str, typer.Option("--chapters")] = "1-10",
+    match_window: Annotated[int, typer.Option("--match-window")] = 3,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = diagnose_chapter_alignment(
+            ws,
+            project_slug=project,
+            raw_path=raw,
+            translated_path=translated,
+            chapters=chapters,
+            match_window=match_window,
+        )
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)

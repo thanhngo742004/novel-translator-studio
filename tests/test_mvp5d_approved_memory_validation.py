@@ -5,6 +5,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from nts_core.approved_memory_validation import _chapter_title_target_map
 from nts_cli.main import app
 from nts_core.eval_harness import detect_truncated_vietnamese
 
@@ -517,3 +518,127 @@ def test_explicit_candidate_exclusion_selects_alternate_window(
     assert (excluded_run / "chapter_8_window_ablation.json").exists()
     exclusions = json.loads((excluded_run / "excluded_validation_candidates.json").read_text(encoding="utf-8"))
     assert exclusions["used_exclusion_count"] >= 1
+
+
+def test_diagnose_chapter_alignment_reports_chapter_10_join(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "learn",
+            "diagnose-chapter-alignment",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--raw",
+            str(RAW_PATH),
+            "--translated",
+            str(EPUB_PATH),
+            "--chapters",
+            "1-10",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    run_dir = Path(data["run_dir"])
+    assert (run_dir / "chapter_alignment_diagnostics.json").exists()
+    assert (run_dir / "chapter_alignment_diagnostics.md").exists()
+    assert (run_dir / "raw_chapter_index.json").exists()
+    assert (run_dir / "translated_chapter_index.json").exists()
+    assert (run_dir / "chapter_10_alignment_candidates.json").exists()
+    assert data["chapter_10_match"]["target_chapter_ids"] == [13, 14]
+    assert data["chapter_10_match"]["split_decision"]["should_join"] is True
+
+
+def test_chapter_matching_falls_back_when_title_differs() -> None:
+    raw = [
+        {
+            "chapter_id": 1,
+            "title": "第1章 无题",
+            "text": "韩绝在玉清宗修炼灵根。\n\n" * 20,
+        }
+    ]
+    target = [
+        {
+            "chapter_id": 1,
+            "title": "Translator intro",
+            "text": "Không liên quan.\n\n" * 20,
+        },
+        {
+            "chapter_id": 2,
+            "title": "Không có tiêu đề gốc",
+            "text": "Hàn Tuyệt tu luyện linh căn tại Ngọc Thanh Tông.\n\n" * 20,
+        },
+    ]
+
+    mapping, rows = _chapter_title_target_map(raw, target, match_window=2)
+
+    assert mapping[1] == [2]
+    assert rows[0]["status"] == "mapped_by_anchor_fallback"
+    assert rows[0]["match_confidence"] >= 0.60
+
+
+def test_chapter_matching_joins_adjacent_split_section() -> None:
+    raw = [
+        {
+            "chapter_id": 10,
+            "title": "第10章 悲惨的好友，大师兄的好感",
+            "text": (
+                "邢红璇遭遇追杀，好友好感变化。\n\n"
+                + ("普通文字。" * 260)
+                + "\n\n韩绝继续修炼。\n\n后来他在玉清宗达到炼气境和筑基境。"
+            ),
+        },
+        {
+            "chapter_id": 11,
+            "title": "第11章 筑基境九层，树妖的机缘",
+            "text": "树妖出现，韩绝闭关修炼。",
+        },
+    ]
+    target = [
+        {
+            "chapter_id": 13,
+            "title": "Chương 13: Bạn tốt bi thảm, thiện cảm của đại sư huynh",
+            "text": "Hình Hồng Tuyền gặp nạn. Thiện cảm của đại sư huynh thay đổi.",
+        },
+        {
+            "chapter_id": 14,
+            "title": "Chương 14: Trúc Cơ cảnh tầng chín, cơ duyên của Thụ Yêu",
+            "text": "Hàn Tuyệt tiếp tục tu luyện ở Ngọc Thanh Tông rồi đạt Trúc Cơ.",
+        },
+    ]
+
+    mapping, rows = _chapter_title_target_map(raw, target, match_window=2)
+
+    assert mapping[10] == [13, 14]
+    assert rows[0]["status"] == "mapped_joined_adjacent_split"
+    assert rows[0]["split_decision"]["should_join"] is True
+
+
+def test_chapter_matching_rejects_low_confidence_match() -> None:
+    raw = [
+        {
+            "chapter_id": 1,
+            "title": "第1章 无题",
+            "text": "完全没有可用锚点。\n\n" * 10,
+        }
+    ]
+    target = [
+        {
+            "chapter_id": 1,
+            "title": "Không liên quan",
+            "text": "Một đoạn không có cùng tên riêng hoặc thuật ngữ.\n\n" * 10,
+        }
+    ]
+
+    mapping, rows = _chapter_title_target_map(raw, target, match_window=1)
+
+    assert mapping == {}
+    assert rows[0]["status"] == "unmapped"
