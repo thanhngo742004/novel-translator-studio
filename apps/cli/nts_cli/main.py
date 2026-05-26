@@ -927,6 +927,16 @@ def learn_validate_approved_memory(
     rollback_on_regression: Annotated[bool, typer.Option("--rollback-on-regression")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     output_dir: Annotated[Optional[Path], typer.Option("--output-dir")] = None,
+    exclude_candidate_ids: Annotated[Optional[str], typer.Option("--exclude-candidate-ids")] = None,
+    candidate_ablation_top_n: Annotated[int, typer.Option("--candidate-ablation-top-n")] = 5,
+    prefer_no_compression_window: Annotated[
+        bool,
+        typer.Option("--prefer-no-compression-window/--no-prefer-no-compression-window"),
+    ] = True,
+    allow_skip_unsafe_chapter_sample: Annotated[
+        bool,
+        typer.Option("--allow-skip-unsafe-chapter-sample/--no-allow-skip-unsafe-chapter-sample"),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     try:
@@ -951,6 +961,10 @@ def learn_validate_approved_memory(
             rollback_on_regression=rollback_on_regression,
             dry_run=dry_run,
             output_dir=output_dir,
+            exclude_candidate_ids=exclude_candidate_ids,
+            candidate_ablation_top_n=candidate_ablation_top_n,
+            prefer_no_compression_window=prefer_no_compression_window,
+            allow_skip_unsafe_chapter_sample=allow_skip_unsafe_chapter_sample,
         )
     except StablePromptBlocker as exc:
         _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)

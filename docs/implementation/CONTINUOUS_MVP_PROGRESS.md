@@ -993,3 +993,38 @@
   - FAIL. Unit selection repair reduced unsafe-compression failures sharply, but severe flags still persist and neither round reached the required +1.0 improvement threshold.
 - Next recommended phase:
   - Add an explicit chapter 8/10 candidate exclusion or alternate-window ablation step, then retry approved-memory validation only after replay shows no pre-translation unit budget risk for those chapters.
+
+## 2026-05-26T05:00:00+07:00
+
+- Completed code work: MVP5D.3 alternate-window ablation and explicit candidate exclusion for approved-memory validation.
+- Implemented:
+  - Replay now writes `targeted_failure_report.json` and `targeted_failure_report.md` for chapter 8/10 failures.
+  - Replay now writes scoped `validation_candidate_exclusions.json` entries for candidate windows with severe safety root causes.
+  - Validation selector now reads scoped candidate exclusions and supports `--exclude-candidate-ids`.
+  - Added `--candidate-ablation-top-n`, `--prefer-no-compression-window`, and `--allow-skip-unsafe-chapter-sample` flags.
+  - Chapter 8/10 ablation artifacts are written as `chapter_8_window_ablation.*` and `chapter_10_window_ablation.*`.
+  - No-safe-candidate selection failure now returns FAIL with ablation artifacts instead of a provider/environment BLOCKED status.
+- Commands run:
+  - `.venv\Scripts\python.exe -m pytest tests/test_mvp5d_approved_memory_validation.py -q`
+  - `.venv\Scripts\python.exe -m pytest -q`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn replay-approved-memory-validation --workspace workspace_mvp5c_smoke_20260525210758 --run workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779760655652 --json`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn validate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 8,10 --rounds 2 --require-consecutive-improvement --use-stable-prompt --resumable --max-real-calls 12 --json`
+- Test result:
+  - Focused MVP5D tests: 10 passed.
+  - Full suite: 125 passed.
+- Targeted replay result:
+  - Source run: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779760655652`
+  - Failure count: 5.
+  - Root causes: 3 unit merge/boundary problems, 2 over-strict micro-unit budget failures.
+  - Candidate exclusions written: 5 evidence rows, deduplicated to 2 active scoped exclusions for chapters 8 and 10.
+- Targeted real run:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779764546543`
+  - Final decision: FAIL before provider calls.
+  - API calls used: 0.
+  - Chapter 8 ablation selected safe alternate candidate `cand_0009`.
+  - Chapter 10 ablation found no safe alternate after excluding `cand_0012`; top alternatives still had unit budget or boundary risks.
+  - Full 10-chapter validation was intentionally not run because targeted safety did not pass.
+- Final MVP5D.3 decision:
+  - FAIL. The exclusion/ablation path works and avoids real API calls when targeted safety cannot be satisfied, but chapter 10 lacks a safe alternate candidate under current rules.
+- Next recommended phase:
+  - Repair chapter 10 alignment/reference extraction at the source, likely by improving split-EPUB chapter grouping or allowing validated smaller intra-chapter windows with stronger semantic anchor checks.

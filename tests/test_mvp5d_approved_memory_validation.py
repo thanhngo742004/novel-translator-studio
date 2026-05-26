@@ -371,6 +371,9 @@ def test_replay_approved_memory_validation_reports_cached_failures_without_api(
     assert (run_dir / "failing_samples_report.json").exists()
     assert (run_dir / "failing_samples_report.md").exists()
     assert (run_dir / "safety_failure_table.csv").exists()
+    assert (run_dir / "targeted_failure_report.json").exists()
+    assert (run_dir / "targeted_failure_report.md").exists()
+    assert (run_dir / "validation_candidate_exclusions.json").exists()
     report = json.loads((run_dir / "failing_samples_report.json").read_text(encoding="utf-8"))
     assert any(row["sample_id"] == sample["sample_id"] for row in report["failures"])
     assert set(report["root_cause_counts"]).issubset(
@@ -393,6 +396,13 @@ def test_replay_approved_memory_validation_reports_cached_failures_without_api(
         "formatting/bracket safety issue",
         "missing_diagnostics",
     }
+    exclusions = json.loads(
+        (workspace / "artifacts" / "approved_memory_validation" / "validation_candidate_exclusions.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert exclusions["exclusions"]
+    assert exclusions["exclusions"][0]["validation_purpose"] == "approved_memory_validation"
 
 
 def test_title_guided_selection_uses_split_epub_chapters(
@@ -438,3 +448,72 @@ def test_title_guided_selection_uses_split_epub_chapters(
     )
     ranking = json.loads((run_dir / "unit_candidate_ranking.json").read_text(encoding="utf-8"))
     assert any(not row["accepted"] for row in ranking["candidates"])
+
+
+def test_explicit_candidate_exclusion_selects_alternate_window(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    default = validate_command(workspace, extra=["--chapters", "8,10", "--dry-run"])
+    assert default.exit_code == 0, default.output
+    default_run = Path(parse_json(default.output)["data"]["run_dir"])
+    default_resume = runner.invoke(
+        app,
+        [
+            "learn",
+            "resume-approved-memory-validation",
+            "--workspace",
+            str(workspace),
+            "--run",
+            str(default_run),
+            "--max-real-calls",
+            "0",
+            "--json",
+        ],
+    )
+    assert default_resume.exit_code == 0, default_resume.output
+    default_samples = json.loads((default_run / "selected_samples.json").read_text(encoding="utf-8"))[
+        "samples"
+    ]
+    chapter_8_candidate = next(
+        sample["block_alignment_candidate_id"]
+        for sample in default_samples
+        if sample["chapter_id"] == 8
+    )
+
+    excluded = validate_command(
+        workspace,
+        extra=[
+            "--chapters",
+            "8,10",
+            "--dry-run",
+            "--exclude-candidate-ids",
+            f"8:{chapter_8_candidate}",
+        ],
+    )
+    assert excluded.exit_code == 0, excluded.output
+    excluded_run = Path(parse_json(excluded.output)["data"]["run_dir"])
+    excluded_resume = runner.invoke(
+        app,
+        [
+            "learn",
+            "resume-approved-memory-validation",
+            "--workspace",
+            str(workspace),
+            "--run",
+            str(excluded_run),
+            "--max-real-calls",
+            "0",
+            "--json",
+        ],
+    )
+    assert excluded_resume.exit_code == 0, excluded_resume.output
+    samples = json.loads((excluded_run / "selected_samples.json").read_text(encoding="utf-8"))[
+        "samples"
+    ]
+    selected_chapter_8 = next(sample for sample in samples if sample["chapter_id"] == 8)
+    assert selected_chapter_8["block_alignment_candidate_id"] != chapter_8_candidate
+    assert (excluded_run / "chapter_8_window_ablation.json").exists()
+    exclusions = json.loads((excluded_run / "excluded_validation_candidates.json").read_text(encoding="utf-8"))
+    assert exclusions["used_exclusion_count"] >= 1

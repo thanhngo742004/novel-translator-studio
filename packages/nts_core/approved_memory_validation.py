@@ -23,6 +23,7 @@ from nts_core.eval_harness import (
     prepare_parallel,
     read_json,
     sample_from_alignment_candidate,
+    sha256_text,
     translate_samples,
     translation_units_report,
     unit_alignment_report,
@@ -51,10 +52,34 @@ MIN_REFERENCE_SOURCE_RATIO = 1.85
 MAX_REFERENCE_SOURCE_RATIO = 4.6
 MIN_REFERENCE_CHARS_FOR_MEDIUM_SOURCE = 180
 MAX_BLOCKS_PER_SAFE_CANDIDATE = 6
+DATASET_DIAGNOSTIC_FILES = (
+    "alignment_report.json",
+    "chapter_alignment_report.json",
+    "block_alignment_report.json",
+    "alignment_candidates.json",
+    "selected_samples.json",
+    "approved_memory_validation_sample_selection.json",
+    "translation_units.json",
+    "unit_alignment_report.json",
+    "unit_candidate_ranking.json",
+    "unit_candidate_ranking.md",
+    "selected_validation_units.json",
+    "selected_validation_units.md",
+    "excluded_validation_candidates.json",
+    "chapter_8_window_ablation.json",
+    "chapter_8_window_ablation.md",
+    "chapter_10_window_ablation.json",
+    "chapter_10_window_ablation.md",
+)
 
 
 def approved_memory_validation_root(workspace: Workspace) -> Path:
     return workspace.path / "artifacts" / "approved_memory_validation"
+
+
+def validation_candidate_exclusions_path(workspace: Workspace | Path) -> Path:
+    workspace_path = workspace.path if isinstance(workspace, Workspace) else Path(workspace)
+    return workspace_path / "artifacts" / "approved_memory_validation" / "validation_candidate_exclusions.json"
 
 
 def new_validation_run_dir(workspace: Workspace, project_slug: str) -> Path:
@@ -119,6 +144,11 @@ def _copy_dir_if_exists(src: Path, dst: Path) -> None:
                     )
         if warnings:
             write_json(dst / "copy_warnings.json", {"warnings": warnings})
+
+
+def _copy_dataset_diagnostics(eval_run: Path, run_dir: Path) -> None:
+    for name in DATASET_DIAGNOSTIC_FILES:
+        _copy_file_if_exists(eval_run / name, run_dir / name)
 
 
 TITLE_TOKEN_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
@@ -467,6 +497,169 @@ def _write_selected_validation_units(run_dir: Path, samples: list[dict[str, Any]
     _write_text(run_dir / "selected_validation_units.md", "\n".join(lines) + "\n")
 
 
+def _parse_excluded_candidate_ids(raw: str | None) -> list[dict[str, Any]]:
+    exclusions: list[dict[str, Any]] = []
+    if not raw:
+        return exclusions
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            chapter, candidate_id = token.split(":", 1)
+            try:
+                chapter_value: int | None = int(chapter)
+            except ValueError:
+                chapter_value = None
+            exclusions.append(
+                {
+                    "chapter": chapter_value,
+                    "candidate_id": candidate_id.strip(),
+                    "exclusion_reason": "cli_excluded_candidate",
+                    "source": "cli",
+                }
+            )
+        else:
+            exclusions.append(
+                {
+                    "chapter": None,
+                    "candidate_id": token,
+                    "exclusion_reason": "cli_excluded_candidate",
+                    "source": "cli",
+                }
+            )
+    return exclusions
+
+
+def _load_validation_candidate_exclusions(
+    workspace_path: Path,
+    *,
+    project_slug: str,
+) -> list[dict[str, Any]]:
+    path = validation_candidate_exclusions_path(workspace_path)
+    if not path.exists():
+        return []
+    payload = read_json(path)
+    return [
+        exclusion
+        for exclusion in payload.get("exclusions", [])
+        if exclusion.get("project") == project_slug
+        and exclusion.get("validation_purpose") == "approved_memory_validation"
+    ]
+
+
+def _write_validation_candidate_exclusions(
+    workspace_path: Path,
+    exclusions: list[dict[str, Any]],
+) -> None:
+    path = validation_candidate_exclusions_path(workspace_path)
+    existing = read_json(path) if path.exists() else {"schema_version": "validation_candidate_exclusions_v1", "exclusions": []}
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for item in existing.get("exclusions", []):
+        key = (
+            item.get("project"),
+            item.get("validation_purpose"),
+            item.get("chapter"),
+            item.get("candidate_id"),
+            item.get("source_hash"),
+            item.get("reference_hash"),
+        )
+        merged[key] = item
+    for item in exclusions:
+        key = (
+            item.get("project"),
+            item.get("validation_purpose"),
+            item.get("chapter"),
+            item.get("candidate_id"),
+            item.get("source_hash"),
+            item.get("reference_hash"),
+        )
+        merged[key] = item
+    write_json(
+        path,
+        {
+            "schema_version": "validation_candidate_exclusions_v1",
+            "exclusions": sorted(
+                merged.values(),
+                key=lambda item: (
+                    str(item.get("project")),
+                    int(item.get("chapter") or 0),
+                    str(item.get("candidate_id")),
+                    str(item.get("created_at")),
+                ),
+            ),
+            "updated_at": utc_now(),
+        },
+    )
+
+
+def _candidate_is_excluded(
+    *,
+    project_slug: str,
+    chapter: int,
+    candidate: dict[str, Any],
+    exclusions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    candidate_id = str(candidate.get("candidate_id"))
+    source_hash = sha256_text(str(candidate.get("source_text", "")))
+    reference_hash = sha256_text(str(candidate.get("target_text", "")))
+    for exclusion in exclusions:
+        if exclusion.get("project") not in (None, project_slug):
+            continue
+        if exclusion.get("chapter") not in (None, chapter):
+            continue
+        if str(exclusion.get("candidate_id")) != candidate_id:
+            continue
+        exclusion_source_hash = exclusion.get("source_hash")
+        exclusion_reference_hash = exclusion.get("reference_hash")
+        if exclusion_source_hash and exclusion_source_hash != source_hash:
+            continue
+        if exclusion_reference_hash and exclusion_reference_hash != reference_hash:
+            continue
+        return exclusion
+    return None
+
+
+def _write_chapter_ablation_report(
+    run_dir: Path,
+    *,
+    chapter: int,
+    rows: list[dict[str, Any]],
+    selected_candidate_id: str | None,
+    previous_exclusions: list[dict[str, Any]],
+    top_n: int,
+) -> None:
+    considered = rows[:top_n]
+    payload = {
+        "schema_version": "approved_memory_validation_window_ablation_v1",
+        "chapter": chapter,
+        "top_n": top_n,
+        "selected_candidate_id": selected_candidate_id,
+        "previously_excluded_candidate_ids": [
+            item.get("candidate_id") for item in previous_exclusions if item.get("chapter") in (chapter, None)
+        ],
+        "candidates": considered,
+        "created_at": utc_now(),
+    }
+    write_json(run_dir / f"chapter_{chapter}_window_ablation.json", payload)
+    lines = [
+        f"# Chapter {chapter} Window Ablation",
+        "",
+        f"- Selected candidate: `{selected_candidate_id}`",
+        f"- Top N: `{top_n}`",
+        "",
+        "| Candidate | Selected | Accepted | Risk | Align | Source | Ref | Ratio | Reasons |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in considered:
+        lines.append(
+            f"| {row['candidate_id']} | {row['selected']} | {row['accepted']} | {row['risk_score']} | "
+            f"{row['alignment_quality']} | {row['source_chars']} | {row['reference_chars']} | "
+            f"{row['ratio']} | {', '.join(row['rejected_reasons'][:4])} |"
+        )
+    _write_text(run_dir / f"chapter_{chapter}_window_ablation.md", "\n".join(lines) + "\n")
+
+
 def _active_memory_rows(workspace: Workspace, project_id: str, project_slug: str) -> list[dict[str, Any]]:
     with connection(workspace.db_path) as conn:
         rows = conn.execute(
@@ -658,6 +851,10 @@ def _initial_state(
     max_real_calls: int | None,
     require_consecutive_improvement: bool,
     rollback_on_regression: bool,
+    exclude_candidate_ids: str | None,
+    candidate_ablation_top_n: int,
+    prefer_no_compression_window: bool,
+    allow_skip_unsafe_chapter_sample: bool,
 ) -> dict[str, Any]:
     selected_chapters = parse_chapter_selection(chapters)
     return {
@@ -686,6 +883,10 @@ def _initial_state(
         "api_calls_used": 0,
         "require_consecutive_improvement": require_consecutive_improvement,
         "rollback_on_regression": rollback_on_regression,
+        "exclude_candidate_ids": exclude_candidate_ids,
+        "candidate_ablation_top_n": candidate_ablation_top_n,
+        "prefer_no_compression_window": prefer_no_compression_window,
+        "allow_skip_unsafe_chapter_sample": allow_skip_unsafe_chapter_sample,
         "current_stage": "initialized",
         "current_round": 0,
         "completed_stages": [],
@@ -713,12 +914,21 @@ def _prepare_dataset(run_dir: Path, state: dict[str, Any]) -> None:
         merge_tiny_paragraphs=True,
     )
     eval_run = Path(prepared["run_dir"])
-    samples = _select_requested_chapter_samples(
-        eval_run,
-        state["chapters"],
-        raw_path=Path(state["raw_path"]),
-        translated_path=Path(state["translated_path"]),
-    )
+    try:
+        samples = _select_requested_chapter_samples(
+            eval_run,
+            state["chapters"],
+            raw_path=Path(state["raw_path"]),
+            translated_path=Path(state["translated_path"]),
+            project_slug=str(state["project_slug"]),
+            workspace_path=Path(state["workspace"]),
+            explicit_exclude_candidate_ids=state.get("exclude_candidate_ids"),
+            candidate_ablation_top_n=int(state.get("candidate_ablation_top_n") or 5),
+            allow_skip_unsafe_chapter_sample=bool(state.get("allow_skip_unsafe_chapter_sample")),
+        )
+    except ValueError:
+        _copy_dataset_diagnostics(eval_run, run_dir)
+        raise
     low_alignment = [
         sample
         for sample in samples
@@ -727,21 +937,7 @@ def _prepare_dataset(run_dir: Path, state: dict[str, Any]) -> None:
     ]
     if low_alignment:
         raise ValueError("Low-alignment sample was selected; approved-memory validation is blocked.")
-    for name in (
-        "alignment_report.json",
-        "chapter_alignment_report.json",
-        "block_alignment_report.json",
-        "alignment_candidates.json",
-        "selected_samples.json",
-        "approved_memory_validation_sample_selection.json",
-        "translation_units.json",
-        "unit_alignment_report.json",
-        "unit_candidate_ranking.json",
-        "unit_candidate_ranking.md",
-        "selected_validation_units.json",
-        "selected_validation_units.md",
-    ):
-        _copy_file_if_exists(eval_run / name, run_dir / name)
+    _copy_dataset_diagnostics(eval_run, run_dir)
     alignment_payload = read_json(eval_run / "alignment_report.json") if (eval_run / "alignment_report.json").exists() else {}
     write_json(run_dir / "alignment_report.json", alignment_payload)
     _write_text(
@@ -771,6 +967,11 @@ def _select_requested_chapter_samples(
     *,
     raw_path: Path,
     translated_path: Path,
+    project_slug: str = "",
+    workspace_path: Path | None = None,
+    explicit_exclude_candidate_ids: str | None = None,
+    candidate_ablation_top_n: int = 5,
+    allow_skip_unsafe_chapter_sample: bool = False,
 ) -> list[dict[str, Any]]:
     raw_chapters = extract_raw_chapters(raw_path, max_chapters=max(chapters))
     target_chapters = extract_epub_chapters(
@@ -784,6 +985,14 @@ def _select_requested_chapter_samples(
     selected_candidates: list[dict[str, Any]] = []
     ranking_rows: list[dict[str, Any]] = []
     selected = []
+    file_exclusions = (
+        _load_validation_candidate_exclusions(workspace_path, project_slug=project_slug)
+        if workspace_path and project_slug
+        else []
+    )
+    cli_exclusions = _parse_excluded_candidate_ids(explicit_exclude_candidate_ids)
+    all_exclusions = [*file_exclusions, *cli_exclusions]
+    used_exclusions: list[dict[str, Any]] = []
     for chapter in chapters:
         expected_targets = set(title_target_map.get(int(chapter), []))
         source_chapter = raw_by_id.get(int(chapter))
@@ -822,6 +1031,27 @@ def _select_requested_chapter_samples(
                 candidate,
                 sample_id=f"sample_{len(selected) + 1}",
             )
+            exclusion = _candidate_is_excluded(
+                project_slug=project_slug,
+                chapter=int(chapter),
+                candidate=candidate,
+                exclusions=all_exclusions,
+            )
+            if exclusion:
+                safety = dict(safety)
+                safety["accepted"] = False
+                safety["risk_score"] = int(safety.get("risk_score") or 0) + 100
+                safety["compression_risk"] = "excluded"
+                safety["hard_rejections"] = [
+                    *list(safety.get("hard_rejections") or []),
+                    "excluded_previous_severe_failure",
+                ]
+                safety["boundary_warnings"] = [
+                    *list(safety.get("boundary_warnings") or []),
+                    "excluded_previous_severe_failure",
+                ]
+                sample["validation_unit_safety"] = safety
+                used_exclusions.append(exclusion)
             candidate_samples.append((candidate, sample, safety))
             ranking_rows.append(
                 _candidate_ranking_row(
@@ -836,6 +1066,38 @@ def _select_requested_chapter_samples(
             if safety["accepted"]
         ]
         if not safe_candidates:
+            chapter_rows = [row for row in ranking_rows if row["chapter"] == int(chapter)]
+            chapter_rows.sort(
+                key=lambda row: (
+                    int(row.get("risk_score") or 0),
+                    -float(row.get("alignment_quality") or 0),
+                    -int(row.get("source_chars") or 0),
+                )
+            )
+            if int(chapter) in {8, 10}:
+                _write_chapter_ablation_report(
+                    eval_run,
+                    chapter=int(chapter),
+                    rows=chapter_rows,
+                    selected_candidate_id=None,
+                    previous_exclusions=all_exclusions,
+                    top_n=candidate_ablation_top_n,
+                )
+            _write_unit_candidate_ranking(eval_run, ranking_rows)
+            _write_selected_validation_units(eval_run, selected)
+            write_json(
+                eval_run / "excluded_validation_candidates.json",
+                {
+                    "schema_version": "approved_memory_validation_excluded_candidates_v1",
+                    "project": project_slug,
+                    "used_exclusion_count": len(used_exclusions),
+                    "available_exclusion_count": len(all_exclusions),
+                    "used_exclusions": used_exclusions,
+                    "created_at": utc_now(),
+                },
+            )
+            if allow_skip_unsafe_chapter_sample:
+                continue
             expected_text = (
                 ", ".join(str(item) for item in sorted(expected_targets))
                 if expected_targets
@@ -861,11 +1123,39 @@ def _select_requested_chapter_samples(
                 row["selected"] = True
                 row["accepted"] = True
                 row["rejected_reasons"] = []
+        if int(chapter) in {8, 10}:
+            chapter_rows = [row for row in ranking_rows if row["chapter"] == int(chapter)]
+            chapter_rows.sort(
+                key=lambda row: (
+                    int(row.get("risk_score") or 0),
+                    -float(row.get("alignment_quality") or 0),
+                    -int(row.get("source_chars") or 0),
+                )
+            )
+            _write_chapter_ablation_report(
+                eval_run,
+                chapter=int(chapter),
+                rows=chapter_rows,
+                selected_candidate_id=str(selected_candidate.get("candidate_id")),
+                previous_exclusions=all_exclusions,
+                top_n=candidate_ablation_top_n,
+            )
     write_json(eval_run / "selected_samples.json", {"samples": selected})
     write_json(eval_run / "translation_units.json", translation_units_report(selected))
     write_json(eval_run / "unit_alignment_report.json", unit_alignment_report(selected))
     _write_unit_candidate_ranking(eval_run, ranking_rows)
     _write_selected_validation_units(eval_run, selected)
+    write_json(
+        eval_run / "excluded_validation_candidates.json",
+        {
+            "schema_version": "approved_memory_validation_excluded_candidates_v1",
+            "project": project_slug,
+            "used_exclusion_count": len(used_exclusions),
+            "available_exclusion_count": len(all_exclusions),
+            "used_exclusions": used_exclusions,
+            "created_at": utc_now(),
+        },
+    )
     write_json(
         eval_run / "alignment_candidates.json",
         {
@@ -1200,6 +1490,9 @@ def replay_approved_memory_validation(workspace: Workspace, *, run: str) -> dict
                         "model": model,
                         "sample_id": sample_id,
                         "chapter_number": score_sample.get("chapter_id") or sample.get("chapter_id"),
+                        "candidate_id": sample.get("block_alignment_candidate_id"),
+                        "source_hash": sha256_text(str(sample.get("source_text", ""))),
+                        "reference_hash": sha256_text(str(sample.get("target_text", ""))),
                         "source_text": sample.get("source_text", ""),
                         "human_reference": sample.get("target_text", ""),
                         "model_output_before_compression": before,
@@ -1260,6 +1553,7 @@ def replay_approved_memory_validation(workspace: Workspace, *, run: str) -> dict
                 "round",
                 "phase",
                 "sample_id",
+                "candidate_id",
                 "chapter_number",
                 "root_cause",
                 "output_reference_ratio",
@@ -1276,6 +1570,7 @@ def replay_approved_memory_validation(workspace: Workspace, *, run: str) -> dict
                     "round": row["round"],
                     "phase": row["phase"],
                     "sample_id": row["sample_id"],
+                    "candidate_id": row.get("candidate_id"),
                     "chapter_number": row["chapter_number"],
                     "root_cause": row["root_cause"],
                     "output_reference_ratio": row["output_reference_ratio"],
@@ -1332,10 +1627,112 @@ def replay_approved_memory_validation(workspace: Workspace, *, run: str) -> dict
             ]
         )
     _write_text(run_dir / "failing_samples_report.md", "\n".join(lines) + "\n")
+    targeted = [
+        row
+        for row in rows
+        if int(row.get("chapter_number") or 0) in {8, 10}
+    ]
+    write_json(
+        run_dir / "targeted_failure_report.json",
+        {
+            "schema_version": "approved_memory_validation_targeted_failure_report_v1",
+            "chapters": [8, 10],
+            "failure_count": len(targeted),
+            "failures": targeted,
+            "created_at": utc_now(),
+        },
+    )
+    targeted_lines = [
+        "# Targeted Chapter 8/10 Failure Report",
+        "",
+        f"- Validation run: `{run_dir.name}`",
+        f"- Failure count: `{len(targeted)}`",
+        "",
+        "| Chapter | Round | Phase | Sample | Candidate | Root cause | Ratio |",
+        "| ---: | ---: | --- | --- | --- | --- | ---: |",
+    ]
+    for row in targeted:
+        targeted_lines.append(
+            f"| {row['chapter_number']} | {row['round']} | {row['phase']} | {row['sample_id']} | "
+            f"{row.get('candidate_id')} | {row['root_cause']} | {row.get('output_reference_ratio')} |"
+        )
+    for row in targeted:
+        targeted_lines.extend(
+            [
+                "",
+                f"## Chapter {row['chapter_number']} {row['phase']} {row['sample_id']}",
+                "",
+                f"- Candidate: `{row.get('candidate_id')}`",
+                f"- Root cause: `{row['root_cause']}`",
+                f"- Compression reasons: `{json_dumps(row.get('unsafe_compression_reasons', []))}`",
+                "",
+                "Source:",
+                "",
+                row.get("source_text", "")[:1600],
+                "",
+                "Reference:",
+                "",
+                row.get("human_reference", "")[:1600],
+                "",
+                "Before compression:",
+                "",
+                row.get("model_output_before_compression", "")[:1600],
+                "",
+                "After compression:",
+                "",
+                row.get("model_output_after_compression", "")[:1600],
+                "",
+                "Selected final:",
+                "",
+                row.get("selected_final_output", "")[:1600],
+            ]
+        )
+    _write_text(run_dir / "targeted_failure_report.md", "\n".join(targeted_lines) + "\n")
+
+    state = read_json(run_dir / "validation_job_state.json")
+    exclusions: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("root_cause") not in {
+            "unit_merge_boundary_problem",
+            "over_strict_micro_unit_budget",
+            "unsafe_compression_rewrite",
+            "real_truncation",
+            "formatting/bracket safety issue",
+        }:
+            continue
+        candidate_id = row.get("candidate_id")
+        if not candidate_id:
+            continue
+        exclusions.append(
+            {
+                "project": state.get("project_slug"),
+                "validation_purpose": "approved_memory_validation",
+                "chapter": int(row.get("chapter_number") or 0),
+                "candidate_id": candidate_id,
+                "exclusion_reason": row.get("root_cause"),
+                "evidence_run_id": run_dir.name,
+                "source_hash": row.get("source_hash"),
+                "reference_hash": row.get("reference_hash"),
+                "created_at": utc_now(),
+            }
+        )
+    if exclusions:
+        _write_validation_candidate_exclusions(workspace.path, exclusions)
+    write_json(
+        run_dir / "validation_candidate_exclusions.json",
+        {
+            "schema_version": "validation_candidate_exclusions_evidence_v1",
+            "exclusion_count": len(exclusions),
+            "exclusions": exclusions,
+            "created_at": utc_now(),
+        },
+    )
     return {
         "validation_run_id": run_dir.name,
         "run_dir": str(run_dir),
         "failure_count": len(rows),
+        "targeted_failure_count": len(targeted),
+        "exclusion_count": len(exclusions),
         "root_cause_counts": {
             cause: sum(1 for row in rows if row["root_cause"] == cause)
             for cause in sorted({row["root_cause"] for row in rows})
@@ -1344,6 +1741,9 @@ def replay_approved_memory_validation(workspace: Workspace, *, run: str) -> dict
             "json": str(run_dir / "failing_samples_report.json"),
             "markdown": str(run_dir / "failing_samples_report.md"),
             "csv": str(run_dir / "safety_failure_table.csv"),
+            "targeted_json": str(run_dir / "targeted_failure_report.json"),
+            "targeted_markdown": str(run_dir / "targeted_failure_report.md"),
+            "exclusions": str(run_dir / "validation_candidate_exclusions.json"),
         },
     }
 
@@ -1583,6 +1983,15 @@ def _block(run_dir: Path, state: dict[str, Any], reason: str, *, can_resume: boo
     _write_final_summary(run_dir, state, reason=reason)
 
 
+def _fail_validation(run_dir: Path, state: dict[str, Any], reason: str) -> None:
+    state["status"] = "failed"
+    state["final_decision"] = "FAIL"
+    state["last_error"] = reason
+    state["can_resume"] = False
+    _mark_stage(run_dir, state, state.get("current_stage") or "unknown", "failed", {"reason": reason})
+    _write_final_summary(run_dir, state, reason=reason)
+
+
 def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -> None:
     rounds = state.get("round_results", [])
     final_summary = {
@@ -1686,6 +2095,10 @@ def start_approved_memory_validation(
     rollback_on_regression: bool = False,
     dry_run: bool = False,
     output_dir: Path | None = None,
+    exclude_candidate_ids: str | None = None,
+    candidate_ablation_top_n: int = 5,
+    prefer_no_compression_window: bool = True,
+    allow_skip_unsafe_chapter_sample: bool = False,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
         raise ValueError("--use-stable-prompt is required.")
@@ -1719,6 +2132,10 @@ def start_approved_memory_validation(
         max_real_calls=max_real_calls,
         require_consecutive_improvement=require_consecutive_improvement,
         rollback_on_regression=rollback_on_regression,
+        exclude_candidate_ids=exclude_candidate_ids,
+        candidate_ablation_top_n=candidate_ablation_top_n,
+        prefer_no_compression_window=prefer_no_compression_window,
+        allow_skip_unsafe_chapter_sample=allow_skip_unsafe_chapter_sample,
     )
     state["approved_memory_ids"] = [item["id"] for item in approved_memory]
     state["stable_prompt_path"] = stable_prompt.prompt_path
@@ -1909,7 +2326,10 @@ def resume_approved_memory_validation(
                 "retryable": retryable,
             },
         )
-        _block(run_dir, state, f"provider_or_validation_error: {message}", can_resume=retryable)
+        if message.startswith("No reliable title-matched alignment sample found"):
+            _fail_validation(run_dir, state, f"validation_candidate_selection_failed: {message}")
+        else:
+            _block(run_dir, state, f"provider_or_validation_error: {message}", can_resume=retryable)
         return _finalize_result(workspace, run_dir, state)
 
 
