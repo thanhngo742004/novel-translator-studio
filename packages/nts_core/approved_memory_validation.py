@@ -1502,15 +1502,22 @@ def _write_memory_delta_context(
 def _memory_prompt_section(memory_items: list[dict[str, Any]], *, title: str) -> str:
     if not memory_items:
         return f"{title}\n- None supplied.\n"
-    lines = [title]
+    lines = [
+        title,
+        "- Apply a memory item only when its source text appears in the current source unit JSON.",
+        "- Ignore listed memory items whose source trigger is absent from the current sample/unit.",
+    ]
     for item in memory_items:
         rules = item.get("rules_json") or {}
+        value = item.get("value_json") or {}
         forbidden = rules.get("forbidden_variants") or []
         lines.append(
             "- "
             f"id={item['id']}; type={item['memory_type']}; "
             f"source={item.get('source_key')}; preferred={item.get('target_text')}; "
-            f"forbidden={json_dumps(forbidden)}; confidence={item.get('confidence_score')}"
+            f"forbidden={json_dumps(forbidden)}; confidence={item.get('confidence_score')}; "
+            f"context_required={value.get('context_required') or rules.get('context_required') or ''}; "
+            f"exclude_chapters={json_dumps(value.get('exclude_chapters') or rules.get('exclude_chapters') or [])}"
         )
     return "\n".join(lines) + "\n"
 
@@ -1559,6 +1566,25 @@ def _selected_validation_source_text(run_dir: Path) -> str:
     return ""
 
 
+def _selected_validation_chapters(run_dir: Path) -> set[int]:
+    chapters: set[int] = set()
+    for name in ("selected_samples.json", "selected_validation_units.json"):
+        path = run_dir / name
+        if not path.exists():
+            continue
+        payload = read_json(path)
+        for sample in payload.get("samples", []):
+            if not isinstance(sample, dict):
+                continue
+            chapter = sample.get("chapter_id")
+            try:
+                if chapter is not None:
+                    chapters.add(int(chapter))
+            except (TypeError, ValueError):
+                continue
+    return chapters
+
+
 def _is_source_pattern_present(source_text: str, source_pattern: str | None) -> bool:
     if not source_pattern:
         return False
@@ -1569,16 +1595,25 @@ def _is_source_pattern_present(source_text: str, source_pattern: str | None) -> 
 
 def _memory_context_gate(item: dict[str, Any], source_text: str) -> tuple[bool, str | None]:
     source_pattern = _memory_source_pattern(item)
+    value = item.get("value_json") or {}
+    rules = item.get("rules_json") or {}
+    context_required = str(value.get("context_required") or rules.get("context_required") or "")
     if source_pattern == "技能":
         panel_match = re.search(r"【[^】]*技能[^】]*】", source_text or "")
         if not panel_match:
             return False, "context_gate_failed:skills_requires_system_panel"
+    if context_required in {"system_panel", "game_ui"} and not re.search(r"【[^】]+】", source_text or ""):
+        return False, f"context_gate_failed:{context_required}"
+    if context_required == "name_only" and item.get("memory_type") != "name":
+        return False, "context_gate_failed:name_only"
     return True, None
 
 
 def _memory_negative_gate(item: dict[str, Any]) -> tuple[bool, str | None]:
     value = item.get("value_json") or {}
     confidence = item.get("confidence_json") or {}
+    if value.get("deprecated_for_validation") is True:
+        return False, "negative_evidence_gate:deprecated_for_validation"
     blocked_statuses = {
         "rejected_after_validation",
         "pending_needs_scoped_review",
@@ -1586,6 +1621,7 @@ def _memory_negative_gate(item: dict[str, Any]) -> tuple[bool, str | None]:
         "harmful_only_in_combination",
         "insufficient_evidence",
         "pending_review",
+        "deprecated_for_validation",
     }
     for field in ("status", "review_status", "validation_status", "impact_classification"):
         if str(value.get(field) or "") in blocked_statuses:
@@ -1600,6 +1636,7 @@ def _memory_applicability_rows(
     memory_items: list[dict[str, Any]],
     source_text: str,
     phase: str,
+    chapters: set[int] | None = None,
     cap: int = 24,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
@@ -1614,6 +1651,19 @@ def _memory_applicability_rows(
         if not _is_source_pattern_present(source_text, source_pattern):
             include = False
             reasons.append("exact_source_trigger_absent")
+        value = item.get("value_json") or {}
+        rules = item.get("rules_json") or {}
+        excluded_chapters = {
+            int(chapter)
+            for chapter in (value.get("exclude_chapters") or rules.get("exclude_chapters") or [])
+            if str(chapter).strip().lstrip("-").isdigit()
+        }
+        if chapters and excluded_chapters and chapters & excluded_chapters:
+            include = False
+            reasons.append(
+                "scope_gate:excluded_chapter="
+                + ",".join(str(chapter) for chapter in sorted(chapters & excluded_chapters))
+            )
         context_ok, context_reason = _memory_context_gate(item, source_text)
         if not context_ok:
             include = False
@@ -1644,17 +1694,19 @@ def _memory_applicability_rows(
     return included, rows
 
 
-def _filter_prompt_memory(
+def _filter_prompt_memory_for_context(
     run_dir: Path,
     *,
     memory_items: list[dict[str, Any]],
     phase: str,
+    source_text: str,
+    chapters: set[int],
 ) -> list[dict[str, Any]]:
-    source_text = _selected_validation_source_text(run_dir)
     included, rows = _memory_applicability_rows(
         memory_items=memory_items,
         source_text=source_text,
         phase=phase,
+        chapters=chapters,
     )
     existing_applicability: dict[str, Any] = (
         read_json(run_dir / "memory_applicability_report.json")
@@ -1667,6 +1719,7 @@ def _filter_prompt_memory(
     )
     existing_applicability.setdefault("phases", {})[phase] = {
         "source_char_count": len(source_text),
+        "chapters": sorted(chapters),
         "input_memory_count": len(memory_items),
         "included_memory_count": len(included),
         "excluded_memory_count": len(memory_items) - len(included),
@@ -1683,6 +1736,7 @@ def _filter_prompt_memory(
         }
     )
     filter_report.setdefault("phases", {})[phase] = {
+        "chapters": sorted(chapters),
         "included_memory_ids": [item["id"] for item in included],
         "excluded_memory_ids": [row["memory_id"] for row in rows if not row["included"]],
         "rows": rows,
@@ -1711,6 +1765,62 @@ def _filter_prompt_memory(
     _write_text(run_dir / "memory_applicability_report.md", "\n".join(lines) + "\n")
     _write_text(run_dir / "prompt_memory_filter_report.md", "\n".join(lines).replace("Memory Applicability", "Prompt Memory Filter") + "\n")
     return included
+
+
+def _filter_prompt_memory(
+    run_dir: Path,
+    *,
+    memory_items: list[dict[str, Any]],
+    phase: str,
+) -> list[dict[str, Any]]:
+    return _filter_prompt_memory_for_context(
+        run_dir,
+        memory_items=memory_items,
+        phase=phase,
+        source_text=_selected_validation_source_text(run_dir),
+        chapters=_selected_validation_chapters(run_dir),
+    )
+
+
+def _validation_prompts_by_sample(
+    run_dir: Path,
+    *,
+    stable_prompt: StablePromptRecord,
+    memory_items: list[dict[str, Any]],
+    excluded_memory: list[dict[str, Any]],
+    phase: str,
+) -> dict[str, str]:
+    samples_path = run_dir / "selected_samples.json"
+    if not samples_path.exists():
+        return {}
+    prompts: dict[str, str] = {}
+    for sample in read_json(samples_path).get("samples", []):
+        if not isinstance(sample, dict):
+            continue
+        sample_id = str(sample.get("sample_id") or "")
+        if not sample_id:
+            continue
+        chapter = sample.get("chapter_id")
+        chapters: set[int] = set()
+        try:
+            if chapter is not None:
+                chapters.add(int(chapter))
+        except (TypeError, ValueError):
+            chapters = set()
+        included = _filter_prompt_memory_for_context(
+            run_dir,
+            memory_items=memory_items,
+            phase=f"{phase}:{sample_id}",
+            source_text=str(sample.get("source_text") or ""),
+            chapters=chapters,
+        )
+        prompts[sample_id] = _validation_prompt(
+            stable_prompt,
+            included_memory=included,
+            excluded_memory=excluded_memory,
+            phase=f"{phase}:{sample_id}",
+        )
+    return prompts
 
 
 def _planned_stages(rounds: int) -> list[str]:
@@ -2859,6 +2969,7 @@ def _run_phase(
     state: dict[str, Any],
     phase: str,
     prompt_text: str,
+    prompt_text_by_sample: dict[str, str] | None = None,
     model: str,
     round_index: int,
 ) -> tuple[dict[str, Any], Path]:
@@ -2874,6 +2985,7 @@ def _run_phase(
         merge_tiny_paragraphs=True,
         sample_limit=len(state["chapters"]),
         stable_prompt_text=prompt_text,
+        stable_prompt_text_by_sample=prompt_text_by_sample,
         provider_retry_attempts=3,
         provider_retry_backoff_seconds=0.0 if state["provider"] == "mock" else 5.0,
         validation_index=round_index,
@@ -3277,6 +3389,13 @@ def resume_approved_memory_validation(
             memory_items=memory_pass_memory,
             phase="approved_memory",
         )
+        _write_active_memory_snapshot(
+            run_dir,
+            active_memory=all_active_memory,
+            baseline_memory=baseline_memory,
+            memory_pass=memory_pass_memory,
+            baseline_excluded=baseline_excluded,
+        )
         eval_run = Path(read_json(run_dir / "validation_manifest.json")["eval_run_dir"])
         model = str(state.get("active_model") or state.get("model"))
         round_results = list(state.get("round_results", []))
@@ -3306,11 +3425,19 @@ def resume_approved_memory_validation(
                     excluded_memory=baseline_excluded,
                     phase=f"round_{round_index}_baseline",
                 )
+                prompt_by_sample = _validation_prompts_by_sample(
+                    run_dir,
+                    stable_prompt=stable_prompt,
+                    memory_items=baseline_memory,
+                    excluded_memory=baseline_excluded,
+                    phase=f"round_{round_index}_baseline",
+                )
                 baseline_report, eval_run = _run_phase(
                     run_dir=run_dir,
                     state=state,
                     phase="baseline",
                     prompt_text=prompt,
+                    prompt_text_by_sample=prompt_by_sample,
                     model=model,
                     round_index=round_index,
                 )
@@ -3346,11 +3473,19 @@ def resume_approved_memory_validation(
                     excluded_memory=[],
                     phase=f"round_{round_index}_approved_memory",
                 )
+                prompt_by_sample = _validation_prompts_by_sample(
+                    run_dir,
+                    stable_prompt=stable_prompt,
+                    memory_items=memory_pass_memory,
+                    excluded_memory=[],
+                    phase=f"round_{round_index}_approved_memory",
+                )
                 memory_report, eval_run = _run_phase(
                     run_dir=run_dir,
                     state=state,
                     phase="memory",
                     prompt_text=prompt,
+                    prompt_text_by_sample=prompt_by_sample,
                     model=model,
                     round_index=round_index,
                 )

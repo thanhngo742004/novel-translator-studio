@@ -384,11 +384,37 @@ def test_memory_applicability_gates_exact_context_and_negative_evidence() -> Non
         },
         "rules_json": {},
     }
+    deprecated_for_validation = {
+        "id": "memory_deprecated_for_validation",
+        "status": "active",
+        "memory_type": "name",
+        "source_key": "玉清宗",
+        "target_text": "Ngọc Thanh Tông",
+        "value_json": {"deprecated_for_validation": True},
+        "rules_json": {},
+    }
+    excluded_chapter = {
+        "id": "memory_excluded_chapter",
+        "status": "active",
+        "memory_type": "name",
+        "source_key": "玉清宗",
+        "target_text": "Ngọc Thanh Tông",
+        "value_json": {"exclude_chapters": [10]},
+        "rules_json": {},
+    }
 
     included, rows = _memory_applicability_rows(
-        memory_items=[active_relevant, absent, unsafe_context, negative],
+        memory_items=[
+            active_relevant,
+            absent,
+            unsafe_context,
+            negative,
+            deprecated_for_validation,
+            excluded_chapter,
+        ],
         source_text=source_text,
         phase="approved_memory",
+        chapters={10},
     )
 
     assert [item["id"] for item in included] == ["memory_relevant"]
@@ -399,6 +425,10 @@ def test_memory_applicability_gates_exact_context_and_negative_evidence() -> Non
         reason.startswith("negative_evidence_gate")
         for reason in by_id["memory_negative"]["reasons"]
     )
+    assert "negative_evidence_gate:deprecated_for_validation" in by_id[
+        "memory_deprecated_for_validation"
+    ]["reasons"]
+    assert "scope_gate:excluded_chapter=10" in by_id["memory_excluded_chapter"]["reasons"]
 
 
 def test_validate_approved_memory_status_command(tmp_path: Path, monkeypatch) -> None:

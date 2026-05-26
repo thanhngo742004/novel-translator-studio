@@ -3618,6 +3618,7 @@ def translate_samples(
     sample_limit: int | None = None,
     prompt_iteration: int = 1,
     stable_prompt_text: str | None = None,
+    stable_prompt_text_by_sample: dict[str, str] | None = None,
     provider_retry_attempts: int = 1,
     provider_retry_backoff_seconds: float = 0.0,
     validation_index: int | None = None,
@@ -3655,7 +3656,7 @@ def translate_samples(
         sample_dir = translations_root / sample_id
         sample_dir.mkdir(parents=True, exist_ok=True)
         source = sample["source_text"][:max_source_chars]
-        system_prompt = stable_prompt_text or translation_system_prompt(
+        system_prompt = (stable_prompt_text_by_sample or {}).get(sample_id) or stable_prompt_text or translation_system_prompt(
             run_dir,
             sample=sample,
             prompt_iteration=prompt_iteration,

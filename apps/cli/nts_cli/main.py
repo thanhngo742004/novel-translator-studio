@@ -80,10 +80,13 @@ from nts_core.memory import (
 from nts_core.memory_impact import (
     ablate_approved_memory,
     ablate_memory_regression,
+    ablate_original_memory_regression,
     diagnose_memory_regression,
+    diagnose_original_memory_regression,
     mine_memory_candidates,
     review_active_memory_risk,
     rollback_approved_memory,
+    scope_approved_memory,
     simulate_memory_bundle,
 )
 from nts_core.model_test import run_mock_model_test
@@ -1192,6 +1195,89 @@ def learn_review_active_memory_risk(
             ws,
             project_slug=project,
             validation_run=validation_run,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("diagnose-original-memory-regression")
+def learn_diagnose_original_memory_regression(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    validation_run: Annotated[str, typer.Option("--validation-run", help="Validation run id or path.")],
+    chapter: Annotated[int, typer.Option("--chapter", help="Chapter number to inspect.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = diagnose_original_memory_regression(
+            ws,
+            project_slug=project,
+            validation_run=validation_run,
+            chapter=chapter,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("ablate-original-memory-regression")
+def learn_ablate_original_memory_regression(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    validation_run: Annotated[str, typer.Option("--validation-run", help="Validation run id or path.")],
+    chapter: Annotated[int, typer.Option("--chapter", help="Chapter number to ablate.")],
+    memory_ids: Annotated[str, typer.Option("--memory-ids", help="Comma-separated original memory ids.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = ablate_original_memory_regression(
+            ws,
+            project_slug=project,
+            validation_run=validation_run,
+            chapter=chapter,
+            memory_ids=memory_ids,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("scope-approved-memory")
+def learn_scope_approved_memory(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    memory_ids: Annotated[str, typer.Option("--memory-ids", help="Comma-separated memory ids.")],
+    reason: Annotated[str, typer.Option("--reason", help="Scope/deprecation reason.")],
+    workspace: WorkspaceOption = None,
+    validation_run: Annotated[Optional[str], typer.Option("--validation-run")] = None,
+    chapter: Annotated[Optional[int], typer.Option("--chapter")] = None,
+    exclude_chapters: Annotated[Optional[str], typer.Option("--exclude-chapters")] = None,
+    context_required: Annotated[Optional[str], typer.Option("--context-required")] = None,
+    deprecated_for_validation: Annotated[
+        bool,
+        typer.Option("--deprecated-for-validation/--scoped-only"),
+    ] = True,
+    exact_source_required: Annotated[
+        bool,
+        typer.Option("--exact-source-required/--no-exact-source-required"),
+    ] = True,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = scope_approved_memory(
+            ws,
+            project_slug=project,
+            memory_ids=memory_ids,
+            reason=reason,
+            validation_run=validation_run,
+            chapter=chapter,
+            exclude_chapters=exclude_chapters,
+            context_required=context_required,
+            deprecated_for_validation=deprecated_for_validation,
+            exact_source_required=exact_source_required,
         )
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)

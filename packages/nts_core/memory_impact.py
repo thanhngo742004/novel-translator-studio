@@ -10,7 +10,7 @@ from typing import Any
 from nts_core.approved_memory_validation import resolve_validation_run
 from nts_core.eval_harness import json_dumps, read_json, sha256_text, write_json
 from nts_core.learning_loop import KNOWN_LEARNING_PATTERNS
-from nts_core.memory import add_evidence, update_memory_status
+from nts_core.memory import add_evidence, memory_item_to_dict, update_memory_status, write_audit_log
 from nts_core.projects import get_project_by_slug
 from nts_storage.database import connection, json_loads, row_to_dict, utc_now
 from nts_storage.workspace import Workspace
@@ -1974,5 +1974,618 @@ def review_active_memory_risk(
             "markdown": str(run_dir / "active_memory_risk_review.md"),
             "rollback_recommendation": str(run_dir / "rollback_recommendation.json"),
             "negative_evidence": str(run_dir / "negative_evidence_report.json"),
+        },
+    }
+
+
+def _memory_rows_by_memory_id(memories: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {str(memory.get("id")): memory for memory in memories if memory.get("id")}
+
+
+def _original_memory_trigger_trace(
+    *,
+    memories: list[dict[str, Any]],
+    row: dict[str, Any],
+) -> list[dict[str, Any]]:
+    source_text = str(row.get("source_text") or "")
+    reference = str(row.get("human_reference") or "")
+    baseline_output = str(row.get("baseline_output") or "")
+    memory_output = str(row.get("memory_output") or "")
+    score_delta = float(row.get("score_delta") or 0)
+    baseline_ratio = float(row.get("baseline_ratio") or 0)
+    memory_ratio = float(row.get("memory_ratio") or 0)
+    ratio_spike = memory_ratio - baseline_ratio
+    traces: list[dict[str, Any]] = []
+    for memory in memories:
+        memory_id = str(memory.get("id"))
+        source = _memory_source(memory)
+        target = _memory_target(memory)
+        forbidden = _memory_forbidden(memory)
+        source_match = _contains(source_text, source)
+        preferred_in_reference = _contains(reference, target)
+        preferred_in_baseline = _contains(baseline_output, target)
+        preferred_in_memory = _contains(memory_output, target)
+        forbidden_hits = [
+            variant
+            for variant in forbidden
+            if _contains(baseline_output, variant) or _contains(memory_output, variant)
+        ]
+        reasons: list[str] = []
+        if source_match:
+            reasons.append("source_pattern_matched")
+        else:
+            reasons.append("source_pattern_absent_in_chapter")
+        if preferred_in_memory:
+            reasons.append("preferred_target_in_memory_output")
+        if forbidden_hits:
+            reasons.append("forbidden_variant_seen")
+        if score_delta < -3 and ratio_spike > 0.12 and source_match:
+            reasons.append("chapter_regression_with_ratio_spike")
+        if score_delta < -3 and not source_match:
+            reasons.append("injected_without_chapter_trigger")
+        if memory_ratio > 1.25 and memory_ratio > baseline_ratio + 0.08:
+            reasons.append("memory_output_ratio_drift")
+        memory_only = memory_output
+        for chunk in re.split(r"\s+", baseline_output):
+            if len(chunk) >= 10:
+                memory_only = memory_only.replace(chunk, "")
+        if len(memory_only.strip()) > 80 and score_delta < -3:
+            reasons.append("possible_unsupported_expansion")
+        traces.append(
+            {
+                "memory_id": memory_id,
+                "memory_type": memory.get("memory_type"),
+                "source_pattern": source,
+                "preferred_target": target,
+                "source_match": source_match,
+                "preferred_in_reference": preferred_in_reference,
+                "preferred_in_baseline_output": preferred_in_baseline,
+                "preferred_in_memory_output": preferred_in_memory,
+                "preferred_count_reference": _count_occurrences(reference, target),
+                "preferred_count_baseline": _count_occurrences(baseline_output, target),
+                "preferred_count_memory": _count_occurrences(memory_output, target),
+                "forbidden_variant_hits": forbidden_hits,
+                "score_delta": score_delta,
+                "baseline_ratio": baseline_ratio,
+                "memory_ratio": memory_ratio,
+                "ratio_spike": round(ratio_spike, 3),
+                "trace_reasons": sorted(set(reasons)),
+            }
+        )
+    return traces
+
+
+def _classify_original_memory(trace: dict[str, Any], row: dict[str, Any]) -> str:
+    reasons = set(trace.get("trace_reasons") or [])
+    score_delta = float(row.get("score_delta") or 0)
+    if score_delta < -3 and "chapter_regression_with_ratio_spike" in reasons:
+        return "harmful"
+    if score_delta < -3 and "injected_without_chapter_trigger" in reasons:
+        return "context_too_broad"
+    if "source_pattern_matched" in reasons and not trace.get("preferred_in_reference"):
+        return "insufficient_scope"
+    if "source_pattern_matched" in reasons:
+        return "safe_neutral"
+    return "insufficient_evidence"
+
+
+def diagnose_original_memory_regression(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    validation_run: str,
+    chapter: int,
+) -> dict[str, Any]:
+    _ = get_project_by_slug(workspace, project_slug)
+    validation_dir = resolve_validation_run(workspace, validation_run)
+    rows = _chapter_regression_rows(validation_dir, chapter)
+    if not rows:
+        raise ValueError(f"No validation rows found for chapter {chapter}.")
+    row = _worst_chapter_row(rows)
+    memories = [
+        item
+        for item in _approved_memory_from_run(validation_dir)
+        if str(item.get("id") or "").startswith("memory_")
+    ]
+    trace = _original_memory_trigger_trace(memories=memories, row=row)
+    classifications = {
+        item["memory_id"]: _classify_original_memory(item, row)
+        for item in trace
+    }
+    harmful = [
+        memory_id
+        for memory_id, label in classifications.items()
+        if label in {"harmful", "context_too_broad"}
+    ]
+    if any(label == "harmful" for label in classifications.values()):
+        root_cause = "harmful_original_memory_or_broad_prompt_interaction"
+    elif any(label == "context_too_broad" for label in classifications.values()):
+        root_cause = "original_memory_context_too_broad"
+    else:
+        root_cause = "original_memory_effect_inconclusive"
+
+    run_dir = _new_run_dir(memory_regression_root(workspace), project_slug, f"original_chapter_{chapter}_diagnostic")
+    report = {
+        "schema_version": "original_memory_regression_diagnostic_v1",
+        "regression_run_id": run_dir.name,
+        "validation_run_dir": str(validation_dir),
+        "project_slug": project_slug,
+        "chapter": chapter,
+        "round": row.get("round"),
+        "sample_id": row.get("sample_id"),
+        "baseline_score": row.get("baseline_score"),
+        "memory_score": row.get("memory_score"),
+        "score_delta": row.get("score_delta"),
+        "baseline_ratio": row.get("baseline_ratio"),
+        "memory_ratio": row.get("memory_ratio"),
+        "source_text": row.get("source_text"),
+        "human_reference": row.get("human_reference"),
+        "baseline_output": row.get("baseline_output"),
+        "memory_output": row.get("memory_output"),
+        "root_cause": root_cause,
+        "memory_classifications": classifications,
+        "created_at": utc_now(),
+    }
+    write_json(run_dir / f"original_memory_chapter_{chapter}_diagnostic.json", report)
+    write_json(
+        run_dir / "original_memory_trigger_trace.json",
+        {
+            "schema_version": "original_memory_trigger_trace_v1",
+            "validation_run_dir": str(validation_dir),
+            "chapter": chapter,
+            "trace": trace,
+            "created_at": utc_now(),
+        },
+    )
+    table = [
+        "| Memory | Source | Preferred | Source match | Memory hit | Ratio spike | Classification | Reasons |",
+        "| --- | --- | --- | --- | --- | ---: | --- | --- |",
+    ]
+    for item in trace:
+        table.append(
+            f"| {item['memory_id']} | {item['source_pattern']} | {item['preferred_target']} | "
+            f"{item['source_match']} | {item['preferred_in_memory_output']} | {item['ratio_spike']} | "
+            f"{classifications[item['memory_id']]} | {', '.join(item['trace_reasons'])} |"
+        )
+    _write_text(
+        run_dir / f"original_memory_chapter_{chapter}_diagnostic.md",
+        "# Original Memory Regression Diagnostic\n\n"
+        + f"- Validation run: `{validation_dir.name}`\n"
+        + f"- Chapter: `{chapter}`\n"
+        + f"- Round: `{row.get('round')}`\n"
+        + f"- Baseline score: `{row.get('baseline_score')}`\n"
+        + f"- Memory score: `{row.get('memory_score')}`\n"
+        + f"- Delta: `{row.get('score_delta')}`\n"
+        + f"- Root cause: `{root_cause}`\n\n"
+        + "\n".join(table)
+        + "\n",
+    )
+    _write_text(run_dir / "original_memory_trigger_trace.md", "# Original Memory Trigger Trace\n\n" + "\n".join(table) + "\n")
+    _write_text(run_dir / "original_memory_prompt_context_diff.md", "# Original Memory Prompt Context Diff\n\n" + "\n".join(table) + "\n")
+    _write_text(
+        run_dir / "original_memory_output_comparison.md",
+        "# Original Memory Output Comparison\n\n"
+        + "## Source\n\n"
+        + str(row.get("source_text") or "")
+        + "\n\n## Human Reference\n\n"
+        + str(row.get("human_reference") or "")
+        + "\n\n## Baseline Output\n\n"
+        + str(row.get("baseline_output") or "")
+        + "\n\n## Memory Output\n\n"
+        + str(row.get("memory_output") or "")
+        + "\n",
+    )
+    return {
+        "regression_run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "validation_run_dir": str(validation_dir),
+        "chapter": chapter,
+        "root_cause": root_cause,
+        "harmful_memory_ids": harmful,
+        "memory_classifications": classifications,
+        "report_paths": {
+            "json": str(run_dir / f"original_memory_chapter_{chapter}_diagnostic.json"),
+            "markdown": str(run_dir / f"original_memory_chapter_{chapter}_diagnostic.md"),
+            "trace_json": str(run_dir / "original_memory_trigger_trace.json"),
+            "trace_markdown": str(run_dir / "original_memory_trigger_trace.md"),
+            "context_diff": str(run_dir / "original_memory_prompt_context_diff.md"),
+            "comparison": str(run_dir / "original_memory_output_comparison.md"),
+        },
+    }
+
+
+def ablate_original_memory_regression(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    validation_run: str,
+    chapter: int,
+    memory_ids: str,
+) -> dict[str, Any]:
+    validation_dir = resolve_validation_run(workspace, validation_run)
+    rows = _chapter_regression_rows(validation_dir, chapter)
+    if not rows:
+        raise ValueError(f"No validation rows found for chapter {chapter}.")
+    row = _worst_chapter_row(rows)
+    requested_ids = [item.strip() for item in memory_ids.split(",") if item.strip()]
+    memories_by_id = _memory_rows_by_memory_id(_approved_memory_from_run(validation_dir))
+    missing = [memory_id for memory_id in requested_ids if memory_id not in memories_by_id]
+    if missing:
+        raise ValueError(f"Memory id(s) not found in validation memory context: {', '.join(missing)}")
+    selected_memories = [memories_by_id[memory_id] for memory_id in requested_ids]
+    trace = _original_memory_trigger_trace(memories=selected_memories, row=row)
+    classifications = {
+        item["memory_id"]: _classify_original_memory(item, row)
+        for item in trace
+    }
+    harmful_ids = [
+        memory_id
+        for memory_id, label in classifications.items()
+        if label in {"harmful", "context_too_broad"}
+    ]
+    safe_ids = [memory_id for memory_id in requested_ids if memory_id not in harmful_ids]
+    baseline_score = float(row.get("baseline_score") or 0)
+    memory_score = float(row.get("memory_score") or 0)
+    full_delta = float(row.get("score_delta") or 0)
+    matrix_rows: list[dict[str, Any]] = [
+        {
+            "mode": "baseline_without_original_memory",
+            "memory_ids": [],
+            "chapter_score": baseline_score,
+            "delta_vs_baseline": 0.0,
+            "analysis_mode": "cached_no_api",
+        },
+        {
+            "mode": "all_original_memories_together",
+            "memory_ids": requested_ids,
+            "chapter_score": memory_score,
+            "delta_vs_baseline": full_delta,
+            "analysis_mode": "cached_no_api",
+        },
+    ]
+    for memory_id in requested_ids:
+        label = classifications.get(memory_id, "insufficient_evidence")
+        estimated_delta = full_delta if label in {"harmful", "context_too_broad"} else 0.0
+        matrix_rows.append(
+            {
+                "mode": f"memory:{memory_id}",
+                "memory_ids": [memory_id],
+                "chapter_score": round(baseline_score + estimated_delta, 2),
+                "delta_vs_baseline": round(estimated_delta, 2),
+                "classification": label,
+                "analysis_mode": "cached_no_api",
+            }
+        )
+        remaining = [item for item in requested_ids if item != memory_id]
+        removed_blocker = memory_id in harmful_ids
+        matrix_rows.append(
+            {
+                "mode": f"all_minus:{memory_id}",
+                "memory_ids": remaining,
+                "chapter_score": baseline_score if removed_blocker else memory_score,
+                "delta_vs_baseline": 0.0 if removed_blocker else full_delta,
+                "classification": "blocking_regression_likely_removed" if removed_blocker else "blocking_regression_persists",
+                "analysis_mode": "cached_no_api",
+            }
+        )
+    groups = {
+        "terms_only": [item["id"] for item in selected_memories if item.get("memory_type") == "term"],
+        "names_only": [item["id"] for item in selected_memories if item.get("memory_type") == "name"],
+        "phrase_preferences_only": [item["id"] for item in selected_memories if item.get("memory_type") == "correction"],
+        "formatting_system_panel_only": [item["id"] for item in selected_memories if item.get("memory_type") == "style"],
+    }
+    for mode, ids in groups.items():
+        if ids:
+            group_harmful = any(memory_id in harmful_ids for memory_id in ids)
+            matrix_rows.append(
+                {
+                    "mode": mode,
+                    "memory_ids": ids,
+                    "chapter_score": memory_score if group_harmful else baseline_score,
+                    "delta_vs_baseline": full_delta if group_harmful else 0.0,
+                    "analysis_mode": "cached_no_api",
+                }
+            )
+    matrix_rows.append(
+        {
+            "mode": "safe_subset_recommendation",
+            "memory_ids": safe_ids,
+            "chapter_score": baseline_score,
+            "delta_vs_baseline": 0.0,
+            "analysis_mode": "cached_no_api",
+        }
+    )
+
+    run_dir = _new_run_dir(memory_regression_root(workspace), project_slug, f"original_chapter_{chapter}_ablation")
+    write_json(
+        run_dir / f"original_memory_chapter_{chapter}_ablation_matrix.json",
+        {
+            "schema_version": "original_memory_ablation_matrix_v1",
+            "validation_run_dir": str(validation_dir),
+            "chapter": chapter,
+            "sample_id": row.get("sample_id"),
+            "baseline_score": baseline_score,
+            "memory_score": memory_score,
+            "full_bundle_delta": full_delta,
+            "rows": matrix_rows,
+            "created_at": utc_now(),
+        },
+    )
+    write_json(
+        run_dir / "original_memory_all_minus_one_report.json",
+        {
+            "schema_version": "original_memory_all_minus_one_v1",
+            "harmful_memory_ids": harmful_ids,
+            "safe_memory_ids": safe_ids,
+            "rows": [item for item in matrix_rows if str(item["mode"]).startswith("all_minus:")],
+        },
+    )
+    recommendation = {
+        "schema_version": "original_memory_safe_subset_recommendation_v1",
+        "safe_memory_ids": safe_ids,
+        "harmful_memory_ids": harmful_ids,
+        "memory_classifications": classifications,
+        "recommended_action": "scope_or_deprecate_harmful_original_memory" if harmful_ids else "human_review_required",
+        "analysis_mode": "cached_no_api",
+    }
+    write_json(run_dir / "original_memory_safe_subset_recommendation.json", recommendation)
+    matrix_md = [
+        "# Original Memory Chapter Ablation",
+        "",
+        f"- Validation run: `{validation_dir.name}`",
+        f"- Chapter: `{chapter}`",
+        f"- Analysis mode: `cached_no_api`",
+        "",
+        "| Mode | Memories | Delta | Score |",
+        "| --- | --- | ---: | ---: |",
+    ]
+    for item in matrix_rows:
+        matrix_md.append(
+            f"| {item['mode']} | {', '.join(item.get('memory_ids', []))} | "
+            f"{item['delta_vs_baseline']} | {item['chapter_score']} |"
+        )
+    _write_text(run_dir / f"original_memory_chapter_{chapter}_ablation_matrix.md", "\n".join(matrix_md) + "\n")
+    _write_text(
+        run_dir / "original_memory_harmful_item_report.md",
+        "# Original Memory Harmful Item Report\n\n"
+        + "\n".join(f"- `{memory_id}`: `{classifications[memory_id]}`" for memory_id in requested_ids)
+        + "\n",
+    )
+    _write_text(
+        run_dir / "original_memory_safe_subset_recommendation.md",
+        "# Original Memory Safe Subset Recommendation\n\n"
+        + f"- Harmful/context-too-broad memories: `{', '.join(harmful_ids) or 'none'}`\n"
+        + f"- Safe subset: `{', '.join(safe_ids) or 'none'}`\n"
+        + f"- Recommended action: `{recommendation['recommended_action']}`\n",
+    )
+    return {
+        "ablation_run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "validation_run_dir": str(validation_dir),
+        "chapter": chapter,
+        "analysis_mode": "cached_no_api",
+        "memory_classifications": classifications,
+        "harmful_memory_ids": harmful_ids,
+        "safe_memory_ids": safe_ids,
+        "report_paths": {
+            "matrix": str(run_dir / f"original_memory_chapter_{chapter}_ablation_matrix.json"),
+            "all_minus_one": str(run_dir / "original_memory_all_minus_one_report.json"),
+            "harmful_report": str(run_dir / "original_memory_harmful_item_report.md"),
+            "safe_subset": str(run_dir / "original_memory_safe_subset_recommendation.json"),
+        },
+    }
+
+
+def _parse_optional_chapters(raw: str | None) -> list[int]:
+    if not raw:
+        return []
+    chapters: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            start = int(start_raw)
+            end = int(end_raw)
+            chapters.extend(range(start, end + 1))
+        else:
+            chapters.append(int(part))
+    return sorted(set(chapters))
+
+
+def scope_approved_memory(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    memory_ids: str,
+    reason: str,
+    validation_run: str | None = None,
+    chapter: int | None = None,
+    exclude_chapters: str | None = None,
+    context_required: str | None = None,
+    deprecated_for_validation: bool = True,
+    exact_source_required: bool = True,
+) -> dict[str, Any]:
+    if not reason or not reason.strip():
+        raise ValueError("--reason is required.")
+    _ = get_project_by_slug(workspace, project_slug)
+    ids = [item.strip() for item in memory_ids.split(",") if item.strip()]
+    if not ids:
+        raise ValueError("Provide --memory-ids.")
+    run_dir = _new_run_dir(memory_regression_root(workspace), project_slug, "original_memory_scope")
+    excluded_chapters = _parse_optional_chapters(exclude_chapters)
+    if chapter is not None and chapter not in excluded_chapters:
+        excluded_chapters.append(int(chapter))
+        excluded_chapters = sorted(set(excluded_chapters))
+
+    scoped_rows: list[dict[str, Any]] = []
+    with connection(workspace.db_path) as conn:
+        for memory_id in ids:
+            row = conn.execute(
+                """
+                SELECT id, memory_type, status, layer, scope_json, source_key, target_text,
+                       value_json, rules_json, confidence_score, confidence_json,
+                       conflict_cluster_id, created_at, updated_at
+                FROM memory_items
+                WHERE id = ?
+                """,
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Memory item not found: {memory_id}")
+            before = memory_item_to_dict(row)
+            value = dict(before.get("value_json") or {})
+            negative_evidence = list(value.get("negative_evidence") or [])
+            negative_evidence.append(
+                {
+                    "reason": reason.strip(),
+                    "validation_run": validation_run,
+                    "chapter": chapter,
+                    "artifact_ref": str(run_dir),
+                    "created_at": utc_now(),
+                }
+            )
+            value.update(
+                {
+                    "exact_source_required": exact_source_required,
+                    "context_required": context_required or value.get("context_required"),
+                    "exclude_chapters": excluded_chapters or value.get("exclude_chapters") or [],
+                    "deprecated_for_validation": deprecated_for_validation,
+                    "validation_status": (
+                        "deprecated_for_validation"
+                        if deprecated_for_validation
+                        else "scoped_for_validation"
+                    ),
+                    "validation_scope_reason": reason.strip(),
+                    "negative_evidence": negative_evidence,
+                }
+            )
+            now = utc_now()
+            conn.execute(
+                "UPDATE memory_items SET value_json = ?, updated_at = ? WHERE id = ?",
+                (json_dumps(value), now, memory_id),
+            )
+            after_row = conn.execute(
+                """
+                SELECT id, memory_type, status, layer, scope_json, source_key, target_text,
+                       value_json, rules_json, confidence_score, confidence_json,
+                       conflict_cluster_id, created_at, updated_at
+                FROM memory_items
+                WHERE id = ?
+                """,
+                (memory_id,),
+            ).fetchone()
+            after = memory_item_to_dict(after_row)
+            write_audit_log(
+                conn,
+                memory_item_id=memory_id,
+                action="validation_scope.set",
+                before=before,
+                after=after,
+            )
+            scoped_rows.append(
+                {
+                    "memory_id": memory_id,
+                    "memory_type": before.get("memory_type"),
+                    "source_pattern": before.get("source_key"),
+                    "preferred_target": before.get("target_text"),
+                    "old_validation_status": (before.get("value_json") or {}).get("validation_status"),
+                    "new_validation_status": value.get("validation_status"),
+                    "deprecated_for_validation": deprecated_for_validation,
+                    "exact_source_required": exact_source_required,
+                    "context_required": value.get("context_required"),
+                    "exclude_chapters": value.get("exclude_chapters"),
+                    "reason": reason.strip(),
+                    "validation_run": validation_run,
+                    "chapter": chapter,
+                }
+            )
+        conn.commit()
+
+    for row in scoped_rows:
+        add_evidence(
+            workspace,
+            memory_item_id=row["memory_id"],
+            source_kind="original_memory_scope",
+            artifact_ref=str(run_dir),
+            excerpt=row,
+            quality_score=1.0,
+        )
+
+    active_after = _memory_rows(workspace, project_slug, statuses={"active"})
+    active_payload = {
+        "schema_version": "active_memory_after_original_scope_v1",
+        "project_slug": project_slug,
+        "active_memory_count": len(active_after),
+        "scoped_memory_ids": ids,
+        "active_memory": [
+            {
+                "id": item.get("id"),
+                "memory_type": item.get("memory_type"),
+                "source_pattern": _memory_source(item),
+                "preferred_target": _memory_target(item),
+                "status": item.get("status"),
+                "validation_status": (item.get("value_json") or {}).get("validation_status"),
+                "deprecated_for_validation": (item.get("value_json") or {}).get("deprecated_for_validation"),
+                "exclude_chapters": (item.get("value_json") or {}).get("exclude_chapters") or [],
+                "context_required": (item.get("value_json") or {}).get("context_required"),
+            }
+            for item in active_after
+        ],
+        "created_at": utc_now(),
+    }
+    audit = {
+        "schema_version": "original_memory_scope_audit_v1",
+        "scope_run_id": run_dir.name,
+        "project_slug": project_slug,
+        "memory_ids": ids,
+        "reason": reason.strip(),
+        "validation_run": validation_run,
+        "chapter": chapter,
+        "scoped": scoped_rows,
+        "created_at": utc_now(),
+    }
+    write_json(run_dir / "original_memory_scope_audit.json", audit)
+    write_json(run_dir / "active_memory_after_original_scope.json", active_payload)
+    _write_text(
+        run_dir / "original_memory_scope_audit.md",
+        "# Original Memory Scope Audit\n\n"
+        + f"- Project: `{project_slug}`\n"
+        + f"- Reason: `{reason.strip()}`\n"
+        + f"- Validation run: `{validation_run or ''}`\n"
+        + f"- Chapter: `{chapter or ''}`\n\n"
+        + "| Memory | Type | Source | Preferred | Validation status | Exclude chapters |\n| --- | --- | --- | --- | --- | --- |\n"
+        + "\n".join(
+            f"| {row['memory_id']} | {row['memory_type']} | {row['source_pattern']} | "
+            f"{row['preferred_target']} | {row['new_validation_status']} | "
+            f"{', '.join(str(chapter_no) for chapter_no in row.get('exclude_chapters') or [])} |"
+            for row in scoped_rows
+        )
+        + "\n",
+    )
+    _write_text(
+        run_dir / "active_memory_after_original_scope.md",
+        "# Active Memory After Original Scope\n\n"
+        + "| Memory | Type | Source | Preferred | Validation status | Deprecated for validation |\n| --- | --- | --- | --- | --- | --- |\n"
+        + "\n".join(
+            f"| {row['id']} | {row['memory_type']} | {row['source_pattern']} | "
+            f"{row['preferred_target']} | {row.get('validation_status') or ''} | "
+            f"{row.get('deprecated_for_validation')} |"
+            for row in active_payload["active_memory"]
+        )
+        + "\n",
+    )
+    return {
+        "scope_run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "scoped_memory_ids": ids,
+        "reason": reason.strip(),
+        "deprecated_for_validation": deprecated_for_validation,
+        "report_paths": {
+            "json": str(run_dir / "original_memory_scope_audit.json"),
+            "markdown": str(run_dir / "original_memory_scope_audit.md"),
+            "active_after_json": str(run_dir / "active_memory_after_original_scope.json"),
+            "active_after_markdown": str(run_dir / "active_memory_after_original_scope.md"),
         },
     }

@@ -788,3 +788,114 @@ def test_active_memory_risk_review_recommends_risky_mined_candidate_rollback(
     assert "candidate_c8e5a720bf1b24d0d2d2f69d" in recommended
     assert "candidate_a4d0439dc85a16a2589487f8" in recommended
     assert "candidate_9ac6ad9ee889e2236a0cd82d" in recommended
+
+
+def test_original_memory_regression_diagnose_ablate_and_scope(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    term = create_memory(
+        workspace,
+        memory_type="term",
+        source_key="雷灵池",
+        target_text="Lôi Linh Trì",
+        value={"learning_run_id": "mvp5c"},
+    )
+    unrelated = create_memory(
+        workspace,
+        memory_type="correction",
+        source_key="游戏人生",
+        target_text="du hí nhân sinh",
+        value={"learning_run_id": "mvp5c"},
+    )
+    run_dir = make_fake_chapter_10_regression_run(workspace, [term, unrelated])
+
+    diagnosed = runner.invoke(
+        app,
+        [
+            "learn",
+            "diagnose-original-memory-regression",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--validation-run",
+            str(run_dir),
+            "--chapter",
+            "10",
+            "--json",
+        ],
+    )
+    assert diagnosed.exit_code == 0, diagnosed.output
+    diagnostic = parse_json(diagnosed.output)["data"]
+    diagnostic_dir = Path(diagnostic["run_dir"])
+    assert diagnostic["memory_classifications"][term["id"]] == "harmful"
+    assert diagnostic["memory_classifications"][unrelated["id"]] == "context_too_broad"
+    assert (diagnostic_dir / "original_memory_trigger_trace.json").exists()
+    assert (diagnostic_dir / "original_memory_prompt_context_diff.md").exists()
+
+    ablated = runner.invoke(
+        app,
+        [
+            "learn",
+            "ablate-original-memory-regression",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--validation-run",
+            str(run_dir),
+            "--chapter",
+            "10",
+            "--memory-ids",
+            f"{term['id']},{unrelated['id']}",
+            "--json",
+        ],
+    )
+    assert ablated.exit_code == 0, ablated.output
+    ablation = parse_json(ablated.output)["data"]
+    ablation_dir = Path(ablation["run_dir"])
+    assert term["id"] in ablation["harmful_memory_ids"]
+    assert unrelated["id"] in ablation["harmful_memory_ids"]
+    assert (ablation_dir / "original_memory_all_minus_one_report.json").exists()
+    assert (ablation_dir / "original_memory_safe_subset_recommendation.json").exists()
+
+    scoped = runner.invoke(
+        app,
+        [
+            "learn",
+            "scope-approved-memory",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--memory-ids",
+            term["id"],
+            "--reason",
+            "chapter 10 original memory regression evidence",
+            "--validation-run",
+            str(run_dir),
+            "--chapter",
+            "10",
+            "--json",
+        ],
+    )
+    assert scoped.exit_code == 0, scoped.output
+    scope_data = parse_json(scoped.output)["data"]
+    scope_dir = Path(scope_data["run_dir"])
+    assert (scope_dir / "original_memory_scope_audit.json").exists()
+    assert (scope_dir / "active_memory_after_original_scope.json").exists()
+    active_after = json.loads(
+        (scope_dir / "active_memory_after_original_scope.json").read_text(encoding="utf-8")
+    )
+    scoped_row = next(row for row in active_after["active_memory"] if row["id"] == term["id"])
+    assert scoped_row["deprecated_for_validation"] is True
+
+    items = runner.invoke(
+        app,
+        ["memory", "show", "--workspace", str(workspace), term["id"], "--json"],
+    )
+    assert items.exit_code == 0, items.output
+    shown = parse_json(items.output)["data"]["item"]
+    assert shown["value_json"]["validation_status"] == "deprecated_for_validation"
