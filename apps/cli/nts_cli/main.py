@@ -21,7 +21,9 @@ from nts_core.chinese_nlp import (
     analyze_chapter as nlp_analyze_chapter,
     analyze_text as nlp_analyze_text,
     cache_build as nlp_cache_build,
+    create_final_human_review_package as nlp_create_final_human_review_package,
     nlp_status as nlp_status_report,
+    quality_check as nlp_quality_check,
     show_cache as nlp_show_cache,
 )
 from nts_core.corrections import (
@@ -1588,6 +1590,42 @@ def nlp_show_cache_command(
     try:
         ws = discover_workspace(_workspace_arg(workspace))
         result = nlp_show_cache(ws, project_slug=project, chapter_ref=chapter)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("NLP_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@nlp_app.command("quality-check")
+def nlp_quality_check_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    chapters: Annotated[str, typer.Option("--chapters", help="Chapter range, e.g. 1-10.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = nlp_quality_check(ws, project_slug=project, chapters=chapters)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("NLP_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@nlp_app.command("human-review-final")
+def nlp_human_review_final_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    validation_run: Annotated[str, typer.Option("--validation-run", help="Approved-memory validation run path.")],
+    chapters: Annotated[str, typer.Option("--chapters", help="Chapter range, e.g. 1-10.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = nlp_create_final_human_review_package(
+            ws,
+            project_slug=project,
+            validation_run=validation_run,
+            chapters=chapters,
+        )
     except (WorkspaceError, ValueError) as exc:
         _fail("NLP_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)

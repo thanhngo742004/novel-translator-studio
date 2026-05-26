@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from nts_cli.main import app
@@ -15,10 +16,12 @@ from nts_core.chinese_nlp import (
     build_normalized_analysis,
     cache_build,
     convert_ner_tags,
+    create_final_human_review_package,
     get_exact_source_anchors,
     get_term_candidates,
     nlp_status,
     normalize_pos,
+    quality_check,
     show_cache,
 )
 from nts_core.config import LtpServerConfig, NlpFallbackConfig, NlpSettings, load_nlp_config
@@ -355,3 +358,176 @@ def test_no_memory_or_dictionary_is_created_by_nlp_cache(tmp_path: Path) -> None
 
     assert memory_count == 0
     assert tables == set()
+
+
+class _FakeLtpAnalyzer:
+    provider_kind = "ltp_server"
+    provider_version = "fake-ltp"
+
+    def analyze_sentences(self, sentences: list[str]):
+        return [
+            {
+                "text": sentence,
+                "words": ["韩绝", "进入", "玉清宗", "。"],
+                "pos": ["nh", "v", "ni", "wp"],
+                "ner": ["S-Nh", "O", "S-Ni", "O"],
+            }
+            for sentence in sentences
+        ]
+
+
+def _write_ltp_quality_fixture(workspace, project_slug: str = "han-jue") -> None:
+    root = workspace.path / "artifacts" / "nlp" / project_slug
+    chapters = []
+    for chapter_no in (1, 2):
+        chapter_id = f"chapter_{chapter_no:04d}"
+        analysis = build_normalized_analysis(
+            text="韩绝进入玉清宗。",
+            project_slug=project_slug,
+            chapter_id=chapter_id,
+            provider=_FakeLtpAnalyzer(),
+            degraded=False,
+        )
+        artifact = root / f"{chapter_id}.ltp.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+        chapters.append(
+            {
+                "chapter_id": chapter_id,
+                "chapter_no": chapter_no,
+                "source_sha256": analysis["meta"]["source_sha256"],
+                "provider": "ltp_server",
+                "provider_version": "fake-ltp",
+                "heuristics_version": "mvp5e-v1",
+                "degraded": False,
+                "sentence_count": len(analysis["sentences"]),
+                "token_count": sum(len(sentence["tokens"]) for sentence in analysis["sentences"]),
+                "artifact_path": str(artifact),
+            }
+        )
+    manifest = {
+        "project_slug": project_slug,
+        "coverage_count": len(chapters),
+        "degraded_chapter_count": 0,
+        "sentence_count": sum(row["sentence_count"] for row in chapters),
+        "token_count": sum(row["token_count"] for row in chapters),
+        "chapters": chapters,
+        "sidecar_status": {
+            "healthy": True,
+            "provider": "ltp_server",
+            "degraded": False,
+            "error": None,
+        },
+    }
+    (root / "nlp_cache_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def test_quality_check_fails_when_cache_is_degraded(tmp_path: Path) -> None:
+    workspace = _workspace_with_chapters(tmp_path)
+    cache_build(workspace, project_slug="han-jue", chapters="1-2", provider_kind="fallback_simple")
+
+    report = quality_check(workspace, project_slug="han-jue", chapters="1-2")
+
+    assert report["pass"] is False
+    assert report["degraded_chapter_count"] == 2
+
+
+def test_quality_check_passes_for_ltp_cache_and_cli_command(tmp_path: Path) -> None:
+    workspace = _workspace_with_chapters(tmp_path)
+    _write_ltp_quality_fixture(workspace)
+
+    result = runner.invoke(
+        app,
+        [
+            "--workspace",
+            str(workspace.path),
+            "nlp",
+            "quality-check",
+            "--project",
+            "han-jue",
+            "--chapters",
+            "1-2",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["data"]["pass"] is True
+    assert payload["data"]["degraded_chapter_count"] == 0
+
+
+def test_final_human_review_package_waits_for_translation_pass(tmp_path: Path) -> None:
+    workspace = _workspace_with_chapters(tmp_path)
+    _write_ltp_quality_fixture(workspace)
+    quality_check(workspace, project_slug="han-jue", chapters="1-2")
+    run_dir = workspace.path / "artifacts" / "approved_memory_validation" / "failed_run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "final_validation_summary.json").write_text(
+        json.dumps(
+            {
+                "final_decision": "FAIL",
+                "round_results": [
+                    {"round": 1, "baseline_score": 90, "memory_score": 91, "score_delta": 1.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Translation quality gate has not passed"):
+        create_final_human_review_package(
+            workspace,
+            project_slug="han-jue",
+            validation_run=str(run_dir),
+            chapters="1-2",
+        )
+
+
+def test_final_human_review_package_created_after_translation_pass(tmp_path: Path) -> None:
+    workspace = _workspace_with_chapters(tmp_path)
+    _write_ltp_quality_fixture(workspace)
+    quality_check(workspace, project_slug="han-jue", chapters="1-2")
+    run_dir = workspace.path / "artifacts" / "approved_memory_validation" / "pass_run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "final_validation_summary.json").write_text(
+        json.dumps(
+            {
+                "final_decision": "PASS",
+                "round_results": [
+                    {
+                        "round": 1,
+                        "baseline_score": 90,
+                        "memory_score": 91,
+                        "score_delta": 1.0,
+                        "severe_flags": [],
+                        "regressions_over_3": [],
+                    },
+                    {
+                        "round": 2,
+                        "baseline_score": 90,
+                        "memory_score": 90.5,
+                        "score_delta": 0.5,
+                        "severe_flags": [],
+                        "regressions_over_3": [],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = create_final_human_review_package(
+        workspace,
+        project_slug="han-jue",
+        validation_run=str(run_dir),
+        chapters="1-2",
+    )
+
+    output_dir = Path(result["output_dir"])
+    assert (output_dir / "human_review_summary.md").exists()
+    assert (output_dir / "nlp_quality_gate_final.json").exists()
+    assert (output_dir / "translation_quality_gate_final.json").exists()

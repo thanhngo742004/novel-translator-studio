@@ -125,11 +125,27 @@ class SidecarStatus:
 _SIDECAR_SESSION_CACHE: dict[str, SidecarStatus] = {}
 
 
+def _sidecar_cache_key(ltp: Any) -> str:
+    return "|".join(
+        [
+            str(ltp.base_url).rstrip("/"),
+            str(ltp.working_dir or ""),
+            str(ltp.executable or ""),
+            str(ltp.start_command or ""),
+            str(ltp.request_timeout_seconds),
+            str(ltp.max_sentences_per_request),
+        ]
+    )
+
+
 def clear_sidecar_session_cache(base_url: str | None = None) -> None:
     if base_url is None:
         _SIDECAR_SESSION_CACHE.clear()
         return
-    _SIDECAR_SESSION_CACHE.pop(base_url.rstrip("/"), None)
+    normalized = base_url.rstrip("/")
+    for key in list(_SIDECAR_SESSION_CACHE):
+        if key == normalized or key.startswith(normalized + "|"):
+            _SIDECAR_SESSION_CACHE.pop(key, None)
 
 
 def _sha256_text(text: str) -> str:
@@ -567,7 +583,7 @@ class NlpSidecarManager:
 
     def ensure_ltp_server(self, *, auto_start: bool | None = None) -> SidecarStatus:
         ltp = self.config.ltp_server
-        cache_key = ltp.base_url.rstrip("/")
+        cache_key = _sidecar_cache_key(ltp)
         cached = _SIDECAR_SESSION_CACHE.get(cache_key)
         if cached and cached.healthy:
             return cached
@@ -1531,6 +1547,272 @@ def quality_check(
         )
     _markdown_write(paths["markdown"], lines)
     return report
+
+
+def _resolve_validation_run_path(workspace: Workspace, validation_run: str) -> Path:
+    run_path = Path(validation_run)
+    if run_path.exists():
+        return run_path
+    candidate = workspace.path / "artifacts" / "approved_memory_validation" / validation_run
+    if candidate.exists():
+        return candidate
+    raise ValueError(f"Approved-memory validation run not found: {validation_run}")
+
+
+def _translation_quality_gate(summary: dict[str, Any]) -> tuple[bool, list[str], dict[str, Any]]:
+    rounds = summary.get("round_results") or []
+    reasons: list[str] = []
+    warnings: list[str] = []
+    if summary.get("final_decision") != "PASS":
+        warnings.append(f"legacy_validation_final_decision:{summary.get('final_decision')}")
+    if len(rounds) < 2:
+        reasons.append("fewer_than_two_validation_rounds")
+    severe_count = 0
+    unsafe_count = 0
+    truncation_count = 0
+    regression_count = 0
+    round_rows: list[dict[str, Any]] = []
+    for row in rounds:
+        severe_flags = row.get("severe_flags") or []
+        regressions = row.get("regressions_over_3") or []
+        severe_count += len(severe_flags)
+        regression_count += len(regressions)
+        unsafe_count += sum(1 for flag in severe_flags if flag.get("reason") == "unsafe_compression")
+        truncation_count += sum(1 for flag in severe_flags if flag.get("reason") == "truncation")
+        if float(row.get("score_delta") or 0) <= 0:
+            reasons.append(f"round_{row.get('round')}_delta_not_positive")
+        round_rows.append(
+            {
+                "round": row.get("round"),
+                "baseline_score": row.get("baseline_score"),
+                "memory_score": row.get("memory_score"),
+                "score_delta": row.get("score_delta"),
+                "severe_flag_count": len(severe_flags),
+                "regressions_over_3": regressions,
+            }
+        )
+    if severe_count:
+        reasons.append("severe_flags_present")
+    if unsafe_count:
+        reasons.append("unsafe_compression_present")
+    if truncation_count:
+        reasons.append("truncation_present")
+    if regression_count:
+        reasons.append("chapter_regression_over_3_present")
+    details = {
+        "rounds": round_rows,
+        "legacy_final_decision": summary.get("final_decision"),
+        "legacy_reason": summary.get("reason"),
+        "warnings": warnings,
+        "severe_flag_count": severe_count,
+        "unsafe_compression_count": unsafe_count,
+        "truncation_count": truncation_count,
+        "regression_count": regression_count,
+        "validation_artifact_path": str(summary.get("validation_artifact_path") or ""),
+    }
+    return not reasons, reasons, details
+
+
+def _candidate_rows_for_review(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    chapters: str,
+    candidate_key: str,
+) -> list[dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for chapter_ref in parse_chapter_range(chapters):
+        try:
+            analysis = load_nlp_cache(workspace, project_slug, chapter_ref)
+        except ValueError:
+            continue
+        chapter_id = analysis.get("meta", {}).get("chapter_id") or chapter_ref
+        for candidate in analysis.get("chapter_candidates", {}).get(candidate_key, []) or []:
+            text = str(candidate.get("text") or "").strip()
+            if not text:
+                continue
+            row = rows.setdefault(
+                text,
+                {
+                    "text": text,
+                    "candidate_type": candidate_key.removesuffix("_candidates"),
+                    "confidence": candidate.get("confidence"),
+                    "count": 0,
+                    "chapters": set(),
+                    "source": "nlp_cache_read_only",
+                },
+            )
+            row["count"] = int(row.get("count") or 0) + int(candidate.get("count") or 1)
+            row["chapters"].add(str(chapter_id))
+    normalized = []
+    for row in rows.values():
+        out = dict(row)
+        out["chapters"] = ", ".join(sorted(out["chapters"]))
+        normalized.append(out)
+    return sorted(normalized, key=lambda item: (-int(item.get("count") or 0), item.get("text") or ""))
+
+
+def _write_candidate_review_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["text", "candidate_type", "confidence", "count", "chapters", "source"],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def create_final_human_review_package(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    validation_run: str,
+    chapters: str,
+) -> dict[str, Any]:
+    quality_path = _quality_paths(workspace, project_slug)["json"]
+    if not quality_path.exists():
+        raise ValueError("NLP quality report is missing. Run nlp quality-check first.")
+    quality_report = json.loads(quality_path.read_text(encoding="utf-8"))
+    if not quality_report.get("pass"):
+        raise ValueError("NLP quality gate has not passed; final human review package is blocked.")
+
+    run_path = _resolve_validation_run_path(workspace, validation_run)
+    summary_path = run_path / "final_validation_summary.json"
+    if not summary_path.exists():
+        raise ValueError(f"Translation validation summary missing: {summary_path}")
+    translation_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    translation_summary["validation_artifact_path"] = str(run_path)
+    translation_pass, translation_reasons, translation_gate = _translation_quality_gate(translation_summary)
+    if not translation_pass:
+        raise ValueError(
+            "Translation quality gate has not passed; final human review package is blocked: "
+            + ", ".join(translation_reasons)
+        )
+
+    root = workspace.path / "artifacts" / "nlp" / project_slug / "human_review_final"
+    root.mkdir(parents=True, exist_ok=True)
+    entity_rows = _candidate_rows_for_review(
+        workspace, project_slug=project_slug, chapters=chapters, candidate_key="entity_candidates"
+    )
+    term_rows = _candidate_rows_for_review(
+        workspace, project_slug=project_slug, chapters=chapters, candidate_key="term_candidates"
+    )
+    phrase_rows = _candidate_rows_for_review(
+        workspace, project_slug=project_slug, chapters=chapters, candidate_key="phrase_candidates"
+    )
+    _write_candidate_review_csv(root / "entity_candidates_review.csv", entity_rows)
+    _write_candidate_review_csv(root / "term_candidates_review.csv", term_rows)
+    _write_candidate_review_csv(root / "phrase_candidates_review.csv", phrase_rows)
+
+    _json_write(root / "sidecar_status_final.json", quality_report.get("sidecar_status") or {})
+    _json_write(root / "nlp_quality_gate_final.json", quality_report)
+    _json_write(root / "translation_quality_gate_final.json", translation_gate | {"pass": True})
+
+    round_lines = [
+        "# Validation Rounds Summary",
+        "",
+        "| Round | Baseline | Memory | Delta | Severe flags | Regressions >3 |",
+        "| ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in translation_gate["rounds"]:
+        round_lines.append(
+            f"| {row.get('round')} | {row.get('baseline_score')} | {row.get('memory_score')} | "
+            f"{row.get('score_delta')} | {row.get('severe_flag_count')} | "
+            f"{json.dumps(row.get('regressions_over_3') or [], ensure_ascii=False)} |"
+        )
+    _markdown_write(root / "validation_rounds_summary.md", round_lines)
+
+    _markdown_write(
+        root / "nlp_cache_overview.md",
+        [
+            "# NLP Cache Overview",
+            "",
+            f"- Provider: `{quality_report.get('provider')}`",
+            f"- Degraded chapters: `{quality_report.get('degraded_chapter_count')}`",
+            f"- Chapters: `{', '.join(quality_report.get('chapters') or [])}`",
+            f"- Sentences: `{quality_report.get('sentence_count')}`",
+            f"- Tokens: `{quality_report.get('token_count')}`",
+            f"- Quality report: `{quality_path}`",
+        ],
+    )
+    _markdown_write(
+        root / "translation_quality_summary.md",
+        [
+            "# Translation Quality Summary",
+            "",
+            f"- Validation artifact: `{run_path}`",
+            f"- Final decision: `{translation_summary.get('final_decision')}`",
+            f"- Severe flags: `{translation_gate['severe_flag_count']}`",
+            f"- Unsafe compression: `{translation_gate['unsafe_compression_count']}`",
+            f"- Truncation: `{translation_gate['truncation_count']}`",
+            f"- Chapter regressions >3: `{translation_gate['regression_count']}`",
+        ],
+    )
+    _markdown_write(
+        root / "prompt_memory_filter_summary.md",
+        [
+            "# Prompt Memory Filter Summary",
+            "",
+            "Production memory filtering remains gate-based: status, exact trigger, context, negative evidence, and prompt budget.",
+            "This MVP5E.1 package is read-only and does not create memory or dictionary entries from NLP candidates.",
+        ],
+    )
+    sample_lines = ["# Chapter Samples", ""]
+    for chapter_ref in parse_chapter_range(chapters)[:3]:
+        try:
+            cache = load_nlp_cache(workspace, project_slug, chapter_ref)
+        except ValueError:
+            continue
+        sample_lines.extend(
+            [
+                f"## Chapter {chapter_ref}",
+                "",
+                f"- Sentences: `{len(cache.get('sentences') or [])}`",
+                f"- Entity candidates: `{len(cache.get('chapter_candidates', {}).get('entity_candidates') or [])}`",
+                f"- Term candidates: `{len(cache.get('chapter_candidates', {}).get('term_candidates') or [])}`",
+                "",
+                (cache.get("sentences") or [{}])[0].get("text", ""),
+                "",
+            ]
+        )
+    _markdown_write(root / "chapter_samples.md", sample_lines)
+
+    summary_lines = [
+        "# MVP5E.1 Human Review Summary",
+        "",
+        f"- Project: `{project_slug}`",
+        f"- Provider used: `{quality_report.get('provider')}`",
+        f"- Degraded chapter count: `{quality_report.get('degraded_chapter_count')}`",
+        f"- Total chapters: `{len(quality_report.get('chapters') or [])}`",
+        f"- Total sentences: `{quality_report.get('sentence_count')}`",
+        f"- Total tokens: `{quality_report.get('token_count')}`",
+        f"- Translation validation artifact: `{run_path}`",
+        f"- Severe flag count: `{translation_gate['severe_flag_count']}`",
+        f"- Unsafe compression count: `{translation_gate['unsafe_compression_count']}`",
+        f"- Truncation count: `{translation_gate['truncation_count']}`",
+        f"- Memory/filter changes during repair: `none in final packaging step`",
+        f"- Recommendation: `Proceed to MVP5F Project Dictionary Builder using this cache as read-only analysis input.`",
+        "",
+        "## Top Entity Candidates",
+        "",
+    ]
+    summary_lines.extend(f"- {row['text']} ({row['count']})" for row in entity_rows[:10])
+    summary_lines.extend(["", "## Top Term Candidates", ""])
+    summary_lines.extend(f"- {row['text']} ({row['count']})" for row in term_rows[:10])
+    summary_lines.extend(["", "## Top Phrase Candidates", ""])
+    summary_lines.extend(f"- {row['text']} ({row['count']})" for row in phrase_rows[:10])
+    _markdown_write(root / "human_review_summary.md", summary_lines)
+
+    return {
+        "status": "created",
+        "project_slug": project_slug,
+        "chapters": parse_chapter_range(chapters),
+        "output_dir": str(root),
+        "required_files": sorted(path.name for path in root.iterdir() if path.is_file()),
+        "translation_validation_run": str(run_path),
+    }
 
 
 def load_nlp_cache(workspace: Workspace, project_slug: str, chapter_ref: str) -> dict[str, Any]:
