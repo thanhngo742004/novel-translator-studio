@@ -82,10 +82,11 @@ class LtpServerConfig(BaseModel):
     base_url: str = "http://127.0.0.1:3003"
     working_dir: str | None = "C:/Users/Admin/tools/ltp-server"
     start_command: str = "cargo run --release"
-    executable: str | None = None
-    startup_timeout_seconds: int = 30
-    request_timeout_seconds: int = 15
+    executable: str | None = "C:/Users/Admin/tools/ltp-server/target/release/ltp-server.exe"
+    startup_timeout_seconds: int = 420
+    request_timeout_seconds: int = 30
     max_sentences_per_request: int = 512
+    stop_on_exit: bool = False
 
     @field_validator("startup_timeout_seconds", "request_timeout_seconds", "max_sentences_per_request")
     @classmethod

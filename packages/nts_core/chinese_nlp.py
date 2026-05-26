@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 import hashlib
 import json
@@ -98,6 +99,10 @@ class SidecarStatus:
     degraded: bool = False
     error: str | None = None
     warnings: tuple[str, ...] = ()
+    command: str | None = None
+    executable: str | None = None
+    working_dir: str | None = None
+    startup_elapsed_seconds: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -110,7 +115,21 @@ class SidecarStatus:
             "degraded": self.degraded,
             "error": self.error,
             "warnings": list(self.warnings),
+            "command": self.command,
+            "executable": self.executable,
+            "working_dir": self.working_dir,
+            "startup_elapsed_seconds": self.startup_elapsed_seconds,
         }
+
+
+_SIDECAR_SESSION_CACHE: dict[str, SidecarStatus] = {}
+
+
+def clear_sidecar_session_cache(base_url: str | None = None) -> None:
+    if base_url is None:
+        _SIDECAR_SESSION_CACHE.clear()
+        return
+    _SIDECAR_SESSION_CACHE.pop(base_url.rstrip("/"), None)
 
 
 def _sha256_text(text: str) -> str:
@@ -421,7 +440,7 @@ class LtpServerAnalyzer:
         self.request_timeout_seconds = request_timeout_seconds
         self.max_sentences_per_request = max_sentences_per_request
 
-    def _post_analyze(self, text: str) -> dict[str, Any]:
+    def _post_analyze(self, text: str) -> Any:
         payload = text.encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/analyze",
@@ -431,39 +450,64 @@ class LtpServerAnalyzer:
         )
         with urllib.request.urlopen(request, timeout=self.request_timeout_seconds) as response:
             raw = response.read().decode("utf-8")
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("ltp-server returned non-object JSON")
-        return data
+        return json.loads(raw)
 
     def health_check(self) -> tuple[bool, str | None]:
         try:
             data = self._post_analyze("他叫汤姆。")
         except (OSError, TimeoutError, urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
             return False, str(exc)
-        if all(key in data for key in ("cws", "pos", "ner")):
+        rows = _ltp_result_objects(data, expected_count=1)
+        if not rows:
+            return False, "ltp-server response missing cws/pos/ner"
+        row = rows[0]
+        if _valid_ltp_result_object(row):
             return True, None
-        return False, "ltp-server response missing cws/pos/ner"
+        return False, "ltp-server response has malformed cws/pos/ner arrays"
 
     def analyze_sentences(self, sentences: list[str]) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for index in range(0, len(sentences), self.max_sentences_per_request):
             batch = sentences[index : index + self.max_sentences_per_request]
             data = self._post_analyze("\n".join(batch))
-            cws = _as_sentence_lists(data.get("cws"), len(batch))
-            pos = _as_sentence_lists(data.get("pos"), len(batch))
-            ner = _as_sentence_lists(data.get("ner"), len(batch))
+            rows = _ltp_result_objects(data, expected_count=len(batch))
+            if not rows:
+                raise ValueError("ltp-server response missing cws/pos/ner")
             for batch_index, sentence in enumerate(batch):
+                row = rows[min(batch_index, len(rows) - 1)]
+                cws = _as_sentence_lists(row.get("cws"), len(batch))
+                pos = _as_sentence_lists(row.get("pos"), len(batch))
+                ner = _as_sentence_lists(row.get("ner"), len(batch))
+                sentence_row_index = 0 if len(rows) == len(batch) else batch_index
                 results.append(
                     {
                         "text": sentence,
-                        "words": cws[batch_index] if batch_index < len(cws) else [],
-                        "pos": pos[batch_index] if batch_index < len(pos) else [],
-                        "ner": ner[batch_index] if batch_index < len(ner) else [],
+                        "words": cws[sentence_row_index] if sentence_row_index < len(cws) else [],
+                        "pos": pos[sentence_row_index] if sentence_row_index < len(pos) else [],
+                        "ner": ner[sentence_row_index] if sentence_row_index < len(ner) else [],
                         "warnings": [],
                     }
                 )
         return results
+
+
+def _valid_ltp_result_object(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if not all(key in value for key in ("cws", "pos", "ner")):
+        return False
+    return all(isinstance(value.get(key), list) and len(value.get(key) or []) > 0 for key in ("cws", "pos", "ner"))
+
+
+def _ltp_result_objects(data: Any, expected_count: int) -> list[dict[str, Any]]:
+    if isinstance(data, dict):
+        return [data] if _valid_ltp_result_object(data) else []
+    if isinstance(data, list):
+        rows = [item for item in data if isinstance(item, dict) and _valid_ltp_result_object(item)]
+        if len(rows) == 1 and expected_count > 1:
+            return rows
+        return rows
+    return []
 
 
 def _as_sentence_lists(value: Any, expected_count: int) -> list[list[str]]:
@@ -523,6 +567,10 @@ class NlpSidecarManager:
 
     def ensure_ltp_server(self, *, auto_start: bool | None = None) -> SidecarStatus:
         ltp = self.config.ltp_server
+        cache_key = ltp.base_url.rstrip("/")
+        cached = _SIDECAR_SESSION_CACHE.get(cache_key)
+        if cached and cached.healthy:
+            return cached
         analyzer = LtpServerAnalyzer(
             base_url=ltp.base_url,
             request_timeout_seconds=ltp.request_timeout_seconds,
@@ -530,7 +578,9 @@ class NlpSidecarManager:
         )
         healthy, error = analyzer.health_check()
         if healthy:
-            return SidecarStatus(healthy=True, base_url=ltp.base_url, provider="ltp_server")
+            status = SidecarStatus(healthy=True, base_url=ltp.base_url, provider="ltp_server")
+            _SIDECAR_SESSION_CACHE[cache_key] = status
+            return status
 
         should_start = self.config.auto_start if auto_start is None else auto_start
         if not should_start:
@@ -554,13 +604,26 @@ class NlpSidecarManager:
                 error=f"ltp-server working_dir not found: {working_dir}",
                 warnings=("ltp_server_start_failed",),
             )
+        executable = Path(ltp.executable).expanduser() if ltp.executable else None
+        use_executable = executable is not None and executable.exists()
+        command: str | list[str]
+        shell = not use_executable
+        if use_executable:
+            command = [str(executable)]
+            command_text = str(executable)
+        else:
+            command = ltp.start_command
+            command_text = ltp.start_command
 
+        start_time = time.monotonic()
         try:
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+                subprocess, "DETACHED_PROCESS", 0
+            )
             self.process = subprocess.Popen(
-                ltp.start_command,
+                command,
                 cwd=str(working_dir),
-                shell=True,
+                shell=shell,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 text=True,
@@ -575,6 +638,10 @@ class NlpSidecarManager:
                 degraded=self.config.fallback.enabled,
                 error=str(exc),
                 warnings=("ltp_server_start_failed",),
+                command=command_text,
+                executable=str(executable) if executable else None,
+                working_dir=str(working_dir),
+                startup_elapsed_seconds=round(time.monotonic() - start_time, 3),
             )
 
         deadline = time.monotonic() + ltp.startup_timeout_seconds
@@ -582,14 +649,20 @@ class NlpSidecarManager:
         while time.monotonic() < deadline:
             healthy, last_error = analyzer.health_check()
             if healthy:
-                return SidecarStatus(
+                status = SidecarStatus(
                     healthy=True,
                     base_url=ltp.base_url,
                     provider="ltp_server",
                     start_attempted=True,
                     started_by_nts=True,
                     pid=self.process.pid if self.process else None,
+                    command=command_text,
+                    executable=str(executable) if executable else None,
+                    working_dir=str(working_dir),
+                    startup_elapsed_seconds=round(time.monotonic() - start_time, 3),
                 )
+                _SIDECAR_SESSION_CACHE[cache_key] = status
+                return status
             time.sleep(1)
 
         return SidecarStatus(
@@ -602,6 +675,10 @@ class NlpSidecarManager:
             degraded=self.config.fallback.enabled,
             error=last_error or "ltp-server startup timeout",
             warnings=("ltp_server_start_timeout",),
+            command=command_text,
+            executable=str(executable) if executable else None,
+            working_dir=str(working_dir),
+            startup_elapsed_seconds=round(time.monotonic() - start_time, 3),
         )
 
 
@@ -740,14 +817,35 @@ def analyze_text(
     provider, sidecar_status, degraded, warnings = _resolve_provider(
         config, provider_kind, auto_start, allow_fallback=True
     )
-    analysis = build_normalized_analysis(
-        text=text,
-        project_slug=project_slug,
-        chapter_id=chapter_id,
-        provider=provider,
-        degraded=degraded,
-        warnings=warnings,
-    )
+    try:
+        analysis = build_normalized_analysis(
+            text=text,
+            project_slug=project_slug,
+            chapter_id=chapter_id,
+            provider=provider,
+            degraded=degraded,
+            warnings=warnings,
+        )
+    except (OSError, TimeoutError, urllib.error.URLError, ValueError) as exc:
+        if (provider_kind or config.provider) != "ltp_server":
+            raise
+        clear_sidecar_session_cache(config.ltp_server.base_url)
+        retry_provider, retry_status, retry_degraded, retry_warnings = _resolve_provider(
+            config,
+            "ltp_server",
+            auto_start,
+            allow_fallback=True,
+        )
+        retry_warnings.append(f"ltp_server_analyze_retry_after_failure:{exc}")
+        analysis = build_normalized_analysis(
+            text=text,
+            project_slug=project_slug,
+            chapter_id=chapter_id,
+            provider=retry_provider,
+            degraded=retry_degraded,
+            warnings=retry_warnings,
+        )
+        sidecar_status = retry_status
     if sidecar_status:
         analysis["sidecar_status"] = sidecar_status.to_dict()
     return analysis
@@ -1206,6 +1304,233 @@ def show_cache(
                 "analysis": analysis,
             }
     raise ValueError(f"NLP cache not found for chapter: {chapter_ref}")
+
+
+MOJIBAKE_RE = re.compile(r"[äåæÃ]")
+
+
+def _quality_paths(workspace: Workspace, project_slug: str) -> dict[str, Path]:
+    root = workspace.path / "artifacts" / "nlp" / project_slug / "quality"
+    return {
+        "root": root,
+        "json": root / "nlp_quality_report.json",
+        "markdown": root / "nlp_quality_report.md",
+        "csv": root / "nlp_quality_table.csv",
+    }
+
+
+def _chapter_entry_by_ref(manifest: dict[str, Any], chapter_ref: str) -> dict[str, Any] | None:
+    for entry in manifest.get("chapters", []):
+        if str(entry.get("chapter_no")) == str(chapter_ref) or entry.get("chapter_id") == chapter_ref:
+            return entry
+    return None
+
+
+def quality_check(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    chapters: str,
+) -> dict[str, Any]:
+    manifest_path = _manifest_path(workspace, project_slug)
+    if not manifest_path.exists():
+        raise ValueError(f"NLP cache manifest not found for project: {project_slug}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    requested = parse_chapter_range(chapters)
+    rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    total_tokens = 0
+    total_sentences = 0
+    total_provider_pos = 0
+    total_ner_tags = 0
+
+    for chapter_ref in requested:
+        entry = _chapter_entry_by_ref(manifest, chapter_ref)
+        reasons: list[str] = []
+        artifact_data: dict[str, Any] | None = None
+        if entry is None:
+            reasons.append("missing_cache_artifact")
+        else:
+            artifact = Path(entry.get("artifact_path") or "")
+            if not artifact.exists():
+                reasons.append("artifact_path_missing")
+            else:
+                try:
+                    artifact_data = json.loads(artifact.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    reasons.append("artifact_malformed_json")
+
+        if artifact_data is not None:
+            meta = artifact_data.get("meta", {})
+            sentences = artifact_data.get("sentences", [])
+            candidates = artifact_data.get("chapter_candidates", {})
+            if meta.get("provider") != "ltp_server":
+                reasons.append("provider_not_ltp_server")
+            if meta.get("degraded"):
+                reasons.append("chapter_degraded")
+            if not sentences:
+                reasons.append("sentences_missing")
+            token_count = 0
+            provider_pos_count = 0
+            ner_count = 0
+            mojibake_count = 0
+            for sentence in sentences:
+                tokens = sentence.get("tokens", [])
+                if not tokens:
+                    reasons.append("sentence_without_tokens")
+                for token in tokens:
+                    token_count += 1
+                    if token.get("provider_pos") is not None:
+                        provider_pos_count += 1
+                    if not token.get("norm_pos"):
+                        reasons.append("token_missing_norm_pos")
+                    if MOJIBAKE_RE.search(str(token.get("text") or "")):
+                        mojibake_count += 1
+                ner_tags = sentence.get("ner_tags", [])
+                ner_count += len(ner_tags)
+            if token_count == 0:
+                reasons.append("zero_tokens")
+            if len(sentences) and token_count / max(len(sentences), 1) < 1.2:
+                reasons.append("suspiciously_tiny_token_count")
+            if provider_pos_count < max(1, token_count // 2):
+                reasons.append("provider_pos_sparse")
+            if ner_count == 0:
+                reasons.append("ner_tags_missing")
+            for key in ("entity_candidates", "term_candidates", "phrase_candidates"):
+                if not isinstance(candidates.get(key), list):
+                    reasons.append(f"{key}_not_list")
+            if mojibake_count:
+                reasons.append("mojibake_detected")
+            total_tokens += token_count
+            total_sentences += len(sentences)
+            total_provider_pos += provider_pos_count
+            total_ner_tags += ner_count
+            row = {
+                "chapter": chapter_ref,
+                "chapter_id": entry.get("chapter_id") if entry else None,
+                "provider": meta.get("provider"),
+                "degraded": bool(meta.get("degraded")),
+                "sentence_count": len(sentences),
+                "token_count": token_count,
+                "provider_pos_count": provider_pos_count,
+                "ner_tag_count": ner_count,
+                "entity_candidate_count": len(candidates.get("entity_candidates") or []),
+                "term_candidate_count": len(candidates.get("term_candidates") or []),
+                "phrase_candidate_count": len(candidates.get("phrase_candidates") or []),
+                "pass": not reasons,
+                "reasons": reasons,
+            }
+        else:
+            row = {
+                "chapter": chapter_ref,
+                "chapter_id": entry.get("chapter_id") if entry else None,
+                "provider": None,
+                "degraded": True,
+                "sentence_count": 0,
+                "token_count": 0,
+                "provider_pos_count": 0,
+                "ner_tag_count": 0,
+                "entity_candidate_count": 0,
+                "term_candidate_count": 0,
+                "phrase_candidate_count": 0,
+                "pass": False,
+                "reasons": reasons,
+            }
+        rows.append(row)
+        if not row["pass"]:
+            failures.append(row)
+
+    sidecar_status = manifest.get("sidecar_status") or {}
+    manifest_reasons: list[str] = []
+    if len(requested) != len(rows):
+        manifest_reasons.append("requested_chapter_count_mismatch")
+    if int(manifest.get("coverage_count") or 0) < len(requested):
+        manifest_reasons.append("coverage_below_requested")
+    if int(manifest.get("degraded_chapter_count") or 0) != 0:
+        manifest_reasons.append("manifest_has_degraded_chapters")
+    providers = {row.get("provider") for row in rows}
+    if providers != {"ltp_server"}:
+        manifest_reasons.append("not_all_chapters_use_ltp_server")
+    if not sidecar_status.get("healthy"):
+        manifest_reasons.append("sidecar_not_healthy")
+    if sidecar_status.get("degraded"):
+        manifest_reasons.append("sidecar_degraded")
+    error_text = str(sidecar_status.get("error") or "")
+    if "non-object JSON" in error_text:
+        manifest_reasons.append("legacy_non_object_json_error_present")
+    pass_gate = not failures and not manifest_reasons
+
+    paths = _quality_paths(workspace, project_slug)
+    report = {
+        "schema_version": "nlp_quality_report_v1",
+        "project_slug": project_slug,
+        "chapters": requested,
+        "pass": pass_gate,
+        "failure_count": len(failures),
+        "manifest_reasons": manifest_reasons,
+        "coverage_count": manifest.get("coverage_count", 0),
+        "degraded_chapter_count": manifest.get("degraded_chapter_count", 0),
+        "provider": "ltp_server" if providers == {"ltp_server"} else sorted(str(p) for p in providers),
+        "sentence_count": total_sentences,
+        "token_count": total_tokens,
+        "provider_pos_count": total_provider_pos,
+        "ner_tag_count": total_ner_tags,
+        "sidecar_status": sidecar_status,
+        "rows": rows,
+        "report_paths": {
+            "json": str(paths["json"]),
+            "markdown": str(paths["markdown"]),
+            "csv": str(paths["csv"]),
+        },
+        "created_at": utc_now(),
+    }
+    _json_write(paths["json"], report)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    with paths["csv"].open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "chapter",
+                "chapter_id",
+                "provider",
+                "degraded",
+                "sentence_count",
+                "token_count",
+                "provider_pos_count",
+                "ner_tag_count",
+                "entity_candidate_count",
+                "term_candidate_count",
+                "phrase_candidate_count",
+                "pass",
+                "reasons",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            out = dict(row)
+            out["reasons"] = "; ".join(row.get("reasons") or [])
+            writer.writerow(out)
+    lines = [
+        f"# NLP Quality Report: {project_slug}",
+        "",
+        f"- Pass: `{pass_gate}`",
+        f"- Coverage: `{report['coverage_count']}`",
+        f"- Degraded chapters: `{report['degraded_chapter_count']}`",
+        f"- Sentences: `{total_sentences}`",
+        f"- Tokens: `{total_tokens}`",
+        f"- Manifest reasons: `{', '.join(manifest_reasons) or 'none'}`",
+        "",
+        "| Chapter | Provider | Degraded | Sentences | Tokens | Pass | Reasons |",
+        "| --- | --- | --- | ---: | ---: | --- | --- |",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['chapter']} | {row.get('provider')} | {row.get('degraded')} | "
+            f"{row.get('sentence_count')} | {row.get('token_count')} | {row.get('pass')} | "
+            f"{'; '.join(row.get('reasons') or []) or 'none'} |"
+        )
+    _markdown_write(paths["markdown"], lines)
+    return report
 
 
 def load_nlp_cache(workspace: Workspace, project_slug: str, chapter_ref: str) -> dict[str, Any]:

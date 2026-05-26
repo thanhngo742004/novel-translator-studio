@@ -49,10 +49,11 @@ DEFAULT_NLP_YAML = """nlp:
     base_url: "http://127.0.0.1:3003"
     working_dir: "C:/Users/Admin/tools/ltp-server"
     start_command: "cargo run --release"
-    executable: null
-    startup_timeout_seconds: 30
-    request_timeout_seconds: 15
+    executable: "C:/Users/Admin/tools/ltp-server/target/release/ltp-server.exe"
+    startup_timeout_seconds: 420
+    request_timeout_seconds: 30
     max_sentences_per_request: 512
+    stop_on_exit: false
   fallback:
     enabled: true
 """
