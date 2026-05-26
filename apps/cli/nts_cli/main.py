@@ -42,6 +42,7 @@ from nts_core.dictionary import (
     reject_dictionary_candidates,
     review_dictionary_run,
 )
+from nts_core.hybrid_prompt import inspect_hybrid_prompt
 from nts_core.eval_harness import (
     DEFAULT_LIMITS,
     DEFAULT_PROVIDER_RETRY_ATTEMPTS,
@@ -144,6 +145,7 @@ manga_manifest_app = typer.Typer(help="Manga manifest commands.")
 eval_app = typer.Typer(help="Evaluation harness commands.")
 nlp_app = typer.Typer(help="Chinese NLP analysis commands.")
 dict_app = typer.Typer(help="Project dictionary commands.")
+prompt_app = typer.Typer(help="Prompt support inspection commands.")
 app.add_typer(project_app, name="project")
 app.add_typer(config_app, name="config")
 app.add_typer(model_app, name="model")
@@ -157,6 +159,7 @@ app.add_typer(manga_app, name="manga")
 app.add_typer(eval_app, name="eval")
 app.add_typer(nlp_app, name="nlp")
 app.add_typer(dict_app, name="dict")
+app.add_typer(prompt_app, name="prompt")
 text_app.add_typer(text_chapters_app, name="chapters")
 text_app.add_typer(text_segments_app, name="segments")
 memory_app.add_typer(memory_evidence_app, name="evidence")
@@ -554,7 +557,10 @@ def translate_text(
     output_dir: Annotated[Optional[Path], typer.Option("--output-dir")] = None,
     force: Annotated[bool, typer.Option("--force")] = False,
     use_approved_dictionary: Annotated[bool, typer.Option("--use-approved-dictionary")] = False,
+    use_hybrid_prompt: Annotated[bool, typer.Option("--use-hybrid-prompt")] = False,
     dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
+    memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
+    support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
     emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
@@ -576,7 +582,10 @@ def translate_text(
             output_dir=output_dir,
             force=force,
             use_approved_dictionary=use_approved_dictionary,
+            use_hybrid_prompt=use_hybrid_prompt,
             dictionary_max_entries=dictionary_max_entries,
+            memory_max_items=memory_max_items,
+            support_max_chars=support_max_chars,
             emit_prompt_artifacts=emit_prompt_artifacts,
         )
     except StablePromptBlocker as exc:
@@ -636,7 +645,10 @@ def translate_batch(
     export_combined: Annotated[bool, typer.Option("--export-combined")] = False,
     stop_on_error: Annotated[bool, typer.Option("--stop-on-error")] = False,
     use_approved_dictionary: Annotated[bool, typer.Option("--use-approved-dictionary")] = False,
+    use_hybrid_prompt: Annotated[bool, typer.Option("--use-hybrid-prompt")] = False,
     dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
+    memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
+    support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
     emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
@@ -667,7 +679,10 @@ def translate_batch(
             export_combined=export_combined,
             stop_on_error=stop_on_error,
             use_approved_dictionary=use_approved_dictionary,
+            use_hybrid_prompt=use_hybrid_prompt,
             dictionary_max_entries=dictionary_max_entries,
+            memory_max_items=memory_max_items,
+            support_max_chars=support_max_chars,
             emit_prompt_artifacts=emit_prompt_artifacts,
         )
     except StablePromptBlocker as exc:
@@ -1020,7 +1035,10 @@ def learn_validate_approved_memory(
         typer.Option("--allow-skip-unsafe-chapter-sample/--no-allow-skip-unsafe-chapter-sample"),
     ] = False,
     use_approved_dictionary: Annotated[bool, typer.Option("--use-approved-dictionary")] = False,
+    use_hybrid_prompt: Annotated[bool, typer.Option("--use-hybrid-prompt")] = False,
     dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
+    memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
+    support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
     emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
@@ -1051,7 +1069,10 @@ def learn_validate_approved_memory(
             prefer_no_compression_window=prefer_no_compression_window,
             allow_skip_unsafe_chapter_sample=allow_skip_unsafe_chapter_sample,
             use_approved_dictionary=use_approved_dictionary,
+            use_hybrid_prompt=use_hybrid_prompt,
             dictionary_max_entries=dictionary_max_entries,
+            memory_max_items=memory_max_items,
+            support_max_chars=support_max_chars,
             emit_prompt_artifacts=emit_prompt_artifacts,
         )
     except StablePromptBlocker as exc:
@@ -1842,6 +1863,36 @@ def dict_inspect_command(
         )
     except (WorkspaceError, ValueError) as exc:
         _fail("DICT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@prompt_app.command("inspect")
+def prompt_inspect_command(
+    project: Annotated[str, typer.Option("--project")],
+    source_text: Annotated[str, typer.Option("--source-text")],
+    workspace: WorkspaceOption = None,
+    mode: Annotated[str, typer.Option("--mode")] = "production",
+    use_hybrid_prompt: Annotated[bool, typer.Option("--use-hybrid-prompt")] = False,
+    dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
+    memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
+    support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        if not use_hybrid_prompt:
+            raise ValueError("--use-hybrid-prompt is required for MVP5H prompt inspection.")
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = inspect_hybrid_prompt(
+            ws,
+            project_slug=project,
+            source_text=source_text,
+            mode=mode,
+            max_dictionary_entries=dictionary_max_entries,
+            max_memory_items=memory_max_items,
+            max_support_chars=support_max_chars,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)
 
 

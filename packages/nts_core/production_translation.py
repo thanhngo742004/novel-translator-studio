@@ -13,6 +13,7 @@ from typing import Any
 import yaml
 
 from nts_core.dictionary import build_dictionary_prompt_support
+from nts_core.hybrid_prompt import build_hybrid_prompt_support
 from nts_core.eval_harness import (
     EvalProvider,
     active_eval_pairs,
@@ -280,10 +281,12 @@ def build_production_prompt(
     memory_bundle: dict[str, Any],
     glossary: dict[str, Any],
     dictionary_block: str | None = None,
+    support_block: str | None = None,
 ) -> tuple[str, str]:
     system_sections = [stable_prompt.prompt_text, ""]
-    if dictionary_block:
-        system_sections.extend([dictionary_block, ""])
+    rendered_support_block = support_block or dictionary_block
+    if rendered_support_block:
+        system_sections.extend([rendered_support_block, ""])
     system_sections.extend(
         [
             "Production translation mode:",
@@ -460,8 +463,11 @@ def translate_chapter_stable(
     source_override: str | None = None,
     save_translation_row: bool = True,
     use_approved_dictionary: bool = False,
+    use_hybrid_prompt: bool = False,
     dictionary_max_entries: int = 8,
     dictionary_max_chars: int = 500,
+    memory_max_items: int = 6,
+    support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = False,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
@@ -485,6 +491,20 @@ def translate_chapter_stable(
     bundle = build_bundle(workspace, project_id=project["id"], text=source_text, top_k=30)
     glossary = _bundle_glossary(bundle)
     sample = _production_sample(chapter=chapter, source_text=source_text, merge_tiny_paragraphs=merge_tiny_paragraphs)
+    hybrid_context = (
+        build_hybrid_prompt_support(
+            workspace,
+            project["slug"],
+            source_text,
+            mode="production",
+            max_dictionary_entries=dictionary_max_entries,
+            max_memory_items=memory_max_items,
+            max_support_chars=support_max_chars,
+            chapters={int(chapter["chapter_no"])} if chapter.get("chapter_no") is not None else None,
+        )
+        if use_hybrid_prompt
+        else None
+    )
     dictionary_context = (
         build_dictionary_prompt_support(
             workspace,
@@ -493,7 +513,7 @@ def translate_chapter_stable(
             max_entries=dictionary_max_entries,
             max_chars=dictionary_max_chars,
         )
-        if use_approved_dictionary
+        if use_approved_dictionary and not use_hybrid_prompt
         else None
     )
     system_prompt, user_prompt = build_production_prompt(
@@ -502,6 +522,7 @@ def translate_chapter_stable(
         memory_bundle=bundle,
         glossary=glossary,
         dictionary_block=(dictionary_context or {}).get("block_text"),
+        support_block=(hybrid_context or {}).get("block_text"),
     )
     full_prompt = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
     prompt_path = artifact_dir / "prompt_used.md"
@@ -514,7 +535,31 @@ def translate_chapter_stable(
     source_path.write_text(source_text + "\n", encoding="utf-8")
     bundle_path.write_text(json_dumps(bundle) + "\n", encoding="utf-8")
     prompt_path.write_text(full_prompt + "\n", encoding="utf-8")
-    if use_approved_dictionary or emit_prompt_artifacts:
+    if use_hybrid_prompt:
+        context_payload = dict(hybrid_context or {})
+        context_payload["source_chunk_id"] = chapter_id
+        context_payload["prompt_sha256"] = _sha256_hex(full_prompt)
+        (artifact_dir / "prompt_context_bundle.json").write_text(
+            json_dumps(context_payload) + "\n",
+            encoding="utf-8",
+        )
+        (artifact_dir / "prompt_budget_report.json").write_text(
+            json_dumps(context_payload.get("budget_report") or {}) + "\n",
+            encoding="utf-8",
+        )
+        (artifact_dir / "prompt_retrieval_report.json").write_text(
+            json_dumps(context_payload.get("retrieval_report") or {}) + "\n",
+            encoding="utf-8",
+        )
+        (artifact_dir / "prompt_conflict_report.json").write_text(
+            json_dumps(context_payload.get("conflict_report") or {}) + "\n",
+            encoding="utf-8",
+        )
+        (artifact_dir / "prompt_support_items.json").write_text(
+            json_dumps(context_payload.get("support_items") or {}) + "\n",
+            encoding="utf-8",
+        )
+    elif use_approved_dictionary or emit_prompt_artifacts:
         context_payload = dictionary_context or {
             "schema_version": "dictionary_prompt_context_bundle_v1",
             "project_slug": project["slug"],
@@ -573,7 +618,10 @@ def translate_chapter_stable(
                 "prompt_id": stable_prompt.prompt_id,
                 "dry_run": dry_run,
                 "use_approved_dictionary": use_approved_dictionary,
+                "use_hybrid_prompt": use_hybrid_prompt,
                 "dictionary_max_entries": dictionary_max_entries,
+                "memory_max_items": memory_max_items,
+                "support_max_chars": support_max_chars,
             },
             result_data={},
         )
@@ -773,6 +821,10 @@ def translate_chapter_stable(
         "model_run_id": model_run_id,
         "translation_id": translation_id,
         "use_approved_dictionary": use_approved_dictionary,
+        "use_hybrid_prompt": use_hybrid_prompt,
+        "hybrid_prompt_block_rendered": bool((hybrid_context or {}).get("block_rendered")),
+        "hybrid_selected_item_count": len((hybrid_context or {}).get("selected_items") or []),
+        "hybrid_conflict_count": int((hybrid_context or {}).get("conflict_count") or 0),
         "dictionary_prompt_block_rendered": bool((dictionary_context or {}).get("block_rendered")),
         "dictionary_selected_hit_count": len((dictionary_context or {}).get("selected_hits") or []),
     }
@@ -799,6 +851,9 @@ def translate_chapter_stable(
         "dry_run": dry_run,
         "warnings": warnings,
         "use_approved_dictionary": use_approved_dictionary,
+        "use_hybrid_prompt": use_hybrid_prompt,
+        "hybrid_selected_item_count": len((hybrid_context or {}).get("selected_items") or []),
+        "hybrid_conflict_count": int((hybrid_context or {}).get("conflict_count") or 0),
         "dictionary_selected_hit_count": len((dictionary_context or {}).get("selected_hits") or []),
     }
 
@@ -923,7 +978,10 @@ def translate_batch_stable(
     stop_on_error: bool = False,
     prompt_id: str | None = None,
     use_approved_dictionary: bool = False,
+    use_hybrid_prompt: bool = False,
     dictionary_max_entries: int = 8,
+    memory_max_items: int = 6,
+    support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = False,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
@@ -1051,7 +1109,10 @@ def translate_batch_stable(
                     source_override=chunk,
                     save_translation_row=False,
                     use_approved_dictionary=use_approved_dictionary,
+                    use_hybrid_prompt=use_hybrid_prompt,
                     dictionary_max_entries=dictionary_max_entries,
+                    memory_max_items=memory_max_items,
+                    support_max_chars=support_max_chars,
                     emit_prompt_artifacts=emit_prompt_artifacts,
                 )
                 actual_api_calls += 1
@@ -1161,7 +1222,10 @@ def translate_batch_stable(
         "prompt_version": stable_prompt.prompt_version if stable_prompt else None,
         "approval_path": stable_prompt.approval_path if stable_prompt else None,
         "use_approved_dictionary": use_approved_dictionary,
+        "use_hybrid_prompt": use_hybrid_prompt,
         "dictionary_max_entries": dictionary_max_entries,
+        "memory_max_items": memory_max_items,
+        "support_max_chars": support_max_chars,
         "started_at": started_at,
         "completed_at": completed_at,
         "status": status,
