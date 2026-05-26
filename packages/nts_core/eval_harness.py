@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import zipfile
@@ -320,6 +321,23 @@ def _starts_with_injected_glossary_label(text: str) -> bool:
     return label_count >= 2 or matched_prefixes[0] not in {"hàn tuyệt"}
 
 
+def _acceptable_nonpunct_terminal(text: str) -> bool:
+    stripped = (text or "").strip()
+    if re.fullmatch(r"[-–—\s]{3,}", stripped):
+        return True
+    tail = re.split(r"[\n。.!?！？…]+", stripped)[-1].strip()
+    if re.fullmatch(r"[-–—\s]{3,}", tail):
+        return True
+    folded = unicodedata.normalize("NFD", tail.lower())
+    folded = "".join(ch for ch in folded if unicodedata.category(ch) != "Mn")
+    return bool(
+        re.fullmatch(
+            r"(?:[-–—]{2,}\s*)?(?:chuong|chapter)\s*\d+\s*[:：].{2,140}",
+            folded,
+        )
+    )
+
+
 def detect_truncated_vietnamese(
     text: str,
     *,
@@ -346,7 +364,12 @@ def detect_truncated_vietnamese(
         or re.search(r"[。.!?！？…]|\n", source_text)
         or len(stripped) >= 24
     )
-    if source_sentence_like and final and final not in TERMINAL_PUNCTUATION:
+    if (
+        source_sentence_like
+        and final
+        and final not in TERMINAL_PUNCTUATION
+        and not _acceptable_nonpunct_terminal(stripped)
+    ):
         reasons.append("missing_terminal_punctuation")
     final_token_match = re.search(r"([\wÀ-ỹĐđ]+)$", stripped, re.UNICODE)
     final_token = final_token_match.group(1).lower() if final_token_match else ""
@@ -3609,12 +3632,13 @@ def translate_samples(
     samples = read_selected_samples(run_dir)
     if sample_limit is not None:
         samples = samples[:sample_limit]
-    samples = apply_translation_units(
-        samples,
-        merge_tiny_paragraphs=merge_tiny_paragraphs,
-        tiny_paragraph_threshold=tiny_paragraph_threshold,
-        unit_target_min_chars=unit_target_min_chars,
-    )
+    if not samples or not all(sample.get("validation_units_locked") for sample in samples):
+        samples = apply_translation_units(
+            samples,
+            merge_tiny_paragraphs=merge_tiny_paragraphs,
+            tiny_paragraph_threshold=tiny_paragraph_threshold,
+            unit_target_min_chars=unit_target_min_chars,
+        )
     write_json(run_dir / "translation_units.json", translation_units_report(samples))
     write_json(run_dir / "unit_alignment_report.json", unit_alignment_report(samples))
     outputs_by_sample: dict[str, dict[str, Any]] = {}

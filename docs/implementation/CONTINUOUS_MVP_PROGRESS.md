@@ -913,3 +913,83 @@
   - No new memory was activated in MVP5D.
 - Next recommended phase:
   - Investigate unsafe compression/truncation in the affected chapter samples before another approval-memory validation. Focus on the production compression selector and chapter 6/9/10 long-ratio samples before expanding validation.
+
+## 2026-05-26T02:20:00+07:00
+
+- In progress/completed code work: MVP5D.1 production safety repair and replay diagnostics.
+- Implemented:
+  - `nts learn replay-approved-memory-validation` for no-API replay of cached approved-memory validation failures.
+  - Cached replay artifacts: `failing_samples_report.json`, `failing_samples_report.md`, and `safety_failure_table.csv`.
+  - Root-cause classification for severe validation flags, including real truncation, unsafe compression rewrite, over-strict unit budget, final-selector mistakes, provider empty output, unit merge/alignment boundary problems, bracket safety issues, evaluator false positives, and missing diagnostics.
+  - Title-guided chapter/sample selection for approved-memory validation so split Vietnamese EPUB chapters are mapped before block alignment.
+  - Truncation detector exceptions for valid chapter-heading and separator endings while preserving broken-fragment detection.
+- Commands run so far:
+  - `.venv\Scripts\python.exe -m pytest tests/test_mvp5d_approved_memory_validation.py -q`
+  - `.venv\Scripts\python.exe -m pytest -q`
+- Test result:
+  - Focused MVP5D/MVP5D.1 tests: 9 passed.
+  - Full suite: 124 passed.
+- Known limitations:
+  - Replay classification is deterministic and diagnostic; it does not suppress any severe flag.
+  - The new title-guided selector repairs the failed Han Jue EPUB split alignment, but the real rerun still must prove whether safety flags clear under provider output.
+- Cached replay on previous failed run:
+  - Run: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779730137664`
+  - Failure count: 25.
+  - Root causes: evaluator false positives 4, over-strict micro-unit budget 4, real truncation 4, unit merge/alignment boundary problems 13.
+- Dry-run result:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779753698989`
+  - Estimated total API calls: 40.
+- Real validation rerun:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779753711963`
+  - Final decision: FAIL.
+  - Round 1: 84.9 -> 85.5, delta +0.6.
+  - Round 2: 85.2 -> 84.9, delta -0.3.
+  - Severe flags remain: round 1 has 6, round 2 has 5.
+  - Truncation count: 0.
+  - Unsafe compression remains on chapters 4, 5, 6, 8, 9, and 10.
+  - Replay root cause on the new run: 22 unit merge/alignment boundary problems.
+  - Automatic resumes performed: 3.
+- Final MVP5D.1 decision:
+  - FAIL. The code fixes removed the detector false positives and improved alignment/sample quality, but approved memory still does not improve two consecutive rounds and severe unsafe-compression flags persist.
+
+## 2026-05-26T04:15:00+07:00
+
+- Completed code work: MVP5D.2 unit boundary selection and budgeting repair.
+- Implemented:
+  - Approved-memory validation now ranks title-matched candidate windows by unit boundary safety before provider calls.
+  - Added validation unit safety checks for unit source/reference width, reference/source ratio, mixed panel/narrative units, small budgets for medium source units, and broad block spans.
+  - Locked selected validation units so baseline and approved-memory passes use the same source/reference units.
+  - Added artifacts:
+    - `unit_candidate_ranking.json`
+    - `unit_candidate_ranking.md`
+    - `selected_validation_units.json`
+    - `selected_validation_units.md`
+  - `translate_samples` now preserves pre-locked validation units instead of re-merging them during approved-memory validation.
+- Commands run:
+  - `.venv\Scripts\python.exe -m pytest tests/test_mvp5d_approved_memory_validation.py -q`
+  - `.venv\Scripts\python.exe -m pytest -q`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn replay-approved-memory-validation --workspace workspace_mvp5c_smoke_20260525210758 --run workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779753711963 --json`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn validate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 1-10 --rounds 2 --require-consecutive-improvement --use-stable-prompt --resumable --dry-run --json`
+  - `.venv\Scripts\python.exe -m nts_cli.main learn validate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --raw test_data/translation_eval/han_jue/raw.txt --translated test_data/translation_eval/han_jue/viettranslated.epub --provider ckey_openai_compatible --model gpt-5.4 --fallback-model gpt-5.4-mini --chapters 1-10 --rounds 2 --require-consecutive-improvement --use-stable-prompt --resumable --max-real-calls 12 --json`
+  - Three automatic resumes of `han-jue_amv_1779760655652` with `--max-real-calls 12`.
+- Test result:
+  - Focused MVP5D tests: 9 passed.
+  - Full suite: 124 passed.
+- Replay before rerun:
+  - Run: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779753711963`
+  - Failure count: 22.
+  - Root causes: 22 unit merge/boundary problems.
+- Real validation rerun:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779760655652`
+  - Final decision: FAIL.
+  - Round 1: 86.9 -> 87.7, delta +0.8.
+  - Round 2: 86.8 -> 86.9, delta +0.1.
+  - Severe flags: 2 total in approved-memory score deltas.
+  - Replay after rerun: 5 cached safety failures total, with 3 unit merge/boundary problems and 2 over-strict micro-unit budget failures.
+  - Truncation count: 0.
+  - Remaining failing chapters: 8 and 10.
+  - Automatic resumes performed: 3.
+- Final MVP5D.2 decision:
+  - FAIL. Unit selection repair reduced unsafe-compression failures sharply, but severe flags still persist and neither round reached the required +1.0 improvement threshold.
+- Next recommended phase:
+  - Add an explicit chapter 8/10 candidate exclusion or alternate-window ablation step, then retry approved-memory validation only after replay shows no pre-translation unit budget risk for those chapters.

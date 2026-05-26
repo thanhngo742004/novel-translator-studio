@@ -6,6 +6,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from nts_cli.main import app
+from nts_core.eval_harness import detect_truncated_vietnamese
 
 
 runner = CliRunner()
@@ -317,3 +318,123 @@ def test_provider_empty_output_blocks_before_scoring(
     assert data["can_resume"] is True
     assert "provider_failure" in data["last_error"]
     assert data["round_results"] == []
+
+
+def test_truncation_detector_allows_headings_and_separators() -> None:
+    heading = "------------ Chương 3: Luyện Khí cảnh tầng bảy, sức hút chết tiệt"
+    separator = "------------"
+
+    assert detect_truncated_vietnamese(heading, source_text="第3章 炼气境七层，该死的魅力")[
+        "is_truncated"
+    ] is False
+    assert detect_truncated_vietnamese(separator, source_text="第9章 筑基境三层，莫复仇")[
+        "is_truncated"
+    ] is False
+    assert detect_truncated_vietnamese("Click bắt đ")["is_truncated"] is True
+
+
+def test_replay_approved_memory_validation_reports_cached_failures_without_api(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    result = validate_command(workspace)
+    assert result.exit_code == 0, result.output
+    run_dir = Path(parse_json(result.output)["data"]["run_dir"])
+
+    evaluation_path = run_dir / "round_1" / "memory_evaluation.json"
+    evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+    model = evaluation["best_model"]
+    sample = evaluation["models"][model]["samples"][0]
+    sample["truncated_paragraphs"] = [
+        {"paragraph_id": "u001", "reasons": ["missing_terminal_punctuation"]}
+    ]
+    sample.setdefault("verification_reasons", []).append("paragraph_truncation_detected")
+    evaluation_path.write_text(json.dumps(evaluation, ensure_ascii=False), encoding="utf-8")
+
+    replay = runner.invoke(
+        app,
+        [
+            "learn",
+            "replay-approved-memory-validation",
+            "--workspace",
+            str(workspace),
+            "--run",
+            str(run_dir),
+            "--json",
+        ],
+    )
+
+    assert replay.exit_code == 0, replay.output
+    data = parse_json(replay.output)["data"]
+    assert data["failure_count"] >= 1
+    assert (run_dir / "failing_samples_report.json").exists()
+    assert (run_dir / "failing_samples_report.md").exists()
+    assert (run_dir / "safety_failure_table.csv").exists()
+    report = json.loads((run_dir / "failing_samples_report.json").read_text(encoding="utf-8"))
+    assert any(row["sample_id"] == sample["sample_id"] for row in report["failures"])
+    assert set(report["root_cause_counts"]).issubset(
+        {
+            "evaluator_false_positive",
+            "real_truncation",
+            "unsafe_compression_rewrite",
+            "unit_merge_boundary_problem",
+            "over_strict_micro_unit_budget",
+            "formatting/bracket safety issue",
+            "missing_diagnostics",
+        }
+    )
+    assert report["failures"][0]["root_cause"] in {
+        "evaluator_false_positive",
+        "real_truncation",
+        "unsafe_compression_rewrite",
+        "unit_merge_boundary_problem",
+        "over_strict_micro_unit_budget",
+        "formatting/bracket safety issue",
+        "missing_diagnostics",
+    }
+
+
+def test_title_guided_selection_uses_split_epub_chapters(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    result = validate_command(workspace, extra=["--chapters", "1-10", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    run_dir = Path(parse_json(result.output)["data"]["run_dir"])
+
+    resumed = runner.invoke(
+        app,
+        [
+            "learn",
+            "resume-approved-memory-validation",
+            "--workspace",
+            str(workspace),
+            "--run",
+            str(run_dir),
+            "--max-real-calls",
+            "0",
+            "--json",
+        ],
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    selection = json.loads(
+        (run_dir / "approved_memory_validation_sample_selection.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert selection["selected_chapters"] == list(range(1, 11))
+    assert selection["selected_target_chapters"] == [1, 2, 4, 5, 6, 8, 9, 11, 12, 13]
+    assert (run_dir / "selected_validation_units.json").exists()
+    assert (run_dir / "selected_validation_units.md").exists()
+    assert (run_dir / "unit_candidate_ranking.json").exists()
+    assert (run_dir / "unit_candidate_ranking.md").exists()
+    units = json.loads((run_dir / "selected_validation_units.json").read_text(encoding="utf-8"))
+    assert all(
+        sample["validation_unit_safety"]["compression_risk"] == "low"
+        for sample in units["samples"]
+    )
+    ranking = json.loads((run_dir / "unit_candidate_ranking.json").read_text(encoding="utf-8"))
+    assert any(not row["accepted"] for row in ranking["candidates"])

@@ -11,6 +11,7 @@ from nts_core.approved_memory_validation import (
     DEFAULT_APPROVED_MEMORY_VALIDATION_CHAPTERS,
     DEFAULT_APPROVED_MEMORY_VALIDATION_ROUNDS,
     approved_memory_validation_status,
+    replay_approved_memory_validation,
     resume_approved_memory_validation,
     start_approved_memory_validation,
 )
@@ -990,6 +991,20 @@ def learn_approved_memory_validation_status(
     try:
         ws = discover_workspace(_workspace_arg(workspace))
         result = approved_memory_validation_status(ws, run=run)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("replay-approved-memory-validation")
+def learn_replay_approved_memory_validation(
+    run: Annotated[str, typer.Option("--run", help="Validation run id or path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = replay_approved_memory_validation(ws, run=run)
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)
