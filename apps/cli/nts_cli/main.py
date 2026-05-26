@@ -32,6 +32,16 @@ from nts_core.corrections import (
     records_from_parallel_files,
 )
 from nts_core.doctor import build_doctor_report
+from nts_core.dictionary import (
+    approve_dictionary_candidates,
+    build_dictionary_run,
+    dictionary_status,
+    export_project_dictionary,
+    inspect_dictionary_hits,
+    prepare_dictionary_run,
+    reject_dictionary_candidates,
+    review_dictionary_run,
+)
 from nts_core.eval_harness import (
     DEFAULT_LIMITS,
     DEFAULT_PROVIDER_RETRY_ATTEMPTS,
@@ -133,6 +143,7 @@ manga_boxes_app = typer.Typer(help="Manga box commands.")
 manga_manifest_app = typer.Typer(help="Manga manifest commands.")
 eval_app = typer.Typer(help="Evaluation harness commands.")
 nlp_app = typer.Typer(help="Chinese NLP analysis commands.")
+dict_app = typer.Typer(help="Project dictionary commands.")
 app.add_typer(project_app, name="project")
 app.add_typer(config_app, name="config")
 app.add_typer(model_app, name="model")
@@ -145,6 +156,7 @@ app.add_typer(export_app, name="export")
 app.add_typer(manga_app, name="manga")
 app.add_typer(eval_app, name="eval")
 app.add_typer(nlp_app, name="nlp")
+app.add_typer(dict_app, name="dict")
 text_app.add_typer(text_chapters_app, name="chapters")
 text_app.add_typer(text_segments_app, name="segments")
 memory_app.add_typer(memory_evidence_app, name="evidence")
@@ -1628,6 +1640,190 @@ def nlp_human_review_final_command(
         )
     except (WorkspaceError, ValueError) as exc:
         _fail("NLP_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@dict_app.command("prepare")
+def dict_prepare_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    chapters: Annotated[str, typer.Option("--chapters", help="Chapter range, e.g. 1-10.")],
+    workspace: WorkspaceOption = None,
+    source_nlp_cache: Annotated[
+        Optional[Path],
+        typer.Option("--source-nlp-cache", help="Optional NLP cache directory or manifest."),
+    ] = None,
+    raw: Annotated[Optional[Path], typer.Option("--raw", help="Optional raw source file path.")] = None,
+    translated: Annotated[
+        Optional[Path],
+        typer.Option("--translated", help="Optional translated EPUB/reference path."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = prepare_dictionary_run(
+            ws,
+            project_slug=project,
+            chapters=chapters,
+            source_nlp_cache=source_nlp_cache,
+            raw_path=raw,
+            translated_path=translated,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("DICT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@dict_app.command("build")
+def dict_build_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Dictionary run id or path.")],
+    workspace: WorkspaceOption = None,
+    from_chunk: Annotated[Optional[int], typer.Option("--from-chunk")] = None,
+    to_chunk: Annotated[Optional[int], typer.Option("--to-chunk")] = None,
+    resume: Annotated[bool, typer.Option("--resume")] = False,
+    skip_existing: Annotated[bool, typer.Option("--skip-existing")] = False,
+    max_candidates: Annotated[Optional[int], typer.Option("--max-candidates")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = build_dictionary_run(
+            ws,
+            project_slug=project,
+            run=run,
+            from_chunk=from_chunk,
+            to_chunk=to_chunk,
+            resume=resume,
+            skip_existing=skip_existing,
+            max_candidates=max_candidates,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("DICT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@dict_app.command("review")
+def dict_review_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Dictionary run id or path.")],
+    workspace: WorkspaceOption = None,
+    min_confidence: Annotated[Optional[float], typer.Option("--min-confidence")] = None,
+    entry_type: Annotated[
+        Optional[str],
+        typer.Option("--type", help="Filter by dictionary entry type."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = review_dictionary_run(
+            ws,
+            project_slug=project,
+            run=run,
+            min_confidence=min_confidence,
+            entry_type=entry_type,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("DICT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@dict_app.command("approve")
+def dict_approve_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Dictionary run id or path.")],
+    workspace: WorkspaceOption = None,
+    candidate_ids: Annotated[Optional[str], typer.Option("--candidate-ids")] = None,
+    all_high_confidence: Annotated[bool, typer.Option("--all-high-confidence")] = False,
+    reviewer: Annotated[str, typer.Option("--reviewer")] = "human",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = approve_dictionary_candidates(
+            ws,
+            project_slug=project,
+            run=run,
+            candidate_ids=candidate_ids,
+            all_high_confidence=all_high_confidence,
+            reviewer=reviewer,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("DICT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@dict_app.command("reject")
+def dict_reject_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Dictionary run id or path.")],
+    candidate_ids: Annotated[str, typer.Option("--candidate-ids")],
+    reason: Annotated[str, typer.Option("--reason")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = reject_dictionary_candidates(
+            ws,
+            project_slug=project,
+            run=run,
+            candidate_ids=candidate_ids,
+            reason=reason,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("DICT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@dict_app.command("export")
+def dict_export_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    out: Annotated[Optional[Path], typer.Option("--out", help="Optional output JSON path.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = export_project_dictionary(ws, project_slug=project, out=out)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("DICT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@dict_app.command("status")
+def dict_status_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = dictionary_status(ws, project_slug=project)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("DICT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@dict_app.command("inspect")
+def dict_inspect_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    source_text: Annotated[str, typer.Option("--source-text", help="Chinese source chunk.")],
+    workspace: WorkspaceOption = None,
+    chapter: Annotated[Optional[str], typer.Option("--chapter")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = inspect_dictionary_hits(
+            ws,
+            project_slug=project,
+            source_text=source_text,
+            chapter=chapter,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("DICT_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)
 
 

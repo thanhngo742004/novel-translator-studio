@@ -349,15 +349,12 @@ def test_no_memory_or_dictionary_is_created_by_nlp_cache(tmp_path: Path) -> None
 
     with sqlite3.connect(workspace.db_path) as conn:
         memory_count = conn.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0]
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%dictionary%'"
-            )
-        }
+        dictionary_candidate_count = conn.execute("SELECT COUNT(*) FROM dictionary_candidates").fetchone()[0]
+        dictionary_entry_count = conn.execute("SELECT COUNT(*) FROM project_dictionary_entries").fetchone()[0]
 
     assert memory_count == 0
-    assert tables == set()
+    assert dictionary_candidate_count == 0
+    assert dictionary_entry_count == 0
 
 
 class _FakeLtpAnalyzer:

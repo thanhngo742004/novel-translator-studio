@@ -73,7 +73,7 @@ def test_mvp1_migrations_create_text_and_memory_tables(tmp_path: Path) -> None:
         "memory_audit_logs",
         "memory_conflicts",
     }.issubset(tables)
-    assert versions == [1, 2, 3, 4, 5, 6]
+    assert versions == [1, 2, 3, 4, 5, 6, 7]
 
 
 def test_import_text_creates_document_chapters_segments_and_artifact(tmp_path: Path) -> None:
