@@ -388,3 +388,84 @@ def test_simulate_memory_bundle_does_not_activate_candidates(
     )
     assert after.exit_code == 0, after.output
     assert len(parse_json(after.output)["data"]["items"]) == before_count
+
+
+def test_approve_mined_memory_candidates_creates_active_memory_and_preserves_unselected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    active = create_memory(
+        workspace,
+        memory_type="term",
+        source_key="灵根资质",
+        target_text="Linh căn tư chất",
+        value={"candidate_type": "term_memory", "source_pattern": "灵根资质"},
+    )
+    run_dir = make_fake_validation_run(workspace, [active])
+    mined = runner.invoke(
+        app,
+        [
+            "learn",
+            "mine-memory-candidates",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--validation-run",
+            str(run_dir),
+            "--json",
+        ],
+    )
+    assert mined.exit_code == 0, mined.output
+    mining_dir = Path(parse_json(mined.output)["data"]["run_dir"])
+    candidates = [
+        json.loads(line)
+        for line in (mining_dir / "mined_memory_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    selected_ids = [candidate["candidate_id"] for candidate in candidates[:2]]
+
+    approved = runner.invoke(
+        app,
+        [
+            "learn",
+            "approve-memory",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "han-jue",
+            "--run",
+            str(mining_dir),
+            "--candidate-ids",
+            ",".join(selected_ids),
+            "--json",
+        ],
+    )
+
+    assert approved.exit_code == 0, approved.output
+    data = parse_json(approved.output)["data"]
+    assert data["updated_candidate_ids"] == selected_ids
+    assert len(data["created_memory_item_ids"]) == 2
+    assert (mining_dir / "mined_memory_approval.json").exists()
+    assert (mining_dir / "mined_memory_approval.md").exists()
+    updated = [
+        json.loads(line)
+        for line in (mining_dir / "mined_memory_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    selected = [candidate for candidate in updated if candidate["candidate_id"] in selected_ids]
+    unselected = [candidate for candidate in updated if candidate["candidate_id"] not in selected_ids]
+    assert all(candidate["status"] == "active" for candidate in selected)
+    assert all(candidate["review_status"] == "approved_by_human" for candidate in selected)
+    assert all(candidate["memory_item_id"] for candidate in selected)
+    assert all(candidate["status"] == "pending_review" for candidate in unselected)
+
+    active_items = runner.invoke(
+        app,
+        ["memory", "list", "--workspace", str(workspace), "--status", "active", "--json"],
+    )
+    assert active_items.exit_code == 0, active_items.output
+    items = parse_json(active_items.output)["data"]["items"]
+    created_ids = set(data["created_memory_item_ids"])
+    assert created_ids.issubset({item["id"] for item in items})

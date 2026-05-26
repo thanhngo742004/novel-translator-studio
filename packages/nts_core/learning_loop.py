@@ -2205,6 +2205,17 @@ def _review_memory_status(
     reason: str,
 ) -> dict[str, Any]:
     run_dir = resolve_learning_run(workspace, project_slug, run)
+    mined_candidates_path = run_dir / "mined_memory_candidates.jsonl"
+    if mined_candidates_path.exists():
+        return _review_mined_memory_status(
+            workspace,
+            project_slug=project_slug,
+            run_dir=run_dir,
+            candidate_ids=candidate_ids,
+            all_candidates=all_candidates,
+            status=status,
+            reason=reason,
+        )
     candidates_path = run_dir / "memory_candidates.json"
     if not candidates_path.exists():
         raise ValueError("No memory candidates found for this learning run.")
@@ -2235,4 +2246,221 @@ def _review_memory_status(
         "reason": reason,
     }
     write_json(run_dir / f"memory_{status}_review.json", result)
+    return result
+
+
+def _read_mined_memory_candidates(path: Path) -> list[dict[str, Any]]:
+    candidates = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            candidates.append(json.loads(line))
+    return candidates
+
+
+def _write_mined_memory_candidates(path: Path, candidates: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for candidate in candidates:
+            handle.write(json_dumps(candidate) + "\n")
+
+
+def _write_mined_review_table(run_dir: Path, candidates: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "candidate_id",
+        "memory_type",
+        "source_pattern",
+        "preferred_target",
+        "rejected_variant",
+        "confidence",
+        "evidence_count",
+        "chapter_spread",
+        "status",
+        "review_status",
+        "memory_item_id",
+        "review_reason",
+    ]
+    for path in (
+        run_dir / "memory_candidate_review.csv",
+        run_dir / "human_review" / "candidate_review_table.csv",
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for candidate in candidates:
+                writer.writerow({key: candidate.get(key) for key in fieldnames})
+
+
+def _write_mined_candidates_markdown(path: Path, candidates: list[dict[str, Any]]) -> None:
+    lines = ["# Mined Memory Candidates", ""]
+    for candidate in candidates:
+        lines.extend(
+            [
+                f"## {candidate['candidate_id']}",
+                "",
+                f"- Type: `{candidate.get('candidate_type')}` / `{candidate.get('memory_type')}`",
+                f"- Source pattern: `{candidate.get('source_pattern')}`",
+                f"- Preferred: `{candidate.get('preferred_target')}`",
+                f"- Rejected: `{candidate.get('rejected_variant')}`",
+                f"- Confidence: `{candidate.get('confidence')}`",
+                f"- Evidence count: `{candidate.get('evidence_count')}`",
+                f"- Status: `{candidate.get('status')}`",
+                f"- Review status: `{candidate.get('review_status')}`",
+                f"- Memory item: `{candidate.get('memory_item_id')}`",
+                "",
+            ]
+        )
+    _write_text(path, "\n".join(lines) + "\n")
+
+
+def _review_mined_memory_status(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    run_dir: Path,
+    candidate_ids: str | None,
+    all_candidates: bool,
+    status: str,
+    reason: str,
+) -> dict[str, Any]:
+    if status not in {"active", "rejected"}:
+        raise ValueError("Mined memory review only supports active or rejected status.")
+    project = get_project_by_slug(workspace, project_slug)
+    candidates_path = run_dir / "mined_memory_candidates.jsonl"
+    candidates = _read_mined_memory_candidates(candidates_path)
+    if not candidates:
+        raise ValueError("No mined memory candidates found for this run.")
+    if all_candidates:
+        ids = [str(candidate["candidate_id"]) for candidate in candidates]
+    else:
+        if not candidate_ids:
+            raise ValueError("Provide --candidate-ids or explicit --all.")
+        ids = [item.strip() for item in candidate_ids.split(",") if item.strip()]
+    candidate_lookup = {str(candidate["candidate_id"]): candidate for candidate in candidates}
+    missing = [candidate_id for candidate_id in ids if candidate_id not in candidate_lookup]
+    if missing:
+        raise ValueError(f"Candidate id(s) not found: {', '.join(missing)}")
+
+    updated: list[dict[str, Any]] = []
+    created_memory_item_ids: list[str] = []
+    for candidate_id in ids:
+        candidate = candidate_lookup[candidate_id]
+        if status == "active":
+            memory_item_id = candidate.get("memory_item_id")
+            if memory_item_id:
+                update_memory_status(workspace, memory_item_id=str(memory_item_id), status="active")
+            else:
+                scope = dict(candidate.get("scope") or {})
+                scope.setdefault("project_id", project["id"])
+                scope.setdefault("project_slug", project_slug)
+                scope.setdefault("domain", project.get("domain"))
+                scope.setdefault("source_lang", project.get("source_lang"))
+                scope.setdefault("target_lang", project.get("target_lang"))
+                scope.setdefault("language_pair", f"{project.get('source_lang')}-{project.get('target_lang')}")
+                rejected_variants = [
+                    str(item)
+                    for item in candidate.get("rejected_variants", [])
+                    if item
+                ]
+                rejected_variant = candidate.get("rejected_variant")
+                if rejected_variant and str(rejected_variant) not in rejected_variants:
+                    rejected_variants.insert(0, str(rejected_variant))
+                value = {
+                    "candidate_id": candidate_id,
+                    "candidate_type": candidate.get("candidate_type"),
+                    "source_pattern": candidate.get("source_pattern"),
+                    "preferred_target": candidate.get("preferred_target"),
+                    "rejected_variant": candidate.get("rejected_variant"),
+                    "rejected_variants": rejected_variants,
+                    "reason": candidate.get("reason"),
+                    "mining_run_id": run_dir.name,
+                    "status": "active",
+                    "review_status": "approved_by_human",
+                }
+                item = create_memory_item(
+                    workspace,
+                    memory_type=str(candidate.get("memory_type")),
+                    status="active",
+                    layer="learning_candidate",
+                    scope=scope,
+                    source_key=str(candidate.get("source_pattern") or ""),
+                    target_text=str(candidate.get("preferred_target") or ""),
+                    value=value,
+                    rules={
+                        "preferred_target": candidate.get("preferred_target"),
+                        "forbidden_variants": rejected_variants,
+                    },
+                    confidence_score=float(candidate.get("confidence") or 0),
+                    confidence={
+                        "source": "mined_memory_candidate",
+                        "evidence_count": int(candidate.get("evidence_count") or 0),
+                        "mining_run_id": run_dir.name,
+                    },
+                )
+                memory_item_id = item["id"]
+                candidate["memory_item_id"] = memory_item_id
+                created_memory_item_ids.append(memory_item_id)
+                for evidence in candidate.get("evidence", []) or []:
+                    add_evidence(
+                        workspace,
+                        memory_item_id=memory_item_id,
+                        source_kind="mined_memory_candidate",
+                        artifact_ref=str(run_dir),
+                        excerpt=evidence,
+                        quality_score=float(candidate.get("confidence") or 0),
+                    )
+            candidate["status"] = "active"
+            candidate["review_status"] = "approved_by_human"
+            candidate["review_reason"] = reason
+            candidate["approved_at"] = utc_now()
+        else:
+            memory_item_id = candidate.get("memory_item_id")
+            if memory_item_id:
+                update_memory_status(workspace, memory_item_id=str(memory_item_id), status="rejected")
+            candidate["status"] = "rejected"
+            candidate["review_status"] = "rejected_by_human"
+            candidate["review_reason"] = reason
+            candidate["rejected_at"] = utc_now()
+        updated.append(candidate)
+
+    _write_mined_memory_candidates(candidates_path, candidates)
+    _write_mined_candidates_markdown(run_dir / "mined_memory_candidates.md", candidates)
+    _write_mined_review_table(run_dir, candidates)
+    review_file_stem = "approval" if status == "active" else "rejection"
+    result = {
+        "run_dir": str(run_dir),
+        "status": status,
+        "review_status": "approved_by_human" if status == "active" else "rejected_by_human",
+        "updated_candidate_ids": ids,
+        "created_memory_item_ids": created_memory_item_ids,
+        "reason": reason,
+        "unselected_candidate_ids": [
+            str(candidate["candidate_id"])
+            for candidate in candidates
+            if str(candidate["candidate_id"]) not in set(ids)
+        ],
+    }
+    write_json(run_dir / f"mined_memory_{review_file_stem}.json", result)
+    lines = [
+        f"# Mined Memory {review_file_stem.title()}",
+        "",
+        f"- Run: `{run_dir}`",
+        f"- Status: `{status}`",
+        f"- Reason: `{reason}`",
+        f"- Updated candidates: `{', '.join(ids)}`",
+        f"- Created memory items: `{', '.join(created_memory_item_ids)}`",
+        "",
+        "Unselected candidates remain unchanged.",
+        "",
+    ]
+    _write_text(run_dir / f"mined_memory_{review_file_stem}.md", "\n".join(lines))
+    review_summary = run_dir / "human_review" / "human_review_summary.md"
+    if review_summary.exists():
+        with review_summary.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "\n## Latest Review Action\n\n"
+                f"- Status: `{status}`\n"
+                f"- Updated candidates: `{', '.join(ids)}`\n"
+                f"- Created memory items: `{', '.join(created_memory_item_ids)}`\n"
+            )
     return result
