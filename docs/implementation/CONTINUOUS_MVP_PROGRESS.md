@@ -1076,3 +1076,70 @@
   - FAIL. Chapter 10 alignment and split-EPUB grouping are repaired and the full run has no safety failures, but the configured approved-memory validation gate still fails because neither round reaches the minimum improvement threshold.
 - Next recommended phase:
   - Investigate whether the five approved memory candidates are too weak for broad 10-chapter uplift; run memory-impact ablation or approve additional evidence-backed candidates before another 10-chapter validation.
+
+## 2026-05-26T13:05:00+07:00
+
+- Completed code work: MVP5D.5 memory-impact ablation and stronger evidence-backed candidate mining.
+- Implemented:
+  - Added `nts learn ablate-approved-memory` for cached/no-API impact analysis of approved learning memory.
+  - Added `nts learn mine-memory-candidates` for evidence-backed pending candidate mining from approved-memory validation outputs and human references.
+  - Added `nts learn simulate-memory-bundle` for a no-activation temporary bundle simulation report.
+  - Added ablation artifacts under `artifacts/approved_memory_ablation/<run_id>/`:
+    - `ablation_manifest.json`
+    - `ablation_matrix.json`
+    - `ablation_matrix.md`
+    - `candidate_impact_report.json`
+    - `candidate_impact_report.md`
+    - `per_chapter_impact.csv`
+    - `recommended_keep_drop_review.md`
+  - Added mining artifacts under `artifacts/memory_candidate_mining/<run_id>/`:
+    - `mined_memory_candidates.jsonl`
+    - `mined_memory_candidates.md`
+    - `memory_candidate_review.csv`
+    - `candidate_conflicts.json`
+    - `candidate_dedup_report.json`
+    - `evidence_pack.md`
+    - `human_review/`
+  - Mined candidates remain `pending_review`; no memory is auto-approved or activated.
+- Commands run:
+  - `python -m pytest tests/test_mvp5d5_memory_impact.py -q`
+  - `python -m pytest`
+  - `python -m nts_cli.main learn ablate-approved-memory --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --validation-run workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779771310284 --json`
+  - `python -m nts_cli.main learn mine-memory-candidates --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --validation-run workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779771310284 --json`
+  - `python -m nts_cli.main learn simulate-memory-bundle --workspace workspace_mvp5c_smoke_20260525210758 --project han-jue --validation-run workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_validation/han-jue_amv_1779771310284 --candidate-run workspace_mvp5c_smoke_20260525210758/artifacts/memory_candidate_mining/han-jue_mining_1779774745969 --json`
+- Test result:
+  - Focused MVP5D.5 tests: 3 passed.
+  - Full suite: 132 passed.
+- Real cached ablation:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/approved_memory_ablation/han-jue_ablation_1779774665130`
+  - Existing approved memory impact classifications:
+    - 4 weak positive.
+    - 1 neutral.
+    - 0 harmful.
+    - 0 insufficient evidence.
+  - Observed full approved-memory delta from MVP5D.4 validation: +0.4 average across the two rounds.
+- Real candidate mining:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/memory_candidate_mining/han-jue_mining_1779774745969`
+  - Candidate count: 5.
+  - Candidate types: 3 name, 1 term, 1 style.
+  - High-confidence candidates: 4.
+  - Conflicts: 0.
+  - Duplicate/merged evidence rows: 7.
+  - High-confidence review candidates:
+    - `玉幽峰` -> `Ngọc U phong`
+    - `曦璇仙子` -> `Hi Tuyền tiên tử`
+    - `雷灵池` -> `Lôi Linh Trì`
+    - `技能` -> `skills`
+  - Needs review candidate:
+    - `莫复仇` -> `Mạc Phục Cừu`
+- Simulation:
+  - Output folder: `workspace_mvp5c_smoke_20260525210758/artifacts/memory_candidate_mining/han-jue_mining_1779774745969/simulation_1779774944685`
+  - Pending candidates included: 4.
+  - Analysis mode: cached/no-API.
+  - Existing observed delta: +0.4.
+  - Predicted total delta: +1.274.
+  - No memory activation performed.
+- Final MVP5D.5 decision:
+  - PASS. The current approved memories are mostly weak positive rather than harmful, and stronger evidence-backed pending candidates were mined for human review before retrying MVP5D.
+- Next recommended phase:
+  - Human-review and approve/reject the high-confidence mined candidates, then rerun 10-chapter approved-memory validation without changing safety thresholds.

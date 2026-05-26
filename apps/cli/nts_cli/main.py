@@ -77,6 +77,11 @@ from nts_core.memory import (
     show_memory_item,
     update_memory_status,
 )
+from nts_core.memory_impact import (
+    ablate_approved_memory,
+    mine_memory_candidates,
+    simulate_memory_bundle,
+)
 from nts_core.model_test import run_mock_model_test
 from nts_core.projects import create_project, get_project_by_slug, list_projects
 from nts_core.production_translation import (
@@ -1045,6 +1050,57 @@ def learn_replay_approved_memory_validation(
     try:
         ws = discover_workspace(_workspace_arg(workspace))
         result = replay_approved_memory_validation(ws, run=run)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("ablate-approved-memory")
+def learn_ablate_approved_memory(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    validation_run: Annotated[str, typer.Option("--validation-run", help="Validation run id or path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = ablate_approved_memory(ws, project_slug=project, validation_run=validation_run)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("mine-memory-candidates")
+def learn_mine_memory_candidates(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    validation_run: Annotated[str, typer.Option("--validation-run", help="Validation run id or path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = mine_memory_candidates(ws, project_slug=project, validation_run=validation_run)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@learn_app.command("simulate-memory-bundle")
+def learn_simulate_memory_bundle(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    validation_run: Annotated[str, typer.Option("--validation-run", help="Validation run id or path.")],
+    candidate_run: Annotated[str, typer.Option("--candidate-run", help="Mining run id or path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = simulate_memory_bundle(
+            ws,
+            project_slug=project,
+            validation_run=validation_run,
+            candidate_run=candidate_run,
+        )
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)
