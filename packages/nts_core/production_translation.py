@@ -467,6 +467,8 @@ def translate_chapter_stable(
     dictionary_max_entries: int = 8,
     dictionary_max_chars: int = 500,
     memory_max_items: int = 6,
+    use_approved_rules: bool = False,
+    rule_max_hints: int = 4,
     support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = False,
 ) -> dict[str, Any]:
@@ -474,6 +476,9 @@ def translate_chapter_stable(
         from nts_core.translation import translate_chapter_mock
 
         return translate_chapter_mock(workspace, chapter_id=chapter_id, provider_key=provider_key)
+    if use_approved_rules:
+        use_hybrid_prompt = True
+        use_approved_dictionary = True
     stable_prompt = load_approved_stable_prompt(workspace, prompt_id=prompt_id)
     provider = load_production_provider(workspace, provider_key)
     chapter, _segments, source_text = _chapter_source_text(workspace, chapter_id, max_source_chars)
@@ -499,6 +504,8 @@ def translate_chapter_stable(
             mode="production",
             max_dictionary_entries=dictionary_max_entries,
             max_memory_items=memory_max_items,
+            use_approved_rules=use_approved_rules,
+            max_rule_hints=rule_max_hints,
             max_support_chars=support_max_chars,
             chapters={int(chapter["chapter_no"])} if chapter.get("chapter_no") is not None else None,
         )
@@ -621,6 +628,8 @@ def translate_chapter_stable(
                 "use_hybrid_prompt": use_hybrid_prompt,
                 "dictionary_max_entries": dictionary_max_entries,
                 "memory_max_items": memory_max_items,
+                "use_approved_rules": use_approved_rules,
+                "rule_max_hints": rule_max_hints,
                 "support_max_chars": support_max_chars,
             },
             result_data={},
@@ -822,8 +831,10 @@ def translate_chapter_stable(
         "translation_id": translation_id,
         "use_approved_dictionary": use_approved_dictionary,
         "use_hybrid_prompt": use_hybrid_prompt,
+        "use_approved_rules": use_approved_rules,
         "hybrid_prompt_block_rendered": bool((hybrid_context or {}).get("block_rendered")),
         "hybrid_selected_item_count": len((hybrid_context or {}).get("selected_items") or []),
+        "hybrid_selected_rule_count": len((hybrid_context or {}).get("selected_rule_items") or []),
         "hybrid_conflict_count": int((hybrid_context or {}).get("conflict_count") or 0),
         "dictionary_prompt_block_rendered": bool((dictionary_context or {}).get("block_rendered")),
         "dictionary_selected_hit_count": len((dictionary_context or {}).get("selected_hits") or []),
@@ -852,7 +863,9 @@ def translate_chapter_stable(
         "warnings": warnings,
         "use_approved_dictionary": use_approved_dictionary,
         "use_hybrid_prompt": use_hybrid_prompt,
+        "use_approved_rules": use_approved_rules,
         "hybrid_selected_item_count": len((hybrid_context or {}).get("selected_items") or []),
+        "hybrid_selected_rule_count": len((hybrid_context or {}).get("selected_rule_items") or []),
         "hybrid_conflict_count": int((hybrid_context or {}).get("conflict_count") or 0),
         "dictionary_selected_hit_count": len((dictionary_context or {}).get("selected_hits") or []),
     }
@@ -981,11 +994,16 @@ def translate_batch_stable(
     use_hybrid_prompt: bool = False,
     dictionary_max_entries: int = 8,
     memory_max_items: int = 6,
+    use_approved_rules: bool = False,
+    rule_max_hints: int = 4,
     support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = False,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
         raise ValueError("--use-stable-prompt is required for MVP5A batch translation.")
+    if use_approved_rules:
+        use_hybrid_prompt = True
+        use_approved_dictionary = True
     if max_chapters <= 0:
         raise ValueError("--max-chapters must be greater than 0.")
     if chunk_size_chars <= 0:
@@ -1112,6 +1130,8 @@ def translate_batch_stable(
                     use_hybrid_prompt=use_hybrid_prompt,
                     dictionary_max_entries=dictionary_max_entries,
                     memory_max_items=memory_max_items,
+                    use_approved_rules=use_approved_rules,
+                    rule_max_hints=rule_max_hints,
                     support_max_chars=support_max_chars,
                     emit_prompt_artifacts=emit_prompt_artifacts,
                 )
@@ -1225,6 +1245,8 @@ def translate_batch_stable(
         "use_hybrid_prompt": use_hybrid_prompt,
         "dictionary_max_entries": dictionary_max_entries,
         "memory_max_items": memory_max_items,
+        "use_approved_rules": use_approved_rules,
+        "rule_max_hints": rule_max_hints,
         "support_max_chars": support_max_chars,
         "started_at": started_at,
         "completed_at": completed_at,

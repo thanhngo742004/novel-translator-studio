@@ -42,6 +42,7 @@ from nts_core.learning_loop import (
     parse_chapter_selection,
 )
 from nts_core.projects import get_project_by_slug
+from nts_core.rules import load_approved_rules
 from nts_core.stable_prompts import StablePromptRecord, load_approved_stable_prompt
 from nts_storage.database import connection, insert_task_run, row_to_dict, utc_now
 from nts_storage.workspace import Workspace
@@ -1608,7 +1609,9 @@ def _hybrid_prompt_empty_context(project_slug: str, source_text: str) -> dict[st
         "selected_items": [],
         "selected_dictionary_items": [],
         "selected_memory_items": [],
+        "selected_rule_items": [],
         "dropped_items": [],
+        "dropped_rule_items": [],
         "deduped_items": [],
         "conflicts": [],
         "conflict_count": 0,
@@ -1617,7 +1620,9 @@ def _hybrid_prompt_empty_context(project_slug: str, source_text: str) -> dict[st
             "selected_item_count": 0,
             "selected_dictionary_count": 0,
             "selected_memory_count": 0,
+            "selected_rule_count": 0,
             "dropped_item_count": 0,
+            "dropped_rule_count": 0,
             "support_chars": 0,
             "support_lines": 0,
             "block_rendered": False,
@@ -1629,6 +1634,8 @@ def _hybrid_prompt_empty_context(project_slug: str, source_text: str) -> dict[st
             "dropped_items": [],
             "excluded_dictionary_matches": [],
             "excluded_memory_rows": [],
+            "excluded_rule_rows": [],
+            "pending_rejected_or_inactive_rule_matches": [],
         },
         "conflict_report": {
             "schema_version": "hybrid_prompt_conflict_report_v1",
@@ -1677,7 +1684,9 @@ def _record_dictionary_prompt_artifacts(
         else (context.get("retrieval_report") or {}).get("excluded_dictionary_matches", []),
         "support_items_selected": context.get("selected_items", []),
         "memory_items_selected": context.get("selected_memory_items", []),
+        "rule_items_selected": context.get("selected_rule_items", []),
         "support_items_dropped": context.get("dropped_items", []),
+        "rule_items_dropped": context.get("dropped_rule_items", []),
         "conflicts": context.get("conflicts", []),
         "conflict_count": int(context.get("conflict_count") or 0),
         "prompt_sha256": prompt_sha,
@@ -1971,6 +1980,8 @@ def _validation_prompts_by_sample(
     dictionary_max_entries: int = 8,
     dictionary_max_chars: int = 500,
     memory_max_items: int = 6,
+    use_approved_rules: bool = False,
+    rule_max_hints: int = 4,
     support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = False,
 ) -> dict[str, str]:
@@ -2008,6 +2019,8 @@ def _validation_prompts_by_sample(
                 mode="production",
                 max_dictionary_entries=dictionary_max_entries,
                 max_memory_items=memory_max_items,
+                use_approved_rules=use_approved_rules,
+                max_rule_hints=rule_max_hints,
                 max_support_chars=support_max_chars,
                 chapters=chapters,
             )
@@ -2173,6 +2186,8 @@ def _initial_state(
     dictionary_max_entries: int,
     dictionary_max_chars: int,
     memory_max_items: int,
+    use_approved_rules: bool,
+    rule_max_hints: int,
     support_max_chars: int,
     emit_prompt_artifacts: bool,
 ) -> dict[str, Any]:
@@ -2209,12 +2224,14 @@ def _initial_state(
         "allow_skip_unsafe_chapter_sample": allow_skip_unsafe_chapter_sample,
         "use_approved_dictionary": use_approved_dictionary,
         "use_hybrid_prompt": use_hybrid_prompt,
+        "use_approved_rules": use_approved_rules,
         "dictionary_max_entries": dictionary_max_entries,
         "dictionary_max_chars": dictionary_max_chars,
         "memory_max_items": memory_max_items,
+        "rule_max_hints": rule_max_hints,
         "support_max_chars": support_max_chars,
         "emit_prompt_artifacts": emit_prompt_artifacts,
-        "comparison_mode": "hybrid_prompt_support" if use_hybrid_prompt else "approved_dictionary_prompt_support" if use_approved_dictionary else "approved_memory",
+        "comparison_mode": "hybrid_prompt_rules_support" if use_approved_rules else "hybrid_prompt_support" if use_hybrid_prompt else "approved_dictionary_prompt_support" if use_approved_dictionary else "approved_memory",
         "current_stage": "initialized",
         "current_round": 0,
         "completed_stages": [],
@@ -3314,10 +3331,11 @@ def _write_dictionary_prompt_review_package(run_dir: Path, state: dict[str, Any]
 def _write_hybrid_prompt_review_package(run_dir: Path, state: dict[str, Any]) -> str | None:
     if not state.get("use_hybrid_prompt"):
         return None
+    review_root = "hybrid_prompt_rules" if state.get("use_approved_rules") else "hybrid_prompt"
     review_dir = (
         Path(state["workspace"])
         / "artifacts"
-        / "hybrid_prompt"
+        / review_root
         / str(state["validation_run_id"])
         / "human_review"
     )
@@ -3328,6 +3346,7 @@ def _write_hybrid_prompt_review_package(run_dir: Path, state: dict[str, Any]) ->
     conflict_payload = read_json(run_dir / "prompt_conflict_report.json") if (run_dir / "prompt_conflict_report.json").exists() else {"phases": {}}
     support_payload = read_json(run_dir / "prompt_support_items.json") if (run_dir / "prompt_support_items.json").exists() else {"phases": {}}
     dictionary_used = read_json(run_dir / "approved_dictionary_used.json") if (run_dir / "approved_dictionary_used.json").exists() else {"entry_count": 0, "entries": []}
+    rules_used = read_json(run_dir / "approved_rules_used.json") if (run_dir / "approved_rules_used.json").exists() else {"rule_count": 0, "rules": []}
     context_rows = _flatten_prompt_phase_rows(context_payload)
     budget_rows = _flatten_prompt_phase_rows(budget_payload)
     retrieval_rows = _flatten_prompt_phase_rows(retrieval_payload)
@@ -3363,6 +3382,11 @@ def _write_hybrid_prompt_review_package(run_dir: Path, state: dict[str, Any]) ->
         str(row.get("item_id")): row
         for row in selected_rows
         if row.get("source_type") == "memory" and row.get("item_id")
+    }
+    unique_rules = {
+        str(row.get("item_id")): row
+        for row in selected_rows
+        if row.get("source_type") == "rule" and row.get("item_id")
     }
     conflicts = [
         conflict
@@ -3429,6 +3453,45 @@ def _write_hybrid_prompt_review_package(run_dir: Path, state: dict[str, Any]) ->
         writer.writeheader()
         for row in dropped_rows:
             writer.writerow({field: row.get(field, "") for field in writer.fieldnames})
+    with (review_dir / "selected_rules.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "phase",
+                "sample_id",
+                "chapter_id",
+                "item_id",
+                "rule_type",
+                "source_anchor",
+                "instruction_text",
+                "confidence",
+                "conflict_group",
+            ],
+        )
+        writer.writeheader()
+        for row in selected_rows:
+            if row.get("source_type") == "rule":
+                writer.writerow({field: row.get(field, "") for field in writer.fieldnames})
+    with (review_dir / "dropped_rules.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "phase",
+                "sample_id",
+                "chapter_id",
+                "item_id",
+                "rule_type",
+                "source_anchor",
+                "instruction_text",
+                "confidence",
+                "drop_reason",
+                "conflict_group",
+            ],
+        )
+        writer.writeheader()
+        for row in dropped_rows:
+            if row.get("source_type") == "rule":
+                writer.writerow({field: row.get(field, "") for field in writer.fieldnames})
     round_lines = [
         "# Validation Rounds Summary",
         "",
@@ -3445,14 +3508,18 @@ def _write_hybrid_prompt_review_package(run_dir: Path, state: dict[str, Any]) ->
         "# Hybrid Effect Summary\n\n"
         f"- Approved dictionary entries: `{dictionary_used.get('entry_count', 0)}`\n"
         f"- Active memory count considered: `{max((row.get('active_memory_count_considered') or 0) for row in retrieval_rows) if retrieval_rows else 0}`\n"
+        f"- Approved rules considered: `{rules_used.get('rule_count', 0)}`\n"
         f"- Unique support items used: `{len(unique_items)}`\n"
         f"- Unique memory support items used: `{len(unique_memory)}`\n"
+        f"- Unique rule support items used: `{len(unique_rules)}`\n"
         f"- Selected support rows: `{len(selected_rows)}`\n"
         f"- Dropped support rows: `{len(dropped_rows)}`\n"
         f"- Conflicts detected: `{len(conflicts)}`\n"
         f"- Final decision: `{state.get('final_decision')}`\n"
         f"- Last error: `{state.get('last_error')}`\n",
     )
+    if state.get("use_approved_rules"):
+        _copy_file_if_exists(review_dir / "hybrid_effect_summary.md", review_dir / "hybrid_rules_effect_summary.md")
     budget_lines = ["# Prompt Budget Summary", ""]
     for row in budget_rows[:80]:
         budget_lines.append(
@@ -3461,6 +3528,7 @@ def _write_hybrid_prompt_review_package(run_dir: Path, state: dict[str, Any]) ->
             f"selected={row.get('selected_item_count', 0)}, "
             f"dict={row.get('selected_dictionary_count', 0)}, "
             f"memory={row.get('selected_memory_count', 0)}, "
+            f"rules={row.get('selected_rule_count', 0)}, "
             f"dropped={row.get('dropped_item_count', 0)}, "
             f"chars={row.get('support_chars', 0)}, "
             f"lines={row.get('support_lines', 0)}"
@@ -3481,21 +3549,28 @@ def _write_hybrid_prompt_review_package(run_dir: Path, state: dict[str, Any]) ->
     for row in retrieval_rows[:12]:
         retrieval_lines.append(f"## {row.get('phase')} / {row.get('sample_id')}")
         for item in row.get("selected_items", []) or []:
-            retrieval_lines.append(
-                f"- {item.get('source_type')}: {item.get('source_anchor')} => {item.get('target_value')}"
-            )
+            if item.get("source_type") == "rule":
+                retrieval_lines.append(f"- rule: {item.get('rule_type')} / {item.get('instruction_text')}")
+            else:
+                retrieval_lines.append(
+                    f"- {item.get('source_type')}: {item.get('source_anchor')} => {item.get('target_value')}"
+                )
         if not row.get("selected_items"):
             retrieval_lines.append("- No hybrid support item rendered.")
         retrieval_lines.append("")
     _write_text(review_dir / "prompt_retrieval_examples.md", "\n".join(retrieval_lines) + "\n")
     prompt_samples = (run_dir / "prompt_used.md").read_text(encoding="utf-8") if (run_dir / "prompt_used.md").exists() else "# Prompt Samples\n\nNo prompt artifacts were emitted.\n"
     _write_text(review_dir / "prompt_samples.md", prompt_samples)
-    recommendation = "proceed to production" if state.get("final_decision") == "PASS" else "review harmful memory/dictionary entries"
+    recommendation = "proceed to controlled production" if state.get("final_decision") == "PASS" else "review harmful memory/dictionary/rule entries"
+    title = "Hybrid Prompt Rules Human Review Summary" if state.get("use_approved_rules") else "Hybrid Prompt Human Review Summary"
     human_lines = [
-        "# Hybrid Prompt Human Review Summary",
+        f"# {title}",
         "",
         f"- Approved dictionary count: `{dictionary_used.get('entry_count', 0)}`",
         f"- Active memory count considered: `{max((row.get('active_memory_count_considered') or 0) for row in retrieval_rows) if retrieval_rows else 0}`",
+        f"- Approved rule count: `{rules_used.get('rule_count', 0)}`",
+        f"- Rules selected: `{sum(1 for row in selected_rows if row.get('source_type') == 'rule')}`",
+        f"- Rules dropped: `{sum(1 for row in dropped_rows if row.get('source_type') == 'rule')}`",
         f"- Support items selected: `{len(selected_rows)}`",
         f"- Support items dropped: `{len(dropped_rows)}`",
         f"- Conflicts detected: `{len(conflicts)}`",
@@ -3512,7 +3587,7 @@ def _write_hybrid_prompt_review_package(run_dir: Path, state: dict[str, Any]) ->
             f"- Chapter regressions over 3: `{len(regressions)}`",
             f"- Recommendation: `{recommendation}`",
             "",
-            "Pending, rejected, deprecated, harmful, and insufficient-evidence memory/dictionary entries are excluded from the rendered support block.",
+            "Pending, rejected, deprecated, harmful, and insufficient-evidence memory/dictionary/rule entries are excluded from the rendered support block.",
             "Raw NLP cache is not injected into prompts.",
         ]
     )
@@ -3691,6 +3766,7 @@ def _validation_result(run_dir: Path, state: dict[str, Any], task_run_id: str | 
         "comparison_mode": state.get("comparison_mode"),
         "use_approved_dictionary": bool(state.get("use_approved_dictionary")),
         "use_hybrid_prompt": bool(state.get("use_hybrid_prompt")),
+        "use_approved_rules": bool(state.get("use_approved_rules")),
         "dictionary_prompt_review_path": state.get("dictionary_prompt_review_path"),
         "hybrid_prompt_review_path": state.get("hybrid_prompt_review_path"),
         "last_error": state.get("last_error"),
@@ -3755,7 +3831,9 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
     rounds = state.get("round_results", [])
     comparison_mode = state.get("comparison_mode", "approved_memory")
     comparison_label = (
-        "Hybrid"
+        "Hybrid Rules"
+        if comparison_mode == "hybrid_prompt_rules_support"
+        else "Hybrid"
         if comparison_mode == "hybrid_prompt_support"
         else "Dictionary"
         if comparison_mode == "approved_dictionary_prompt_support"
@@ -3763,7 +3841,7 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
     )
     review_path = (
         _write_hybrid_prompt_review_package(run_dir, state)
-        if comparison_mode == "hybrid_prompt_support"
+        if comparison_mode in {"hybrid_prompt_support", "hybrid_prompt_rules_support"}
         else _write_dictionary_prompt_review_package(run_dir, state)
     )
     final_summary = {
@@ -3780,8 +3858,9 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
         "comparison_mode": comparison_mode,
         "use_approved_dictionary": bool(state.get("use_approved_dictionary")),
         "use_hybrid_prompt": bool(state.get("use_hybrid_prompt")),
+        "use_approved_rules": bool(state.get("use_approved_rules")),
         "dictionary_prompt_review_path": review_path,
-        "hybrid_prompt_review_path": review_path if comparison_mode == "hybrid_prompt_support" else None,
+        "hybrid_prompt_review_path": review_path if comparison_mode in {"hybrid_prompt_support", "hybrid_prompt_rules_support"} else None,
         "round_results": rounds,
         "final_decision": state.get("final_decision"),
         "reason": reason,
@@ -3809,8 +3888,9 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
             f"| {row['round']} | {row['baseline_score']} | {row['memory_score']} | {row['score_delta']} |"
         )
     _write_text(run_dir / "final_validation_summary.md", "\n".join(lines) + "\n")
+    effect_report_name = "hybrid_rules_effect_report.md" if comparison_label == "Hybrid Rules" else "hybrid_effect_report.md" if comparison_label == "Hybrid" else "dictionary_effect_report.md" if comparison_label == "Dictionary" else "memory_effect_report.md"
     _write_text(
-        run_dir / ("hybrid_effect_report.md" if comparison_label == "Hybrid" else "dictionary_effect_report.md" if comparison_label == "Dictionary" else "memory_effect_report.md"),
+        run_dir / effect_report_name,
         f"# {comparison_label} Effect Report\n\n"
         + "\n".join(
             f"- Round {row['round']}: delta={row['score_delta']}, terminology_delta={row.get('terminology_error_delta')}"
@@ -3818,10 +3898,10 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
         )
         + "\n",
     )
-    if comparison_label in {"Dictionary", "Hybrid"}:
+    if comparison_label in {"Dictionary", "Hybrid", "Hybrid Rules"}:
         _write_text(
             run_dir / "memory_effect_report.md",
-            f"# Memory Effect Report\n\n{comparison_label} prompt support mode used; see {comparison_label.lower()}_effect_report.md.\n",
+            f"# Memory Effect Report\n\n{comparison_label} prompt support mode used; see {effect_report_name}.\n",
         )
     regressions = [
         regression
@@ -3893,6 +3973,8 @@ def start_approved_memory_validation(
     dictionary_max_entries: int = 8,
     dictionary_max_chars: int = 500,
     memory_max_items: int = 6,
+    use_approved_rules: bool = False,
+    rule_max_hints: int = 4,
     support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = False,
 ) -> dict[str, Any]:
@@ -3905,6 +3987,9 @@ def start_approved_memory_validation(
         raise ValueError("MVP5D refuses to process more than 10 chapters.")
     if rounds < 2:
         raise ValueError("MVP5D requires at least two validation rounds.")
+    if use_approved_rules:
+        use_hybrid_prompt = True
+        use_approved_dictionary = True
     project = get_project_by_slug(workspace, project_slug)
     stable_prompt = load_approved_stable_prompt(workspace)
     approved_memory = _approved_learning_memory(workspace, project)
@@ -3912,6 +3997,7 @@ def start_approved_memory_validation(
     if use_hybrid_prompt:
         approved_memory = list(all_active_memory)
     approved_dictionary_entries = load_project_dictionary(workspace, project_slug) if (use_approved_dictionary or use_hybrid_prompt) else []
+    approved_rule_entries = load_approved_rules(workspace, project_slug) if use_approved_rules else []
     mined_approved_memory = [item for item in approved_memory if _is_mined_approved_memory(item)]
     if use_approved_dictionary or use_hybrid_prompt:
         baseline_excluded_memory = []
@@ -3950,9 +4036,11 @@ def start_approved_memory_validation(
         allow_skip_unsafe_chapter_sample=allow_skip_unsafe_chapter_sample,
         use_approved_dictionary=use_approved_dictionary,
         use_hybrid_prompt=use_hybrid_prompt,
+        use_approved_rules=use_approved_rules,
         dictionary_max_entries=dictionary_max_entries,
         dictionary_max_chars=dictionary_max_chars,
         memory_max_items=memory_max_items,
+        rule_max_hints=rule_max_hints,
         support_max_chars=support_max_chars,
         emit_prompt_artifacts=emit_prompt_artifacts,
     )
@@ -3979,7 +4067,21 @@ def start_approved_memory_validation(
                 "max_dictionary_chars": dictionary_max_chars,
                 "use_hybrid_prompt": use_hybrid_prompt,
                 "memory_max_items": memory_max_items,
+                "use_approved_rules": use_approved_rules,
+                "rule_max_hints": rule_max_hints,
                 "support_max_chars": support_max_chars,
+                "created_at": utc_now(),
+            },
+        )
+    if use_approved_rules:
+        write_json(
+            run_dir / "approved_rules_used.json",
+            {
+                "schema_version": "approved_rules_used_v1",
+                "project_slug": project_slug,
+                "rule_count": len(approved_rule_entries),
+                "rules": approved_rule_entries,
+                "max_rule_hints": rule_max_hints,
                 "created_at": utc_now(),
             },
         )
@@ -4018,6 +4120,9 @@ def start_approved_memory_validation(
     )
     if (use_approved_dictionary or use_hybrid_prompt) and not approved_dictionary_entries:
         _block(run_dir, state, "approved_project_dictionary_missing", can_resume=False)
+        return _finalize_result(workspace, run_dir, state)
+    if use_approved_rules and not approved_rule_entries:
+        _block(run_dir, state, "approved_rules_missing", can_resume=False)
         return _finalize_result(workspace, run_dir, state)
     if not use_approved_dictionary and not approved_memory:
         _block(run_dir, state, "approved_learning_memory_missing", can_resume=False)
@@ -4181,6 +4286,8 @@ def resume_approved_memory_validation(
                     dictionary_max_entries=int(state.get("dictionary_max_entries") or 8),
                     dictionary_max_chars=int(state.get("dictionary_max_chars") or 500),
                     memory_max_items=int(state.get("memory_max_items") or 6),
+                    use_approved_rules=bool(state.get("use_approved_rules")),
+                    rule_max_hints=int(state.get("rule_max_hints") or 4),
                     support_max_chars=int(state.get("support_max_chars") or 1200),
                     emit_prompt_artifacts=bool(state.get("emit_prompt_artifacts")),
                 )
@@ -4237,6 +4344,8 @@ def resume_approved_memory_validation(
                     dictionary_max_entries=int(state.get("dictionary_max_entries") or 8),
                     dictionary_max_chars=int(state.get("dictionary_max_chars") or 500),
                     memory_max_items=int(state.get("memory_max_items") or 6),
+                    use_approved_rules=bool(state.get("use_approved_rules")),
+                    rule_max_hints=int(state.get("rule_max_hints") or 4),
                     support_max_chars=int(state.get("support_max_chars") or 1200),
                     emit_prompt_artifacts=bool(state.get("emit_prompt_artifacts")),
                 )

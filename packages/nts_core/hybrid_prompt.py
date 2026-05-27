@@ -8,6 +8,7 @@ from typing import Any
 
 from nts_core.dictionary import TYPE_PRIORITY, load_project_dictionary
 from nts_core.projects import get_project_by_slug
+from nts_core.rules import load_approved_rules
 from nts_storage.database import connection, row_to_dict, utc_now
 from nts_storage.workspace import Workspace
 
@@ -30,6 +31,15 @@ BLOCKED_MEMORY_MARKERS = {
     "insufficient_evidence",
     "pending_review",
 }
+RULE_TYPE_PRIORITY = {
+    "dictionary_priority_guard": 0,
+    "format_preservation": 1,
+    "forbidden_variant": 2,
+    "expansion_guard": 3,
+    "entity_atomicity_guard": 4,
+    "context_lexical_preference": 5,
+    "style_rhythm_preservation": 6,
+}
 
 
 @dataclass
@@ -41,6 +51,11 @@ class SupportItem:
     instruction_text: str
     entry_type: str | None = None
     memory_type: str | None = None
+    rule_id: str | None = None
+    rule_type: str | None = None
+    trigger_pattern: dict[str, Any] = field(default_factory=dict)
+    forbidden_variants: list[str] = field(default_factory=list)
+    priority: int | None = None
     authority_rank: int = 50
     specificity_rank: int = 0
     confidence: float = 0.0
@@ -185,6 +200,27 @@ def _chapter_scope_gate(item: dict[str, Any], chapters: set[int] | None) -> tupl
     return True, None
 
 
+def _rule_chapter_scope_gate(scope: dict[str, Any], chapters: set[int] | None) -> tuple[bool, str | None]:
+    if not chapters:
+        return True, None
+    scoped_chapters = {
+        int(chapter)
+        for chapter in (scope.get("chapters") or [])
+        if str(chapter).strip().lstrip("-").isdigit()
+    }
+    if scoped_chapters and not (scoped_chapters & chapters):
+        return False, "scope_gate:chapter_not_in_rule_scope"
+    excluded = {
+        int(chapter)
+        for chapter in (scope.get("exclude_chapters") or [])
+        if str(chapter).strip().lstrip("-").isdigit()
+    }
+    overlap = excluded & chapters
+    if overlap:
+        return False, "scope_gate:rule_excluded_chapter=" + ",".join(str(chapter) for chapter in sorted(overlap))
+    return True, None
+
+
 def _load_active_memory_rows(workspace: Workspace, project: dict[str, Any]) -> list[dict[str, Any]]:
     with connection(workspace.db_path) as conn:
         rows = conn.execute(
@@ -207,6 +243,47 @@ def _load_active_memory_rows(workspace: Workspace, project: dict[str, Any]) -> l
         if _scope_matches(item.get("scope_json") or {}, context):
             scoped.append(item)
     return scoped
+
+
+def _load_ineligible_rule_rows(workspace: Workspace, project_slug: str, source_text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with connection(workspace.db_path) as conn:
+        candidates = conn.execute(
+            """
+            SELECT id, rule_type, trigger_pattern_json, instruction, status, review_status,
+                   confidence_score
+            FROM rule_candidates
+            WHERE project_slug = ? AND status NOT IN ('approved_by_human')
+            ORDER BY created_at ASC, id ASC
+            """,
+            (project_slug,),
+        ).fetchall()
+        inactive_approved = conn.execute(
+            """
+            SELECT id, rule_type, trigger_pattern_json, instruction, status, confidence_score
+            FROM approved_rules
+            WHERE project_slug = ? AND status != 'active'
+            ORDER BY created_at ASC, id ASC
+            """,
+            (project_slug,),
+        ).fetchall()
+    for row in candidates:
+        item = row_to_dict(row, json_fields=("trigger_pattern_json",))
+        trigger = item.get("trigger_pattern_json") or {}
+        text = str(trigger.get("text") or "")
+        if text and _source_present(source_text, text):
+            item["record_kind"] = "rule_candidate"
+            item["reasons"] = [f"status_gate:{item.get('status')}"]
+            rows.append(item)
+    for row in inactive_approved:
+        item = row_to_dict(row, json_fields=("trigger_pattern_json",))
+        trigger = item.get("trigger_pattern_json") or {}
+        text = str(trigger.get("text") or "")
+        if text and _source_present(source_text, text):
+            item["record_kind"] = "approved_rule"
+            item["reasons"] = [f"status_gate:{item.get('status')}"]
+            rows.append(item)
+    return rows[:100]
 
 
 def _load_inactive_memory_matches(workspace: Workspace, project: dict[str, Any], source_text: str) -> list[dict[str, Any]]:
@@ -410,6 +487,165 @@ def _memory_items(
     return items, excluded[:100], len(rows)
 
 
+def _safe_rule_trigger_match(rule: dict[str, Any], source_text: str) -> tuple[bool, list[str]]:
+    trigger = rule.get("trigger_pattern_json") or {}
+    applies = rule.get("applies_when_json") or {}
+    kind = str(trigger.get("kind") or "")
+    text = str(trigger.get("text") or "")
+    reasons: list[str] = []
+    matched = False
+    if kind in {"exact_text", "exact_ngram", "dictionary_hit"}:
+        matched = bool(text and _source_present(source_text, text))
+        reasons.append("exact_trigger_match" if matched else "exact_trigger_absent")
+    elif kind == "segment_type":
+        if text == "system_panel":
+            matched = bool(re.search(r"【[^】]+】", source_text or ""))
+            reasons.append("system_panel_bracket_match" if matched else "system_panel_absent")
+        else:
+            reasons.append(f"unsupported_segment_type:{text}")
+    elif kind == "anchored_regex":
+        try:
+            matched = bool(text and re.search(text, source_text or ""))
+            reasons.append("regex_match" if matched else "regex_absent")
+        except re.error:
+            matched = False
+            reasons.append("unsafe_regex_rejected")
+    else:
+        reasons.append(f"unsupported_trigger_kind:{kind or 'missing'}")
+    if matched and applies.get("source_has_brackets") and not re.search(r"【[^】]+】", source_text or ""):
+        matched = False
+        reasons.append("applies_when_source_has_brackets_failed")
+    context_required = str(applies.get("context_required") or "")
+    if matched and context_required in {"system_panel", "system_panel_or_game_ui", "game_ui"} and not re.search(r"【[^】]+】", source_text or ""):
+        matched = False
+        reasons.append(f"context_required_failed:{context_required}")
+    return matched, reasons
+
+
+def _rule_is_covered_by_dictionary(rule: dict[str, Any], dictionary_items: list[SupportItem]) -> bool:
+    if rule.get("rule_type") != "dictionary_priority_guard":
+        return False
+    trigger = rule.get("trigger_pattern_json") or {}
+    text = str(trigger.get("text") or "")
+    return bool(text and any(item.source_anchor == text for item in dictionary_items))
+
+
+def _longer_dictionary_hit_present(rule: dict[str, Any], dictionary_items: list[SupportItem]) -> bool:
+    if rule.get("rule_type") != "expansion_guard":
+        return False
+    trigger = rule.get("trigger_pattern_json") or {}
+    text = str(trigger.get("text") or "")
+    return bool(text and any(item.source_anchor != text and text in item.source_anchor for item in dictionary_items))
+
+
+def _rule_has_positive_canon(rule: dict[str, Any], dictionary_items: list[SupportItem], memory_items: list[SupportItem]) -> bool:
+    trigger = rule.get("trigger_pattern_json") or {}
+    text = str(trigger.get("text") or "")
+    if not text:
+        return False
+    return any(item.source_anchor == text and item.target_value for item in [*dictionary_items, *memory_items])
+
+
+def _rule_needs_panel_context(rule: dict[str, Any]) -> bool:
+    if rule.get("rule_type") != "expansion_guard":
+        return False
+    forbidden = " ".join(str(item) for item in (rule.get("forbidden_variants_json") or []))
+    instruction = str(rule.get("instruction") or "")
+    return "【" in forbidden or "】" in forbidden or "【" in instruction or "】" in instruction
+
+
+def _rule_items(
+    workspace: Workspace,
+    project: dict[str, Any],
+    source_text: str,
+    *,
+    mode: str,
+    chapters: set[int] | None,
+    dictionary_items: list[SupportItem],
+    memory_items: list[SupportItem],
+) -> tuple[list[SupportItem], list[dict[str, Any]], int]:
+    context = _project_scope_context(project)
+    rules = load_approved_rules(workspace, project["slug"])
+    items: list[SupportItem] = []
+    excluded: list[dict[str, Any]] = []
+    for rule in rules:
+        reasons: list[str] = []
+        if rule.get("status") != "active":
+            reasons.append(f"status_gate:{rule.get('status')}")
+        if not rule.get("approved_by"):
+            reasons.append("status_gate:missing_approved_by")
+        scope = rule.get("scope_json") or {}
+        if not _scope_matches(scope, context):
+            reasons.append("scope_gate:project_scope_mismatch")
+        ok, reason = _rule_chapter_scope_gate(scope, chapters)
+        if not ok:
+            reasons.append(reason or "scope_gate:chapter")
+        matched, match_reasons = _safe_rule_trigger_match(rule, source_text)
+        if not matched:
+            reasons.extend(match_reasons)
+        if _longer_dictionary_hit_present(rule, dictionary_items):
+            reasons.append("longer_exact_dictionary_hit_present")
+        if rule.get("rule_type") == "forbidden_variant" and not _rule_has_positive_canon(rule, dictionary_items, memory_items):
+            reasons.append("forbidden_variant_without_positive_canon")
+        if _rule_needs_panel_context(rule) and not re.search(r"【[^】]+】", source_text or ""):
+            reasons.append("panel_expansion_guard_requires_bracket_context")
+        if reasons:
+            excluded.append(
+                {
+                    "rule_id": rule.get("id"),
+                    "rule_type": rule.get("rule_type"),
+                    "trigger_pattern": rule.get("trigger_pattern_json") or {},
+                    "instruction": rule.get("instruction"),
+                    "status": rule.get("status"),
+                    "reasons": reasons,
+                }
+            )
+            continue
+        trigger = rule.get("trigger_pattern_json") or {}
+        source_anchor = str(trigger.get("text") or trigger.get("kind") or "")
+        instruction = str(rule.get("instruction") or "").strip()
+        if not instruction:
+            excluded.append(
+                {
+                    "rule_id": rule.get("id"),
+                    "rule_type": rule.get("rule_type"),
+                    "trigger_pattern": trigger,
+                    "status": rule.get("status"),
+                    "reasons": ["missing_instruction"],
+                }
+            )
+            continue
+        rule_type = str(rule.get("rule_type") or "")
+        authority = 78 if rule_type in {"dictionary_priority_guard", "format_preservation"} else 74
+        if _rule_is_covered_by_dictionary(rule, dictionary_items):
+            authority = 64
+        items.append(
+            SupportItem(
+                item_id=str(rule.get("id")),
+                source_type="rule",
+                source_anchor=source_anchor,
+                target_value="",
+                instruction_text=instruction,
+                rule_id=str(rule.get("id")),
+                rule_type=rule_type,
+                trigger_pattern=trigger,
+                forbidden_variants=[str(item) for item in (rule.get("forbidden_variants_json") or [])],
+                priority=RULE_TYPE_PRIORITY.get(rule_type, 99),
+                authority_rank=authority,
+                specificity_rank=len(source_anchor),
+                confidence=float(rule.get("confidence_score") or 0),
+                scope=scope,
+                provenance=_compact_provenance(rule.get("provenance_json") or {}),
+                status=str(rule.get("status") or "active"),
+                mode_allowed=mode,
+                source_ref=f"approved_rules:{rule.get('id')}",
+                char_cost=len(instruction),
+                render_group="rule",
+            )
+        )
+    return items, excluded[:100], len(rules)
+
+
 def _dictionary_occurs_independently(source_text: str, shorter: str, longer_items: list[SupportItem]) -> bool:
     positions: list[tuple[int, int]] = []
     for item in longer_items:
@@ -428,11 +664,12 @@ def _dictionary_occurs_independently(source_text: str, shorter: str, longer_item
 
 
 def _rank_key(item: SupportItem) -> tuple[Any, ...]:
-    type_priority = (
-        TYPE_PRIORITY.get(str(item.entry_type), 99)
-        if item.source_type == "dictionary"
-        else MEMORY_TYPE_PRIORITY.get(str(item.memory_type), 99)
-    )
+    if item.source_type == "dictionary":
+        type_priority = TYPE_PRIORITY.get(str(item.entry_type), 99)
+    elif item.source_type == "rule":
+        type_priority = RULE_TYPE_PRIORITY.get(str(item.rule_type), 99)
+    else:
+        type_priority = MEMORY_TYPE_PRIORITY.get(str(item.memory_type), 99)
     return (
         -item.authority_rank,
         -int(item.exact_source_match),
@@ -489,8 +726,27 @@ def _dedupe_and_resolve_conflicts(
         groups.setdefault(key, []).append(item)
 
     for source_key, group in groups.items():
+        dictionary_for_anchor = [item for item in group if item.source_type == "dictionary"]
+        if dictionary_for_anchor:
+            for rule in [item for item in group if item.source_type == "rule" and item.rule_type == "dictionary_priority_guard"]:
+                conflicts.append(
+                    {
+                        "conflict_type": "dictionary_rule_duplicate",
+                        "source_anchor": rule.source_anchor,
+                        "dictionary_item_ids": [item.item_id for item in dictionary_for_anchor],
+                        "rule_item_id": rule.item_id,
+                        "policy": "dictionary_canon_kept_rule_budgeted_if_behavioral",
+                    }
+                )
         target_groups: dict[str, list[SupportItem]] = {}
         for item in group:
+            if item.source_type == "rule":
+                if item.rule_type == "dictionary_priority_guard" and dictionary_for_anchor:
+                    item.drop_reason = "covered_by_dictionary"
+                    dropped.append(item)
+                    continue
+                selected.append(item)
+                continue
             target_groups.setdefault(_normalize_text(item.target_value), []).append(item)
         if len(target_groups) > 1:
             conflict_group = f"conflict_{hashlib.sha1(source_key.encode('utf-8')).hexdigest()[:10]}"
@@ -564,16 +820,18 @@ def _dedupe_and_resolve_conflicts(
 def _render_block(items: list[SupportItem]) -> str:
     dictionary_lines = [f"- {item.source_anchor} => {item.target_value}" for item in items if item.render_group == "dictionary"]
     memory_lines = [f"- {item.source_anchor} => {item.target_value}" for item in items if item.render_group == "memory"]
-    if not dictionary_lines and not memory_lines:
+    rule_lines = [f"- {item.instruction_text}" for item in items if item.render_group == "rule"]
+    if not dictionary_lines and not memory_lines and not rule_lines:
         return ""
     lines = ["Project support for this source:"]
     if dictionary_lines:
         lines.extend(["Dictionary:", *dictionary_lines])
     if memory_lines:
         lines.extend(["Memory:", *memory_lines])
+    if rule_lines:
+        lines.extend(["Rules:", *rule_lines])
     lines.extend(
         [
-            "Rules:",
             "- Use entries only when the exact Chinese source appears in this chunk.",
             "- Do not apply unrelated entries.",
         ]
@@ -586,6 +844,7 @@ def _budget_prune(
     *,
     max_dictionary_entries: int,
     max_memory_items: int,
+    max_rule_hints: int,
     max_support_chars: int,
     max_support_lines: int,
 ) -> tuple[list[SupportItem], list[SupportItem], dict[str, Any], str]:
@@ -593,6 +852,7 @@ def _budget_prune(
     dropped: list[SupportItem] = []
     dictionary_count = 0
     memory_count = 0
+    rule_count = 0
     for item in items:
         if item.source_type == "dictionary":
             if dictionary_count >= max_dictionary_entries:
@@ -606,6 +866,17 @@ def _budget_prune(
                 dropped.append(item)
                 continue
             memory_count += 1
+        elif item.source_type == "rule":
+            if rule_count >= max_rule_hints:
+                item.drop_reason = (
+                    "covered_by_dictionary"
+                    if item.rule_type == "dictionary_priority_guard"
+                    and any(selected_item.source_type == "dictionary" and selected_item.source_anchor == item.source_anchor for selected_item in selected)
+                    else "max_rule_hints"
+                )
+                dropped.append(item)
+                continue
+            rule_count += 1
         selected.append(item)
 
     def over_budget(current: list[SupportItem]) -> tuple[bool, str, str]:
@@ -624,7 +895,10 @@ def _budget_prune(
         prune_order = sorted(
             selected,
             key=lambda item: (
-                0 if item.source_type == "memory" else 1,
+                0 if item.source_type == "memory" and item.memory_type not in {"name"} else
+                1 if item.source_type == "rule" else
+                2 if item.source_type == "memory" else
+                3,
                 item.confidence,
                 item.authority_rank,
                 item.specificity_rank,
@@ -639,12 +913,15 @@ def _budget_prune(
         "schema_version": "hybrid_prompt_budget_report_v1",
         "max_dictionary_entries": max_dictionary_entries,
         "max_memory_items": max_memory_items,
+        "max_rule_hints": max_rule_hints,
         "max_support_chars": max_support_chars,
         "max_support_lines": max_support_lines,
         "selected_item_count": len(selected),
         "selected_dictionary_count": sum(1 for item in selected if item.source_type == "dictionary"),
         "selected_memory_count": sum(1 for item in selected if item.source_type == "memory"),
+        "selected_rule_count": sum(1 for item in selected if item.source_type == "rule"),
         "dropped_item_count": len(dropped),
+        "dropped_rule_count": sum(1 for item in dropped if item.source_type == "rule"),
         "support_chars": len(block_text),
         "support_lines": len(block_text.splitlines()) if block_text else 0,
         "block_rendered": bool(block_text),
@@ -653,6 +930,7 @@ def _budget_prune(
         "config": {
             "max_dictionary_entries": max_dictionary_entries,
             "max_memory_items": max_memory_items,
+            "max_rule_hints": max_rule_hints,
             "max_support_chars": max_support_chars,
             "max_support_lines": max_support_lines,
         },
@@ -668,13 +946,15 @@ def build_hybrid_prompt_support(
     mode: str = "production",
     max_dictionary_entries: int = 8,
     max_memory_items: int = 6,
+    use_approved_rules: bool = False,
+    max_rule_hints: int = 4,
     max_support_chars: int = 1200,
     max_support_lines: int = 18,
     chapters: set[int] | None = None,
 ) -> dict[str, Any]:
     if mode not in {"production", "learning"}:
         raise ValueError("mode must be production or learning.")
-    if max_dictionary_entries < 0 or max_memory_items < 0:
+    if max_dictionary_entries < 0 or max_memory_items < 0 or max_rule_hints < 0:
         raise ValueError("max entry counts cannot be negative.")
     if max_support_chars <= 0 or max_support_lines <= 0:
         raise ValueError("support budgets must be positive.")
@@ -688,9 +968,24 @@ def build_hybrid_prompt_support(
         mode=mode,
         chapters=chapters,
     )
+    rule_items: list[SupportItem] = []
+    excluded_rules: list[dict[str, Any]] = []
+    approved_rule_count = 0
+    ineligible_rule_matches: list[dict[str, Any]] = []
+    if use_approved_rules:
+        rule_items, excluded_rules, approved_rule_count = _rule_items(
+            workspace,
+            project,
+            source_text,
+            mode=mode,
+            chapters=chapters,
+            dictionary_items=dictionary_items,
+            memory_items=memory_items,
+        )
+        ineligible_rule_matches = _load_ineligible_rule_rows(workspace, project_slug, source_text)
     inactive_dictionary = _inactive_dictionary_matches(workspace, project_slug, source_text)
     inactive_memory = _load_inactive_memory_matches(workspace, project, source_text)
-    candidates = dictionary_items + memory_items
+    candidates = dictionary_items + memory_items + rule_items
     deduped, dedupe_dropped, conflict_report = _dedupe_and_resolve_conflicts(
         items=candidates,
         source_text=source_text,
@@ -700,10 +995,14 @@ def build_hybrid_prompt_support(
         deduped,
         max_dictionary_entries=max_dictionary_entries,
         max_memory_items=max_memory_items,
+        max_rule_hints=max_rule_hints,
         max_support_chars=max_support_chars,
         max_support_lines=max_support_lines,
     )
     dropped = dedupe_dropped + budget_dropped
+    budget_report["dropped_item_count"] = len(dropped)
+    budget_report["dropped_rule_count"] = sum(1 for item in dropped if item.source_type == "rule")
+    budget_report["dropped_items"] = [item.to_dict() for item in dropped]
     retrieval_report = {
         "schema_version": "hybrid_prompt_retrieval_report_v1",
         "project_slug": project_slug,
@@ -718,13 +1017,26 @@ def build_hybrid_prompt_support(
             "negative_evidence",
             "scope",
         ],
+        "rule_applicability_gates": [
+            "status",
+            "approved_by",
+            "project_scope",
+            "chapter_scope",
+            "trigger",
+            "applies_when",
+        ],
+        "rules_enabled": use_approved_rules,
         "active_dictionary_candidate_count": len(dictionary_items),
         "active_memory_count_considered": active_memory_count,
+        "approved_rule_count_considered": approved_rule_count,
         "eligible_memory_count": len(memory_items),
+        "eligible_rule_count": len(rule_items),
         "selected_items": [item.to_dict() for item in selected],
         "dropped_items": [item.to_dict() for item in dropped],
         "excluded_dictionary_matches": inactive_dictionary,
         "excluded_memory_rows": excluded_memory,
+        "excluded_rule_rows": excluded_rules,
+        "pending_rejected_or_inactive_rule_matches": ineligible_rule_matches,
         "inactive_or_negative_memory_matches": inactive_memory,
     }
     support_items = {
@@ -746,7 +1058,9 @@ def build_hybrid_prompt_support(
         "selected_items": [item.to_dict() for item in selected],
         "selected_dictionary_items": [item.to_dict() for item in selected if item.source_type == "dictionary"],
         "selected_memory_items": [item.to_dict() for item in selected if item.source_type == "memory"],
+        "selected_rule_items": [item.to_dict() for item in selected if item.source_type == "rule"],
         "dropped_items": [item.to_dict() for item in dropped],
+        "dropped_rule_items": [item.to_dict() for item in dropped if item.source_type == "rule"],
         "deduped_items": [item.to_dict() for item in deduped],
         "conflicts": conflict_report.get("conflicts", []),
         "conflict_count": conflict_report.get("conflict_count", 0),
@@ -755,6 +1069,7 @@ def build_hybrid_prompt_support(
         "conflict_report": conflict_report,
         "support_items": support_items,
         "active_memory_count_considered": active_memory_count,
+        "approved_rule_count_considered": approved_rule_count,
         "active_dictionary_hit_count": len(dictionary_items),
     }
 
@@ -767,6 +1082,8 @@ def inspect_hybrid_prompt(
     mode: str = "production",
     max_dictionary_entries: int = 8,
     max_memory_items: int = 6,
+    use_approved_rules: bool = False,
+    max_rule_hints: int = 4,
     max_support_chars: int = 1200,
 ) -> dict[str, Any]:
     bundle = build_hybrid_prompt_support(
@@ -776,6 +1093,8 @@ def inspect_hybrid_prompt(
         mode=mode,
         max_dictionary_entries=max_dictionary_entries,
         max_memory_items=max_memory_items,
+        use_approved_rules=use_approved_rules,
+        max_rule_hints=max_rule_hints,
         max_support_chars=max_support_chars,
     )
     return {
@@ -786,6 +1105,8 @@ def inspect_hybrid_prompt(
         "selected_item_count": len(bundle["selected_items"]),
         "selected_dictionary_count": len(bundle["selected_dictionary_items"]),
         "selected_memory_count": len(bundle["selected_memory_items"]),
+        "selected_rule_count": len(bundle["selected_rule_items"]),
+        "approved_rule_count_considered": bundle["approved_rule_count_considered"],
         "conflict_count": bundle["conflict_count"],
         "dropped_item_count": len(bundle["dropped_items"]),
         "budget_report": bundle["budget_report"],

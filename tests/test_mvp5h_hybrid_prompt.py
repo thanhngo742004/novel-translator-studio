@@ -113,6 +113,53 @@ def _insert_dictionary_entry(
         conn.commit()
 
 
+def _insert_approved_rule(
+    workspace,
+    project: dict,
+    *,
+    rule_id: str,
+    rule_type: str,
+    trigger: dict,
+    instruction: str,
+    applies_when: dict | None = None,
+    status: str = "active",
+    approved_by: str | None = "human",
+    confidence: float = 0.9,
+) -> None:
+    now = utc_now()
+    with connection(workspace.db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO approved_rules (
+                id, project_id, project_slug, rule_type, trigger_pattern_json,
+                applies_when_json, instruction, examples_json, forbidden_variants_json,
+                scope_json, confidence_score, provenance_json, status,
+                approved_by, approved_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                rule_id,
+                project["id"],
+                project["slug"],
+                rule_type,
+                json_dumps(trigger),
+                json_dumps(applies_when or {"exact_source_required": True}),
+                instruction,
+                json_dumps([]),
+                json_dumps([]),
+                json_dumps({"project_slug": project["slug"]}),
+                confidence,
+                json_dumps({"source_run_id": "pytest_rules"}),
+                status,
+                approved_by,
+                now if approved_by else None,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+
 def test_hybrid_support_dedupes_conflicts_and_filters_ineligible_memory(tmp_path: Path) -> None:
     workspace, project = _workspace_with_project(tmp_path)
     _insert_dictionary_entry(
@@ -239,6 +286,212 @@ def test_prompt_inspect_cli_builds_hybrid_bundle(tmp_path: Path) -> None:
     assert "sentences" not in data["block_text"]
 
 
+def test_hybrid_prompt_includes_approved_rules_only_when_enabled_and_triggered(tmp_path: Path) -> None:
+    workspace, project = _workspace_with_project(tmp_path)
+    _insert_dictionary_entry(
+        workspace,
+        project,
+        entry_id="dict_linggen",
+        source="灵根",
+        target="linh căn",
+        entry_type="realm",
+    )
+    _insert_approved_rule(
+        workspace,
+        project,
+        rule_id="rule_expand",
+        rule_type="expansion_guard",
+        trigger={"kind": "exact_ngram", "text": "灵根"},
+        instruction="Do not expand 灵根 into 灵根资质 unless the exact longer source appears.",
+        confidence=0.91,
+    )
+    _insert_approved_rule(
+        workspace,
+        project,
+        rule_id="rule_panel",
+        rule_type="format_preservation",
+        trigger={"kind": "segment_type", "text": "system_panel"},
+        applies_when={"source_has_brackets": True},
+        instruction="Preserve bracketed system panels 【...】 when they appear.",
+        confidence=0.93,
+    )
+    _insert_approved_rule(
+        workspace,
+        project,
+        rule_id="rule_pending",
+        rule_type="forbidden_variant",
+        trigger={"kind": "exact_text", "text": "灵根"},
+        instruction="Pending rule must not render.",
+        status="inactive",
+        approved_by=None,
+    )
+
+    disabled = build_hybrid_prompt_support(workspace, "han-jue", "韩绝查看灵根。")
+    enabled = build_hybrid_prompt_support(
+        workspace,
+        "han-jue",
+        "韩绝查看灵根。",
+        use_approved_rules=True,
+        max_rule_hints=4,
+    )
+    panel = build_hybrid_prompt_support(
+        workspace,
+        "han-jue",
+        "【灵根：无】",
+        use_approved_rules=True,
+        max_rule_hints=4,
+    )
+
+    assert disabled["selected_rule_items"] == []
+    assert "Do not expand 灵根" in enabled["block_text"]
+    assert "Preserve bracketed system panels" not in enabled["block_text"]
+    assert "Preserve bracketed system panels" in panel["block_text"]
+    assert all(item["item_id"] != "rule_pending" for item in enabled["selected_rule_items"])
+    assert enabled["retrieval_report"]["pending_rejected_or_inactive_rule_matches"]
+    assert "chapter_candidates" not in enabled["block_text"]
+
+
+def test_rule_applicability_blocks_unsupported_negative_and_panel_expansion_rules(tmp_path: Path) -> None:
+    workspace, project = _workspace_with_project(tmp_path)
+    _insert_dictionary_entry(
+        workspace,
+        project,
+        entry_id="dict_xiuwei",
+        source="修为",
+        target="tu vi",
+        entry_type="realm",
+    )
+    _insert_approved_rule(
+        workspace,
+        project,
+        rule_id="rule_panel_expansion",
+        rule_type="expansion_guard",
+        trigger={"kind": "exact_ngram", "text": "修为"},
+        instruction="Do not expand 修为 into 【修为：无】 unless the exact longer Chinese source appears.",
+        applies_when={"exact_source_required": True, "longer_hit_must_be_exact": True},
+        confidence=0.9,
+    )
+    _insert_approved_rule(
+        workspace,
+        project,
+        rule_id="rule_negative_only",
+        rule_type="forbidden_variant",
+        trigger={"kind": "exact_text", "text": "雷灵池"},
+        instruction="Do not use deprecated variants for 雷灵池.",
+        confidence=0.9,
+    )
+
+    narrative = build_hybrid_prompt_support(
+        workspace,
+        "han-jue",
+        "韩绝看了看，相关人物的修为都没有进步。雷灵池灵气浓郁。",
+        use_approved_rules=True,
+    )
+    panel = build_hybrid_prompt_support(
+        workspace,
+        "han-jue",
+        "【修为：无】",
+        use_approved_rules=True,
+    )
+
+    assert "Do not expand 修为" not in narrative["block_text"]
+    assert "Do not use deprecated variants" not in narrative["block_text"]
+    assert any(
+        row["rule_id"] == "rule_panel_expansion"
+        and "panel_expansion_guard_requires_bracket_context" in row["reasons"]
+        for row in narrative["retrieval_report"]["excluded_rule_rows"]
+    )
+    assert any(
+        row["rule_id"] == "rule_negative_only"
+        and "forbidden_variant_without_positive_canon" in row["reasons"]
+        for row in narrative["retrieval_report"]["excluded_rule_rows"]
+    )
+    assert "Do not expand 修为" in panel["block_text"]
+
+
+def test_rule_budget_and_dictionary_covered_rule_reporting(tmp_path: Path) -> None:
+    workspace, project = _workspace_with_project(tmp_path)
+    _insert_dictionary_entry(
+        workspace,
+        project,
+        entry_id="dict_yuqing",
+        source="玉清宗",
+        target="Ngọc Thanh Tông",
+        entry_type="sect_org",
+    )
+    _insert_approved_rule(
+        workspace,
+        project,
+        rule_id="rule_dict_guard",
+        rule_type="dictionary_priority_guard",
+        trigger={"kind": "dictionary_hit", "text": "玉清宗"},
+        instruction="When exact source 玉清宗 appears, use Ngọc Thanh Tông.",
+        confidence=0.95,
+    )
+    _insert_approved_rule(
+        workspace,
+        project,
+        rule_id="rule_forbidden",
+        rule_type="forbidden_variant",
+        trigger={"kind": "exact_text", "text": "玉清宗"},
+        instruction="Do not use rejected variant Ngọc Thanh phái for 玉清宗.",
+        confidence=0.88,
+    )
+
+    bundle = build_hybrid_prompt_support(
+        workspace,
+        "han-jue",
+        "韩绝进入玉清宗。",
+        use_approved_rules=True,
+        max_rule_hints=1,
+        max_support_chars=1200,
+    )
+
+    assert len(bundle["selected_rule_items"]) == 1
+    assert any(
+        item.get("source_type") == "rule"
+        and item.get("drop_reason") in {"max_rule_hints", "covered_by_dictionary"}
+        for item in bundle["dropped_items"]
+    )
+    assert any(conflict["conflict_type"] == "dictionary_rule_duplicate" for conflict in bundle["conflicts"])
+    assert bundle["budget_report"]["selected_rule_count"] == 1
+    assert bundle["budget_report"]["dropped_rule_count"] >= 1
+
+
+def test_prompt_inspect_cli_can_enable_rules_without_explicit_hybrid_flag(tmp_path: Path) -> None:
+    workspace, project = _workspace_with_project(tmp_path)
+    _insert_approved_rule(
+        workspace,
+        project,
+        rule_id="rule_panel",
+        rule_type="format_preservation",
+        trigger={"kind": "segment_type", "text": "system_panel"},
+        applies_when={"source_has_brackets": True},
+        instruction="Preserve bracketed system panels 【...】 when they appear.",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "prompt",
+            "inspect",
+            "--workspace",
+            str(workspace.path),
+            "--project",
+            "han-jue",
+            "--source-text",
+            "【修为：无】",
+            "--use-approved-rules",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["selected_rule_count"] == 1
+    assert "Preserve bracketed system panels" in data["block_text"]
+
+
 def test_translate_text_hybrid_prompt_artifacts_created(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     workspace_path = tmp_path / "workspace"
@@ -294,6 +547,14 @@ def test_translate_text_hybrid_prompt_artifacts_created(tmp_path: Path, monkeypa
         target_text="Hàn Tuyệt",
         confidence_score=0.9,
     )
+    _insert_approved_rule(
+        workspace,
+        project,
+        rule_id="rule_hanjue_atomic",
+        rule_type="entity_atomicity_guard",
+        trigger={"kind": "exact_text", "text": "韩绝"},
+        instruction="Treat 韩绝 as an atomic approved name when it appears.",
+    )
 
     result = runner.invoke(
         app,
@@ -310,6 +571,7 @@ def test_translate_text_hybrid_prompt_artifacts_created(tmp_path: Path, monkeypa
             "mock-production",
             "--use-stable-prompt",
             "--use-hybrid-prompt",
+            "--use-approved-rules",
             "--emit-prompt-artifacts",
             "--force",
             "--json",
@@ -328,7 +590,10 @@ def test_translate_text_hybrid_prompt_artifacts_created(tmp_path: Path, monkeypa
     assert "Project support for this source:" in prompt_text
     assert "灵根资质 => Linh căn tư chất" in prompt_text
     assert "韩绝 => Hàn Tuyệt" in prompt_text
+    assert "Rules:" in prompt_text
     assert "chapter_candidates" not in prompt_text
+    context = json.loads((artifact_dir / "prompt_context_bundle.json").read_text(encoding="utf-8"))
+    assert context["selected_rule_items"]
 
 
 def test_validate_hybrid_prompt_artifacts_and_review_package(tmp_path: Path, monkeypatch) -> None:
@@ -382,6 +647,14 @@ def test_validate_hybrid_prompt_artifacts_and_review_package(tmp_path: Path, mon
         target_text="Hàn Tuyệt",
         confidence_score=0.9,
     )
+    _insert_approved_rule(
+        workspace,
+        project,
+        rule_id="rule_hanjue_atomic",
+        rule_type="entity_atomicity_guard",
+        trigger={"kind": "exact_text", "text": "韩绝"},
+        instruction="Treat 韩绝 as an atomic approved name when it appears.",
+    )
 
     result = runner.invoke(
         app,
@@ -409,6 +682,7 @@ def test_validate_hybrid_prompt_artifacts_and_review_package(tmp_path: Path, mon
             "--use-stable-prompt",
             "--resumable",
             "--use-hybrid-prompt",
+            "--use-approved-rules",
             "--dictionary-max-entries",
             "8",
             "--memory-max-items",
@@ -424,17 +698,20 @@ def test_validate_hybrid_prompt_artifacts_and_review_package(tmp_path: Path, mon
     data = parse_json(result.output)["data"]
     run_dir = Path(data["run_dir"])
     assert data["final_decision"] == "PASS"
-    assert data["comparison_mode"] == "hybrid_prompt_support"
+    assert data["comparison_mode"] == "hybrid_prompt_rules_support"
     assert all(row["score_delta"] > 0 for row in data["round_results"])
     assert (run_dir / "prompt_context_bundle.json").exists()
     assert (run_dir / "prompt_conflict_report.json").exists()
     assert (run_dir / "prompt_support_items.json").exists()
     prompt_text = (run_dir / "prompt_used.md").read_text(encoding="utf-8")
     assert "Project support for this source:" in prompt_text
+    assert "Treat 韩绝 as an atomic approved name" in prompt_text
     assert "chapter_candidates" not in prompt_text
     review_path = Path(data["hybrid_prompt_review_path"])
     assert (review_path / "human_review_summary.md").exists()
     assert (review_path / "selected_support_items.csv").exists()
+    assert (review_path / "selected_rules.csv").exists()
+    assert "hybrid_prompt_rules" in str(review_path)
     assert (review_path / "prompt_conflict_summary.md").exists()
     with sqlite3.connect(workspace.db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM memory_items WHERE status = 'pending'").fetchone()[0] == 0

@@ -569,8 +569,10 @@ def translate_text(
     force: Annotated[bool, typer.Option("--force")] = False,
     use_approved_dictionary: Annotated[bool, typer.Option("--use-approved-dictionary")] = False,
     use_hybrid_prompt: Annotated[bool, typer.Option("--use-hybrid-prompt")] = False,
+    use_approved_rules: Annotated[bool, typer.Option("--use-approved-rules")] = False,
     dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
     memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
+    rule_max_hints: Annotated[int, typer.Option("--rule-max-hints")] = 4,
     support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
     emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
@@ -594,8 +596,10 @@ def translate_text(
             force=force,
             use_approved_dictionary=use_approved_dictionary,
             use_hybrid_prompt=use_hybrid_prompt,
+            use_approved_rules=use_approved_rules,
             dictionary_max_entries=dictionary_max_entries,
             memory_max_items=memory_max_items,
+            rule_max_hints=rule_max_hints,
             support_max_chars=support_max_chars,
             emit_prompt_artifacts=emit_prompt_artifacts,
         )
@@ -657,8 +661,10 @@ def translate_batch(
     stop_on_error: Annotated[bool, typer.Option("--stop-on-error")] = False,
     use_approved_dictionary: Annotated[bool, typer.Option("--use-approved-dictionary")] = False,
     use_hybrid_prompt: Annotated[bool, typer.Option("--use-hybrid-prompt")] = False,
+    use_approved_rules: Annotated[bool, typer.Option("--use-approved-rules")] = False,
     dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
     memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
+    rule_max_hints: Annotated[int, typer.Option("--rule-max-hints")] = 4,
     support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
     emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
@@ -691,8 +697,10 @@ def translate_batch(
             stop_on_error=stop_on_error,
             use_approved_dictionary=use_approved_dictionary,
             use_hybrid_prompt=use_hybrid_prompt,
+            use_approved_rules=use_approved_rules,
             dictionary_max_entries=dictionary_max_entries,
             memory_max_items=memory_max_items,
+            rule_max_hints=rule_max_hints,
             support_max_chars=support_max_chars,
             emit_prompt_artifacts=emit_prompt_artifacts,
         )
@@ -1047,8 +1055,10 @@ def learn_validate_approved_memory(
     ] = False,
     use_approved_dictionary: Annotated[bool, typer.Option("--use-approved-dictionary")] = False,
     use_hybrid_prompt: Annotated[bool, typer.Option("--use-hybrid-prompt")] = False,
+    use_approved_rules: Annotated[bool, typer.Option("--use-approved-rules")] = False,
     dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
     memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
+    rule_max_hints: Annotated[int, typer.Option("--rule-max-hints")] = 4,
     support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
     emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
@@ -1081,8 +1091,10 @@ def learn_validate_approved_memory(
             allow_skip_unsafe_chapter_sample=allow_skip_unsafe_chapter_sample,
             use_approved_dictionary=use_approved_dictionary,
             use_hybrid_prompt=use_hybrid_prompt,
+            use_approved_rules=use_approved_rules,
             dictionary_max_entries=dictionary_max_entries,
             memory_max_items=memory_max_items,
+            rule_max_hints=rule_max_hints,
             support_max_chars=support_max_chars,
             emit_prompt_artifacts=emit_prompt_artifacts,
         )
@@ -1884,12 +1896,16 @@ def prompt_inspect_command(
     workspace: WorkspaceOption = None,
     mode: Annotated[str, typer.Option("--mode")] = "production",
     use_hybrid_prompt: Annotated[bool, typer.Option("--use-hybrid-prompt")] = False,
+    use_approved_rules: Annotated[bool, typer.Option("--use-approved-rules")] = False,
     dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
     memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
+    rule_max_hints: Annotated[int, typer.Option("--rule-max-hints")] = 4,
     support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     try:
+        if use_approved_rules:
+            use_hybrid_prompt = True
         if not use_hybrid_prompt:
             raise ValueError("--use-hybrid-prompt is required for MVP5H prompt inspection.")
         ws = discover_workspace(_workspace_arg(workspace))
@@ -1900,6 +1916,8 @@ def prompt_inspect_command(
             mode=mode,
             max_dictionary_entries=dictionary_max_entries,
             max_memory_items=memory_max_items,
+            use_approved_rules=use_approved_rules,
+            max_rule_hints=rule_max_hints,
             max_support_chars=support_max_chars,
         )
     except (WorkspaceError, ValueError) as exc:
