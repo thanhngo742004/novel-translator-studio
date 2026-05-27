@@ -122,6 +122,7 @@ def _insert_approved_rule(
     trigger: dict,
     instruction: str,
     applies_when: dict | None = None,
+    forbidden_variants: list[str] | None = None,
     status: str = "active",
     approved_by: str | None = "human",
     confidence: float = 0.9,
@@ -146,7 +147,7 @@ def _insert_approved_rule(
                 json_dumps(applies_when or {"exact_source_required": True}),
                 instruction,
                 json_dumps([]),
-                json_dumps([]),
+                json_dumps(forbidden_variants or []),
                 json_dumps({"project_slug": project["slug"]}),
                 confidence,
                 json_dumps({"source_run_id": "pytest_rules"}),
@@ -303,6 +304,7 @@ def test_hybrid_prompt_includes_approved_rules_only_when_enabled_and_triggered(t
         rule_type="expansion_guard",
         trigger={"kind": "exact_ngram", "text": "灵根"},
         instruction="Do not expand 灵根 into 灵根资质 unless the exact longer source appears.",
+        forbidden_variants=["Linh căn tư chất"],
         confidence=0.91,
     )
     _insert_approved_rule(
@@ -369,6 +371,7 @@ def test_rule_applicability_blocks_unsupported_negative_and_panel_expansion_rule
         trigger={"kind": "exact_ngram", "text": "修为"},
         instruction="Do not expand 修为 into 【修为：无】 unless the exact longer Chinese source appears.",
         applies_when={"exact_source_required": True, "longer_hit_must_be_exact": True},
+        forbidden_variants=["【 Tu vi: Không 】"],
         confidence=0.9,
     )
     _insert_approved_rule(
@@ -435,6 +438,7 @@ def test_rule_budget_and_dictionary_covered_rule_reporting(tmp_path: Path) -> No
         rule_type="forbidden_variant",
         trigger={"kind": "exact_text", "text": "玉清宗"},
         instruction="Do not use rejected variant Ngọc Thanh phái for 玉清宗.",
+        forbidden_variants=["Ngọc Thanh phái"],
         confidence=0.88,
     )
 

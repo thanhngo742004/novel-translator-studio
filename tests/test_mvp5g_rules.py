@@ -11,12 +11,15 @@ from nts_core.hybrid_prompt import build_hybrid_prompt_support
 from nts_core.memory import create_memory_item
 from nts_core.projects import create_project
 from nts_core.rules import (
+    ablate_rule_prompt_impact,
     approve_rule_candidates,
+    diagnose_rule_prompt_impact,
     export_project_rules,
     extract_rule_candidates,
     reject_rule_candidates,
     review_rule_run,
     rule_status,
+    scope_approved_rules,
     test_project_rules as inspect_project_rules,
 )
 from nts_storage.database import connection, json_dumps, utc_now
@@ -254,6 +257,114 @@ def _read_candidates(path: str) -> list[dict]:
     ]
 
 
+def _insert_approved_rule_row(
+    workspace,
+    project: dict,
+    *,
+    rule_id: str,
+    rule_type: str,
+    trigger: dict,
+    instruction: str,
+    forbidden_variants: list[str] | None = None,
+    status: str = "active",
+) -> None:
+    now = utc_now()
+    with connection(workspace.db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO approved_rules (
+                id, project_id, project_slug, rule_type, trigger_pattern_json,
+                applies_when_json, instruction, examples_json, forbidden_variants_json,
+                scope_json, confidence_score, provenance_json, status,
+                approved_by, approved_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                rule_id,
+                project["id"],
+                project["slug"],
+                rule_type,
+                json_dumps(trigger),
+                json_dumps({"exact_source_required": True}),
+                instruction,
+                json_dumps([]),
+                json_dumps(forbidden_variants or []),
+                json_dumps({"project_slug": project["slug"]}),
+                0.9,
+                json_dumps({"source_run_id": "pytest_scope"}),
+                status,
+                "human",
+                now,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+
+def _write_rule_prompt_validation_fixture(validation_run: Path) -> None:
+    validation_run.mkdir(parents=True, exist_ok=True)
+    (validation_run / "prompt_context_bundle.json").write_text(
+        json.dumps(
+            {
+                "phases": {
+                    "round_1_approved_memory:sample_1": {
+                        "sample_1": {
+                            "chapter_id": 1,
+                            "rule_items_selected": [
+                                {
+                                    "item_id": "rule_expand",
+                                    "rule_id": "rule_expand",
+                                    "rule_type": "expansion_guard",
+                                    "instruction_text": "Do not expand 灵根.",
+                                }
+                            ],
+                            "rule_items_dropped": [
+                                {
+                                    "item_id": "rule_dict_guard",
+                                    "rule_id": "rule_dict_guard",
+                                    "rule_type": "dictionary_priority_guard",
+                                    "drop_reason": "covered_by_dictionary",
+                                }
+                            ],
+                            "support_items_dropped": [],
+                            "conflicts": [
+                                {
+                                    "conflict_type": "dictionary_rule_duplicate",
+                                    "source_anchor": "灵根资质",
+                                    "rule_item_id": "rule_dict_guard",
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (validation_run / "final_validation_summary.json").write_text(
+        json.dumps(
+            {
+                "final_decision": "FAIL",
+                "round_results": [
+                    {
+                        "round": 1,
+                        "score_delta": -0.5,
+                        "sample_deltas": [
+                            {"sample_id": "sample_1", "chapter_id": 1, "delta": -1.0}
+                        ],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_rule_extract_from_hybrid_dictionary_memory_and_nlp(tmp_path: Path) -> None:
     workspace, _project, result = _extract_fixture_rules(tmp_path)
     candidates = _read_candidates(result["candidates_path"])
@@ -335,7 +446,18 @@ def test_rule_cli_commands_exist_and_extract_review(tmp_path: Path) -> None:
     workspace, _project, validation_run, hybrid_review = _workspace_with_rule_sources(tmp_path)
     help_result = runner.invoke(app, ["--workspace", str(workspace.path), "rule", "--help"])
     assert help_result.exit_code == 0, help_result.output
-    for command_name in ("extract", "review", "approve", "reject", "export", "status", "test"):
+    for command_name in (
+        "extract",
+        "review",
+        "approve",
+        "reject",
+        "export",
+        "status",
+        "test",
+        "diagnose-prompt-impact",
+        "ablate-prompt-impact",
+        "scope-approved",
+    ):
         assert command_name in help_result.output
 
     extract_result = runner.invoke(
@@ -376,6 +498,135 @@ def test_rule_cli_commands_exist_and_extract_review(tmp_path: Path) -> None:
     )
     assert review_result.exit_code == 0, review_result.output
     assert Path(json.loads(review_result.output)["data"]["human_review_path"]).exists()
+
+
+def test_rule_prompt_diagnostic_ablation_and_scope_artifacts(tmp_path: Path) -> None:
+    workspace, project, _validation_run, _hybrid_review = _workspace_with_rule_sources(tmp_path)
+    validation_run = workspace.path / "artifacts" / "approved_memory_validation" / "rule_prompt_fixture"
+    _write_rule_prompt_validation_fixture(validation_run)
+    _insert_approved_rule_row(
+        workspace,
+        project,
+        rule_id="rule_dict_guard",
+        rule_type="dictionary_priority_guard",
+        trigger={"kind": "dictionary_hit", "text": "灵根资质"},
+        instruction="When exact source 灵根资质 appears, use Linh căn tư chất.",
+    )
+    _insert_approved_rule_row(
+        workspace,
+        project,
+        rule_id="rule_expand",
+        rule_type="expansion_guard",
+        trigger={"kind": "exact_ngram", "text": "灵根"},
+        instruction="Do not expand 灵根 into 灵根资质 unless exact source appears.",
+        forbidden_variants=["Linh căn tư chất"],
+    )
+
+    diagnostic = diagnose_rule_prompt_impact(
+        workspace,
+        project_slug="han-jue",
+        validation_run=str(validation_run),
+    )
+    ablation = ablate_rule_prompt_impact(
+        workspace,
+        project_slug="han-jue",
+        validation_run=str(validation_run),
+    )
+    scoped = scope_approved_rules(
+        workspace,
+        project_slug="han-jue",
+        rule_ids="rule_expand",
+        action="verifier_only",
+        reason="pytest noisy rule ablation",
+    )
+
+    assert Path(diagnostic["report_path"]).exists()
+    assert Path(ablation["matrix_path"]).exists()
+    assert ablation["classifications"]["rule_dict_guard"] == "redundant_covered_by_dictionary"
+    assert scoped["updated_rule_ids"] == ["rule_expand"]
+    assert Path(scoped["audit_path"]).exists()
+    with sqlite3.connect(workspace.db_path) as conn:
+        status = conn.execute("SELECT status FROM approved_rules WHERE id = 'rule_expand'").fetchone()[0]
+    assert status == "active_verifier_only"
+
+    bundle = build_hybrid_prompt_support(
+        workspace,
+        "han-jue",
+        "韩绝查看灵根资质和灵根。",
+        use_approved_rules=True,
+    )
+    assert "Do not expand 灵根" not in bundle["block_text"]
+    assert any(
+        row.get("id") == "rule_expand" and "verifier_only" in row.get("reasons", [])
+        for row in bundle["retrieval_report"]["pending_rejected_or_inactive_rule_matches"]
+    )
+
+
+def test_rule_prompt_diagnostic_scope_cli_commands(tmp_path: Path) -> None:
+    workspace, project, _validation_run, _hybrid_review = _workspace_with_rule_sources(tmp_path)
+    validation_run = workspace.path / "artifacts" / "approved_memory_validation" / "rule_prompt_cli_fixture"
+    _write_rule_prompt_validation_fixture(validation_run)
+    _insert_approved_rule_row(
+        workspace,
+        project,
+        rule_id="rule_expand_cli",
+        rule_type="expansion_guard",
+        trigger={"kind": "exact_ngram", "text": "灵根"},
+        instruction="Do not expand 灵根 into 灵根资质 unless exact source appears.",
+        forbidden_variants=["Linh căn tư chất"],
+    )
+
+    diagnostic = runner.invoke(
+        app,
+        [
+            "--workspace",
+            str(workspace.path),
+            "rule",
+            "diagnose-prompt-impact",
+            "--project",
+            "han-jue",
+            "--validation-run",
+            str(validation_run),
+            "--json",
+        ],
+    )
+    ablation = runner.invoke(
+        app,
+        [
+            "--workspace",
+            str(workspace.path),
+            "rule",
+            "ablate-prompt-impact",
+            "--project",
+            "han-jue",
+            "--validation-run",
+            str(validation_run),
+            "--json",
+        ],
+    )
+    scoped = runner.invoke(
+        app,
+        [
+            "--workspace",
+            str(workspace.path),
+            "rule",
+            "scope-approved",
+            "--project",
+            "han-jue",
+            "--rule-ids",
+            "rule_expand_cli",
+            "--action",
+            "disable_prompt",
+            "--reason",
+            "pytest disable noisy prompt rule",
+            "--json",
+        ],
+    )
+
+    assert diagnostic.exit_code == 0, diagnostic.output
+    assert ablation.exit_code == 0, ablation.output
+    assert scoped.exit_code == 0, scoped.output
+    assert json.loads(scoped.output)["data"]["new_status"] == "disabled_for_prompt"
 
 
 def test_hybrid_prompt_builder_does_not_use_approved_rules_yet(tmp_path: Path) -> None:

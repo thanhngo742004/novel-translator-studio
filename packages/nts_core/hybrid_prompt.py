@@ -281,7 +281,14 @@ def _load_ineligible_rule_rows(workspace: Workspace, project_slug: str, source_t
         text = str(trigger.get("text") or "")
         if text and _source_present(source_text, text):
             item["record_kind"] = "approved_rule"
-            item["reasons"] = [f"status_gate:{item.get('status')}"]
+            status = str(item.get("status") or "")
+            reason_map = {
+                "active_verifier_only": "verifier_only",
+                "disabled_for_prompt": "disabled_after_validation",
+                "rejected_after_validation": "rejected_after_validation",
+                "scoped_prompt_only": "scoped_prompt_only",
+            }
+            item["reasons"] = [reason_map.get(status, f"status_gate:{status}")]
             rows.append(item)
     return rows[:100]
 
@@ -554,6 +561,19 @@ def _rule_needs_panel_context(rule: dict[str, Any]) -> bool:
     return "【" in forbidden or "】" in forbidden or "【" in instruction or "】" in instruction
 
 
+def _rule_has_concrete_negative_evidence(rule: dict[str, Any]) -> bool:
+    if rule.get("forbidden_variants_json"):
+        return True
+    for example in rule.get("examples_json") or []:
+        if isinstance(example, dict) and (example.get("rejected") or example.get("forbidden")):
+            return True
+    provenance = rule.get("provenance_json") or {}
+    return str(provenance.get("conflict_type") or "") in {
+        "overlapping_dictionary_hit",
+        "related_inactive_or_negative_memory",
+    }
+
+
 def _rule_items(
     workspace: Workspace,
     project: dict[str, Any],
@@ -585,8 +605,13 @@ def _rule_items(
             reasons.extend(match_reasons)
         if _longer_dictionary_hit_present(rule, dictionary_items):
             reasons.append("longer_exact_dictionary_hit_present")
-        if rule.get("rule_type") == "forbidden_variant" and not _rule_has_positive_canon(rule, dictionary_items, memory_items):
-            reasons.append("forbidden_variant_without_positive_canon")
+        if rule.get("rule_type") == "forbidden_variant":
+            if not rule.get("forbidden_variants_json"):
+                reasons.append("no_concrete_forbidden_variant")
+            if not _rule_has_positive_canon(rule, dictionary_items, memory_items):
+                reasons.append("forbidden_variant_without_positive_canon")
+        if rule.get("rule_type") == "expansion_guard" and not _rule_has_concrete_negative_evidence(rule):
+            reasons.append("no_concrete_forbidden_variant")
         if _rule_needs_panel_context(rule) and not re.search(r"【[^】]+】", source_text or ""):
             reasons.append("panel_expansion_guard_requires_bracket_context")
         if reasons:

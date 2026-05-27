@@ -120,12 +120,15 @@ from nts_core.production_translation import (
     translate_chapter_stable,
 )
 from nts_core.rules import (
+    ablate_rule_prompt_impact,
     approve_rule_candidates,
+    diagnose_rule_prompt_impact,
     export_project_rules,
     extract_rule_candidates,
     reject_rule_candidates,
     review_rule_run,
     rule_status,
+    scope_approved_rules,
     test_project_rules,
 )
 from nts_core.stable_prompts import StablePromptBlocker
@@ -2087,6 +2090,70 @@ def rule_test_command(
     except (WorkspaceError, ValueError) as exc:
         _fail("RULE_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)
+
+
+@rule_app.command("diagnose-prompt-impact")
+def rule_diagnose_prompt_impact_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    validation_run: Annotated[str, typer.Option("--validation-run", help="Validation run artifact path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = diagnose_rule_prompt_impact(
+            ws,
+            project_slug=project,
+            validation_run=validation_run,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("RULE_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@rule_app.command("ablate-prompt-impact")
+def rule_ablate_prompt_impact_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    validation_run: Annotated[str, typer.Option("--validation-run", help="Validation run artifact path.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = ablate_rule_prompt_impact(
+            ws,
+            project_slug=project,
+            validation_run=validation_run,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("RULE_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@rule_app.command("scope-approved")
+def rule_scope_approved_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    rule_ids: Annotated[str, typer.Option("--rule-ids", help="Comma-separated approved rule ids.")],
+    action: Annotated[
+        str,
+        typer.Option("--action", help="scope, verifier_only, disable_prompt, or reject_after_validation."),
+    ],
+    reason: Annotated[str, typer.Option("--reason")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = scope_approved_rules(
+            ws,
+            project_slug=project,
+            rule_ids=rule_ids,
+            action=action,
+            reason=reason,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("RULE_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
 
 
 @eval_app.command("prepare-parallel")

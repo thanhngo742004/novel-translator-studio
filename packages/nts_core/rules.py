@@ -50,6 +50,18 @@ APPROVED_RULE_JSON_FIELDS = (
     "scope_json",
     "provenance_json",
 )
+RULE_PROMPT_DISABLED_STATUSES = {
+    "active_verifier_only",
+    "disabled_for_prompt",
+    "rejected_after_validation",
+    "scoped_prompt_only",
+}
+RULE_SCOPE_ACTION_TO_STATUS = {
+    "scope": "scoped_prompt_only",
+    "verifier_only": "active_verifier_only",
+    "disable_prompt": "disabled_for_prompt",
+    "reject_after_validation": "rejected_after_validation",
+}
 RULE_TYPE_PRIORITY = {
     "dictionary_priority_guard": 10,
     "forbidden_variant": 20,
@@ -101,6 +113,13 @@ def _normalize_text(text: Any) -> str:
     return re.sub(r"\s+", "", str(text or "").strip()).casefold()
 
 
+def _group_by(rows: list[dict[str, Any]], key: str) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get(key) or "")].append(row)
+    return grouped
+
+
 def _rules_root(workspace: Workspace) -> Path:
     return workspace.path / "artifacts" / "rules"
 
@@ -121,6 +140,22 @@ def _candidate_path(run_dir: Path) -> Path:
 
 def _load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _resolve_validation_run(run: str) -> Path:
+    path = Path(run)
+    if not path.exists():
+        raise ValueError(f"Validation artifact not found: {run}")
+    if (path / "prompt_context_bundle.json").exists() or (path / "final_validation_summary.json").exists():
+        return path
+    raise ValueError(f"Validation run path is missing prompt/final artifacts: {run}")
+
+
+def _diagnostic_run_dir(workspace: Workspace, project_slug: str, kind: str) -> Path:
+    run_id = f"{project_slug}_{kind}_{int(time.time() * 1000)}"
+    run_dir = _rules_root(workspace) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 
 def _project_scope(project: dict[str, Any], chapters: list[int] | None = None) -> dict[str, Any]:
@@ -1396,6 +1431,590 @@ def load_approved_rules(workspace: Workspace, project_slug: str) -> list[dict[st
             (project_slug,),
         ).fetchall()
     return [_row_to_approved_rule(row) for row in rows]
+
+
+def load_all_project_rules(workspace: Workspace, project_slug: str) -> list[dict[str, Any]]:
+    initialize_database(workspace.db_path)
+    with connection(workspace.db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, project_id, project_slug, rule_type, trigger_pattern_json,
+                   applies_when_json, instruction, examples_json, forbidden_variants_json,
+                   scope_json, confidence_score, provenance_json, status,
+                   approved_by, approved_at, created_at, updated_at
+            FROM approved_rules
+            WHERE project_slug = ?
+            ORDER BY status ASC, rule_type ASC, confidence_score DESC, instruction ASC
+            """,
+            (project_slug,),
+        ).fetchall()
+    return [_row_to_approved_rule(row) for row in rows]
+
+
+def _flatten_prompt_context_rows(validation_run: Path) -> list[dict[str, Any]]:
+    path = validation_run / "prompt_context_bundle.json"
+    if not path.exists():
+        return []
+    payload = _load_json(path)
+    rows: list[dict[str, Any]] = []
+    for phase_key, sample_map in (payload.get("phases") or {}).items():
+        if not isinstance(sample_map, dict):
+            continue
+        phase = str(phase_key).split(":", 1)[0]
+        for sample_id, sample_payload in sample_map.items():
+            if not isinstance(sample_payload, dict):
+                continue
+            row = dict(sample_payload)
+            row["phase_key"] = phase_key
+            row["phase"] = phase
+            row["sample_id"] = str(sample_id)
+            rows.append(row)
+    return rows
+
+
+def _load_round_sample_deltas(validation_run: Path) -> dict[tuple[int, str], float]:
+    summary_path = validation_run / "final_validation_summary.json"
+    if not summary_path.exists():
+        return {}
+    payload = _load_json(summary_path)
+    deltas: dict[tuple[int, str], float] = {}
+    for round_row in payload.get("round_results") or []:
+        round_no = int(round_row.get("round") or 0)
+        for sample in (round_row.get("sample_deltas") or round_row.get("per_chapter_deltas") or []):
+            sample_id = str(sample.get("sample_id") or "")
+            if round_no and sample_id:
+                deltas[(round_no, sample_id)] = float(sample.get("delta") or 0)
+    return deltas
+
+
+def _phase_round(phase: str) -> int | None:
+    match = re.match(r"round_(\d+)_", phase or "")
+    return int(match.group(1)) if match else None
+
+
+def _rule_trigger_text(rule: dict[str, Any]) -> str:
+    trigger = rule.get("trigger_pattern_json") or {}
+    return str(trigger.get("text") or trigger.get("pattern") or trigger.get("kind") or "")
+
+
+def _rule_recommendation(stats: dict[str, Any]) -> str:
+    status = str(stats.get("status") or "")
+    if status == "active_verifier_only":
+        return "verifier_only"
+    if status in {"disabled_for_prompt", "rejected_after_validation"}:
+        return "disable_prompt_rendering"
+    selected = int(stats.get("selected_count") or 0)
+    selected_negative = int(stats.get("selected_negative_delta_count") or 0)
+    covered = bool(stats.get("covered_by_dictionary"))
+    rule_type = str(stats.get("rule_type") or "")
+    if covered and rule_type == "dictionary_priority_guard":
+        return "verifier_only"
+    if selected and selected_negative / max(selected, 1) >= 0.5:
+        if rule_type in {"expansion_guard", "forbidden_variant", "dictionary_priority_guard"}:
+            return "disable_prompt_rendering"
+        return "scope_tighter"
+    if selected == 0 and int(stats.get("dropped_count") or 0) > 0:
+        return "verifier_only"
+    return "keep"
+
+
+def _build_rule_prompt_impact(workspace: Workspace, project_slug: str, validation_run: Path) -> dict[str, Any]:
+    rules = load_all_project_rules(workspace, project_slug)
+    rows = _flatten_prompt_context_rows(validation_run)
+    deltas = _load_round_sample_deltas(validation_run)
+    stats: dict[str, dict[str, Any]] = {}
+    for rule in rules:
+        stats[str(rule["id"])] = {
+            "rule_id": rule["id"],
+            "rule_type": rule.get("rule_type"),
+            "trigger_pattern": rule.get("trigger_pattern_json") or {},
+            "trigger_text": _rule_trigger_text(rule),
+            "instruction": rule.get("instruction"),
+            "status": rule.get("status"),
+            "confidence": rule.get("confidence_score"),
+            "selected_count": 0,
+            "dropped_count": 0,
+            "selected_samples": [],
+            "dropped_samples": [],
+            "selected_chapters": [],
+            "conflict_count": 0,
+            "conflict_types": Counter(),
+            "drop_reasons": Counter(),
+            "covered_by_dictionary": False,
+            "selected_negative_delta_count": 0,
+            "selected_nonnegative_delta_count": 0,
+            "rendered_instruction_redundant": False,
+            "dictionary_or_memory_already_covered": False,
+        }
+
+    selected_rows: list[dict[str, Any]] = []
+    dropped_rows: list[dict[str, Any]] = []
+    conflict_rows: list[dict[str, Any]] = []
+    for row in rows:
+        round_no = _phase_round(str(row.get("phase") or ""))
+        delta = deltas.get((round_no or 0, str(row.get("sample_id") or "")))
+        for item in row.get("rule_items_selected") or []:
+            rule_id = str(item.get("rule_id") or item.get("item_id") or "")
+            if not rule_id:
+                continue
+            entry = {
+                "rule_id": rule_id,
+                "rule_type": item.get("rule_type"),
+                "phase": row.get("phase"),
+                "sample_id": row.get("sample_id"),
+                "chapter_id": row.get("chapter_id"),
+                "delta": delta,
+                "instruction_text": item.get("instruction_text"),
+            }
+            selected_rows.append(entry)
+            if rule_id in stats:
+                stats[rule_id]["selected_count"] += 1
+                stats[rule_id]["selected_samples"].append(str(row.get("sample_id")))
+                stats[rule_id]["selected_chapters"].append(row.get("chapter_id"))
+                if delta is not None and delta < 0:
+                    stats[rule_id]["selected_negative_delta_count"] += 1
+                elif delta is not None:
+                    stats[rule_id]["selected_nonnegative_delta_count"] += 1
+        for item in (row.get("rule_items_dropped") or []) + [
+            item for item in (row.get("support_items_dropped") or []) if item.get("source_type") == "rule"
+        ]:
+            rule_id = str(item.get("rule_id") or item.get("item_id") or "")
+            if not rule_id:
+                continue
+            reason = str(item.get("drop_reason") or "")
+            dropped_rows.append(
+                {
+                    "rule_id": rule_id,
+                    "rule_type": item.get("rule_type"),
+                    "phase": row.get("phase"),
+                    "sample_id": row.get("sample_id"),
+                    "chapter_id": row.get("chapter_id"),
+                    "drop_reason": reason,
+                }
+            )
+            if rule_id in stats:
+                stats[rule_id]["dropped_count"] += 1
+                stats[rule_id]["dropped_samples"].append(str(row.get("sample_id")))
+                stats[rule_id]["drop_reasons"][reason] += 1
+                if reason == "covered_by_dictionary":
+                    stats[rule_id]["covered_by_dictionary"] = True
+                    stats[rule_id]["dictionary_or_memory_already_covered"] = True
+        for conflict in row.get("conflicts") or []:
+            conflict_rows.append(
+                {
+                    "phase": row.get("phase"),
+                    "sample_id": row.get("sample_id"),
+                    "chapter_id": row.get("chapter_id"),
+                    **conflict,
+                }
+            )
+            rule_id = str(conflict.get("rule_item_id") or conflict.get("rule_id") or "")
+            if rule_id in stats:
+                stats[rule_id]["conflict_count"] += 1
+                stats[rule_id]["conflict_types"][str(conflict.get("conflict_type") or "")] += 1
+                if conflict.get("conflict_type") == "dictionary_rule_duplicate":
+                    stats[rule_id]["covered_by_dictionary"] = True
+                    stats[rule_id]["dictionary_or_memory_already_covered"] = True
+
+    for rule_id, row in stats.items():
+        row["selected_samples"] = sorted(set(row["selected_samples"]))
+        row["dropped_samples"] = sorted(set(row["dropped_samples"]))
+        row["selected_chapters"] = sorted({chapter for chapter in row["selected_chapters"] if chapter is not None})
+        row["conflict_types"] = dict(row["conflict_types"])
+        row["drop_reasons"] = dict(row["drop_reasons"])
+        row["rendered_instruction_redundant"] = bool(
+            row["covered_by_dictionary"] or row["rule_type"] == "dictionary_priority_guard"
+        )
+        row["recommendation"] = _rule_recommendation(row)
+
+    summary_path = validation_run / "final_validation_summary.json"
+    summary = _load_json(summary_path) if summary_path.exists() else {}
+    return {
+        "schema_version": "rule_prompt_impact_v1",
+        "project_slug": project_slug,
+        "validation_run": str(validation_run),
+        "validation_run_id": validation_run.name,
+        "created_at": utc_now(),
+        "final_decision": summary.get("final_decision"),
+        "round_results": summary.get("round_results") or [],
+        "rules": list(stats.values()),
+        "selected_rows": selected_rows,
+        "dropped_rows": dropped_rows,
+        "conflict_rows": conflict_rows,
+    }
+
+
+def diagnose_rule_prompt_impact(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    validation_run: str,
+) -> dict[str, Any]:
+    get_project_by_slug(workspace, project_slug)
+    validation_path = _resolve_validation_run(validation_run)
+    impact = _build_rule_prompt_impact(workspace, project_slug, validation_path)
+    run_dir = _diagnostic_run_dir(workspace, project_slug, "rule_prompt_diag")
+
+    rules = impact["rules"]
+    recommendations = [
+        {
+            "rule_id": row["rule_id"],
+            "rule_type": row["rule_type"],
+            "recommendation": row["recommendation"],
+            "selected_count": row["selected_count"],
+            "selected_negative_delta_count": row["selected_negative_delta_count"],
+            "covered_by_dictionary": row["covered_by_dictionary"],
+        }
+        for row in rules
+    ]
+    report = {
+        **{key: impact[key] for key in ("schema_version", "project_slug", "validation_run", "validation_run_id", "created_at", "final_decision")},
+        "rule_count": len(rules),
+        "rules": rules,
+        "recommendations": recommendations,
+    }
+    _json_write(run_dir / "rule_prompt_impact_report.json", report)
+    _json_write(run_dir / "noisy_rule_recommendation.json", {"schema_version": "noisy_rule_recommendation_v1", "recommendations": recommendations})
+
+    with (run_dir / "selected_rules_by_sample.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["phase", "sample_id", "chapter_id", "rule_id", "rule_type", "delta", "instruction_text"])
+        writer.writeheader()
+        for row in impact["selected_rows"]:
+            writer.writerow({field: row.get(field, "") for field in writer.fieldnames})
+    with (run_dir / "rule_conflict_frequency.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["rule_id", "rule_type", "conflict_count", "conflict_types"])
+        writer.writeheader()
+        for row in rules:
+            writer.writerow(
+                {
+                    "rule_id": row["rule_id"],
+                    "rule_type": row["rule_type"],
+                    "conflict_count": row["conflict_count"],
+                    "conflict_types": json.dumps(row["conflict_types"], ensure_ascii=False, sort_keys=True),
+                }
+            )
+    with (run_dir / "rule_render_frequency.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["rule_id", "rule_type", "selected_count", "dropped_count", "drop_reasons"])
+        writer.writeheader()
+        for row in rules:
+            writer.writerow(
+                {
+                    "rule_id": row["rule_id"],
+                    "rule_type": row["rule_type"],
+                    "selected_count": row["selected_count"],
+                    "dropped_count": row["dropped_count"],
+                    "drop_reasons": json.dumps(row["drop_reasons"], ensure_ascii=False, sort_keys=True),
+                }
+            )
+    type_rows = []
+    for rule_type, group in _group_by(rules, "rule_type").items():
+        type_rows.append(
+            {
+                "rule_type": rule_type,
+                "rule_count": len(group),
+                "selected_count": sum(int(row["selected_count"]) for row in group),
+                "dropped_count": sum(int(row["dropped_count"]) for row in group),
+                "selected_negative_delta_count": sum(int(row["selected_negative_delta_count"]) for row in group),
+            }
+        )
+    _text_write(
+        run_dir / "rule_type_impact_summary.md",
+        "# Rule Type Impact Summary\n\n"
+        + "\n".join(
+            f"- {row['rule_type']}: rules={row['rule_count']}, selected={row['selected_count']}, "
+            f"dropped={row['dropped_count']}, selected_negative={row['selected_negative_delta_count']}"
+            for row in type_rows
+        ),
+    )
+    _text_write(
+        run_dir / "rule_prompt_impact_report.md",
+        "# Rule Prompt Impact Report\n\n"
+        + "\n".join(
+            f"- `{row['rule_id']}` ({row['rule_type']}): selected={row['selected_count']}, "
+            f"dropped={row['dropped_count']}, conflicts={row['conflict_count']}, "
+            f"negative_samples={row['selected_negative_delta_count']}, recommendation={row['recommendation']}"
+            for row in rules
+        ),
+    )
+    return {
+        "project_slug": project_slug,
+        "diagnostic_run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "report_path": str(run_dir / "rule_prompt_impact_report.json"),
+        "recommendation_path": str(run_dir / "noisy_rule_recommendation.json"),
+        "rule_count": len(rules),
+        "recommendations": recommendations,
+    }
+
+
+def ablate_rule_prompt_impact(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    validation_run: str,
+) -> dict[str, Any]:
+    get_project_by_slug(workspace, project_slug)
+    validation_path = _resolve_validation_run(validation_run)
+    impact = _build_rule_prompt_impact(workspace, project_slug, validation_path)
+    run_dir = _diagnostic_run_dir(workspace, project_slug, "rule_prompt_ablation")
+    summary_path = validation_path / "final_validation_summary.json"
+    summary = _load_json(summary_path) if summary_path.exists() else {}
+    round_results = summary.get("round_results") or []
+
+    rows: list[dict[str, Any]] = [
+        {
+            "mode": "no_rules_baseline",
+            "scope": "all",
+            "rule_count_rendered": 0,
+            "support_chars": 0,
+            "conflicts_count": 0,
+            "score_delta_rounds": [],
+            "classification": "baseline",
+        },
+        {
+            "mode": "all_approved_rules_together",
+            "scope": "all",
+            "rule_count_rendered": sum(int(row.get("selected_count") or 0) for row in impact["rules"]),
+            "support_chars": None,
+            "conflicts_count": len(impact["conflict_rows"]),
+            "score_delta_rounds": [row.get("score_delta") for row in round_results],
+            "classification": "observed_previous_run",
+        },
+    ]
+    classifications: dict[str, str] = {}
+    for rule in impact["rules"]:
+        recommendation = rule["recommendation"]
+        if rule["covered_by_dictionary"]:
+            classification = "redundant_covered_by_dictionary"
+        elif recommendation in {"disable_prompt_rendering", "reject_after_validation"}:
+            classification = "harmful" if rule["selected_negative_delta_count"] else "noisy"
+        elif recommendation == "verifier_only":
+            classification = "verifier_only_recommended"
+        elif recommendation == "scope_tighter":
+            classification = "noisy"
+        elif int(rule["selected_count"]) == 0:
+            classification = "neutral"
+        else:
+            classification = "neutral"
+        classifications[rule["rule_id"]] = classification
+        rows.append(
+            {
+                "mode": "individual_rule",
+                "rule_id": rule["rule_id"],
+                "rule_type": rule["rule_type"],
+                "selected_count": rule["selected_count"],
+                "selected_negative_delta_count": rule["selected_negative_delta_count"],
+                "conflicts_count": rule["conflict_count"],
+                "classification": classification,
+                "recommended_action": recommendation,
+            }
+        )
+        rows.append(
+            {
+                "mode": "all_minus_one_rule",
+                "removed_rule_id": rule["rule_id"],
+                "removed_rule_type": rule["rule_type"],
+                "expected_effect": (
+                    "removes_redundant_or_negative_prompt_noise"
+                    if classification in {"harmful", "noisy", "redundant_covered_by_dictionary", "verifier_only_recommended"}
+                    else "no_clear_quality_change"
+                ),
+                "classification": classification,
+            }
+        )
+
+    type_rows = []
+    for rule_type, group in _group_by(impact["rules"], "rule_type").items():
+        type_rows.append(
+            {
+                "rule_type": rule_type,
+                "rule_count": len(group),
+                "selected_count": sum(int(row["selected_count"]) for row in group),
+                "selected_negative_delta_count": sum(int(row["selected_negative_delta_count"]) for row in group),
+                "recommended_action": (
+                    "disable_or_verifier_only"
+                    if any(classifications[row["rule_id"]] in {"harmful", "noisy", "redundant_covered_by_dictionary"} for row in group)
+                    else "keep_or_scope"
+                ),
+            }
+        )
+    safe_subset = [
+        row["rule_id"]
+        for row in impact["rules"]
+        if classifications[row["rule_id"]] not in {"harmful", "noisy", "redundant_covered_by_dictionary", "verifier_only_recommended"}
+        and row.get("status") == "active"
+    ]
+    disable_or_verifier = [
+        row["rule_id"]
+        for row in impact["rules"]
+        if row["rule_id"] not in safe_subset
+    ]
+    matrix = {
+        "schema_version": "rule_ablation_matrix_v1",
+        "project_slug": project_slug,
+        "validation_run": str(validation_path),
+        "created_at": utc_now(),
+        "rows": rows,
+        "classifications": classifications,
+    }
+    recommendation = {
+        "schema_version": "safe_rule_subset_recommendation_v1",
+        "project_slug": project_slug,
+        "safe_prompt_rule_ids": safe_subset,
+        "disable_or_verifier_only_rule_ids": disable_or_verifier,
+        "classifications": classifications,
+        "reason": "No-API ablation from prior validation prompt artifacts; real rerun required after scoping.",
+    }
+    _json_write(run_dir / "rule_ablation_matrix.json", matrix)
+    _json_write(run_dir / "all_minus_one_rule_report.json", {"schema_version": "all_minus_one_rule_report_v1", "rows": [row for row in rows if row["mode"] == "all_minus_one_rule"]})
+    _json_write(run_dir / "safe_rule_subset_recommendation.json", recommendation)
+    _text_write(
+        run_dir / "rule_ablation_matrix.md",
+        "# Rule Ablation Matrix\n\n"
+        + "\n".join(f"- {row.get('mode')}: {row.get('rule_id') or row.get('removed_rule_id') or row.get('scope')} -> {row.get('classification')}" for row in rows),
+    )
+    _text_write(
+        run_dir / "rule_type_ablation_report.md",
+        "# Rule Type Ablation Report\n\n"
+        + "\n".join(
+            f"- {row['rule_type']}: rules={row['rule_count']}, selected={row['selected_count']}, "
+            f"selected_negative={row['selected_negative_delta_count']}, action={row['recommended_action']}"
+            for row in type_rows
+        ),
+    )
+    _text_write(
+        run_dir / "safe_rule_subset_recommendation.md",
+        "# Safe Rule Subset Recommendation\n\n"
+        f"- Safe prompt rule ids: `{', '.join(safe_subset) if safe_subset else 'none'}`\n"
+        f"- Disable or verifier-only ids: `{', '.join(disable_or_verifier) if disable_or_verifier else 'none'}`\n",
+    )
+    return {
+        "project_slug": project_slug,
+        "ablation_run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "matrix_path": str(run_dir / "rule_ablation_matrix.json"),
+        "recommendation_path": str(run_dir / "safe_rule_subset_recommendation.json"),
+        "classifications": classifications,
+        "safe_prompt_rule_ids": safe_subset,
+        "disable_or_verifier_only_rule_ids": disable_or_verifier,
+    }
+
+
+def scope_approved_rules(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    rule_ids: str,
+    action: str,
+    reason: str,
+) -> dict[str, Any]:
+    project = get_project_by_slug(workspace, project_slug)
+    action = action.strip()
+    if action not in RULE_SCOPE_ACTION_TO_STATUS:
+        raise ValueError(f"Unsupported rule scope action: {action}")
+    selected_ids = [item.strip() for item in rule_ids.split(",") if item.strip()]
+    if not selected_ids:
+        raise ValueError("--rule-ids is required.")
+    new_status = RULE_SCOPE_ACTION_TO_STATUS[action]
+    now = utc_now()
+    run_dir = _diagnostic_run_dir(workspace, project_slug, "rule_scope")
+    updated: list[dict[str, Any]] = []
+    with connection(workspace.db_path) as conn:
+        placeholders = ",".join("?" for _ in selected_ids)
+        rows = conn.execute(
+            f"""
+            SELECT id, project_id, project_slug, rule_type, trigger_pattern_json,
+                   applies_when_json, instruction, examples_json, forbidden_variants_json,
+                   scope_json, confidence_score, provenance_json, status,
+                   approved_by, approved_at, created_at, updated_at
+            FROM approved_rules
+            WHERE project_slug = ? AND id IN ({placeholders})
+            """,
+            [project_slug, *selected_ids],
+        ).fetchall()
+        found = {_row_to_approved_rule(row)["id"]: _row_to_approved_rule(row) for row in rows}
+        missing = [rule_id for rule_id in selected_ids if rule_id not in found]
+        if missing:
+            raise ValueError(f"Approved rule id(s) not found: {', '.join(missing)}")
+        for rule_id in selected_ids:
+            row = found[rule_id]
+            old_status = row.get("status")
+            provenance = dict(row.get("provenance_json") or {})
+            history = list(provenance.get("prompt_scope_history") or [])
+            history.append(
+                {
+                    "action": action,
+                    "old_status": old_status,
+                    "new_status": new_status,
+                    "reason": reason,
+                    "created_at": now,
+                }
+            )
+            provenance["prompt_scope_history"] = history
+            conn.execute(
+                "UPDATE approved_rules SET status = ?, provenance_json = ?, updated_at = ? WHERE id = ?",
+                (new_status, json_dumps(provenance), now, rule_id),
+            )
+            payload = {
+                "rule_id": rule_id,
+                "old_status": old_status,
+                "new_status": new_status,
+                "action": action,
+                "reason": reason,
+                "scope_run_id": run_dir.name,
+            }
+            conn.execute(
+                """
+                INSERT INTO rule_audit_logs (
+                    id, rule_candidate_id, approved_rule_id, action, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (new_id("ruleaudit"), None, rule_id, "scope_approved", json_dumps(payload), now),
+            )
+            row["old_status"] = old_status
+            row["status"] = new_status
+            row["provenance_json"] = provenance
+            updated.append(row)
+            _append_jsonl(run_dir / "rule_audit_log.jsonl", {"created_at": now, **payload})
+        task_id = insert_task_run(
+            conn,
+            task_type="rule.scope_approved",
+            status="success",
+            stage="scoped",
+            project_id=project["id"],
+            input_data={"project": project_slug, "rule_ids": selected_ids, "action": action, "reason": reason},
+            result_data={"updated_rule_ids": selected_ids, "new_status": new_status},
+        )
+        conn.commit()
+    all_rules = load_all_project_rules(workspace, project_slug)
+    audit = {
+        "schema_version": "rule_scope_audit_v1",
+        "project_slug": project_slug,
+        "action": action,
+        "reason": reason,
+        "new_status": new_status,
+        "updated_rule_ids": selected_ids,
+        "updated_rules": updated,
+        "created_at": now,
+    }
+    _json_write(run_dir / "rule_scope_audit.json", audit)
+    _json_write(run_dir / "approved_rules_after_scope.json", {"schema_version": "approved_rules_after_scope_v1", "rules": all_rules, "created_at": now})
+    _text_write(
+        run_dir / "rule_scope_audit.md",
+        "# Rule Scope Audit\n\n"
+        + "\n".join(f"- `{row['id']}`: `{row.get('old_status')}` -> `{row.get('status')}` ({reason})" for row in updated),
+    )
+    return {
+        "task_run_id": task_id,
+        "project_slug": project_slug,
+        "scope_run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "updated_rule_ids": selected_ids,
+        "new_status": new_status,
+        "audit_path": str(run_dir / "rule_scope_audit.json"),
+        "audit_md_path": str(run_dir / "rule_scope_audit.md"),
+        "active_prompt_rule_count": sum(1 for row in all_rules if row.get("status") == "active"),
+    }
 
 
 def export_project_rules(workspace: Workspace, *, project_slug: str, out: Path | None = None) -> dict[str, Any]:
