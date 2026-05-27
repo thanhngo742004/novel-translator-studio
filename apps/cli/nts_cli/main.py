@@ -119,6 +119,15 @@ from nts_core.production_translation import (
     translate_batch_stable,
     translate_chapter_stable,
 )
+from nts_core.rules import (
+    approve_rule_candidates,
+    export_project_rules,
+    extract_rule_candidates,
+    reject_rule_candidates,
+    review_rule_run,
+    rule_status,
+    test_project_rules,
+)
 from nts_core.stable_prompts import StablePromptBlocker
 from nts_core.text_import import get_chapter, import_text_file, list_chapters, list_segments
 from nts_shared.envelopes import error_envelope, success_envelope
@@ -146,6 +155,7 @@ eval_app = typer.Typer(help="Evaluation harness commands.")
 nlp_app = typer.Typer(help="Chinese NLP analysis commands.")
 dict_app = typer.Typer(help="Project dictionary commands.")
 prompt_app = typer.Typer(help="Prompt support inspection commands.")
+rule_app = typer.Typer(help="Rule candidate commands.")
 app.add_typer(project_app, name="project")
 app.add_typer(config_app, name="config")
 app.add_typer(model_app, name="model")
@@ -160,6 +170,7 @@ app.add_typer(eval_app, name="eval")
 app.add_typer(nlp_app, name="nlp")
 app.add_typer(dict_app, name="dict")
 app.add_typer(prompt_app, name="prompt")
+app.add_typer(rule_app, name="rule")
 text_app.add_typer(text_chapters_app, name="chapters")
 text_app.add_typer(text_segments_app, name="segments")
 memory_app.add_typer(memory_evidence_app, name="evidence")
@@ -1893,6 +1904,170 @@ def prompt_inspect_command(
         )
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@rule_app.command("extract")
+def rule_extract_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    from_hybrid_run: Annotated[
+        Optional[str],
+        typer.Option("--from-hybrid-run", help="Hybrid prompt artifact or review path."),
+    ] = None,
+    from_dictionary_run: Annotated[
+        Optional[str],
+        typer.Option("--from-dictionary-run", help="Dictionary run id or path."),
+    ] = None,
+    from_learning_run: Annotated[
+        Optional[str],
+        typer.Option("--from-learning-run", help="Learning run id or path."),
+    ] = None,
+    from_validation_run: Annotated[
+        Optional[str],
+        typer.Option("--from-validation-run", help="Approved-memory validation run path."),
+    ] = None,
+    from_nlp_cache: Annotated[bool, typer.Option("--from-nlp-cache", help="Use read-only NLP cache signals.")] = False,
+    chapters: Annotated[str, typer.Option("--chapters", help="Chapter range, e.g. 1-10.")] = "1-10",
+    max_candidates: Annotated[Optional[int], typer.Option("--max-candidates")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = extract_rule_candidates(
+            ws,
+            project_slug=project,
+            from_hybrid_run=from_hybrid_run,
+            from_dictionary_run=from_dictionary_run,
+            from_learning_run=from_learning_run,
+            from_validation_run=from_validation_run,
+            from_nlp_cache=from_nlp_cache,
+            chapters=chapters,
+            max_candidates=max_candidates,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("RULE_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@rule_app.command("review")
+def rule_review_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Rule run id or path.")],
+    workspace: WorkspaceOption = None,
+    min_confidence: Annotated[Optional[float], typer.Option("--min-confidence")] = None,
+    rule_type: Annotated[Optional[str], typer.Option("--type", help="Filter by rule type.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = review_rule_run(
+            ws,
+            project_slug=project,
+            run=run,
+            min_confidence=min_confidence,
+            rule_type=rule_type,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("RULE_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@rule_app.command("approve")
+def rule_approve_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Rule run id or path.")],
+    workspace: WorkspaceOption = None,
+    rule_ids: Annotated[Optional[str], typer.Option("--rule-ids", help="Comma-separated rule candidate ids.")] = None,
+    all_high_confidence: Annotated[bool, typer.Option("--all-high-confidence")] = False,
+    reviewer: Annotated[str, typer.Option("--reviewer")] = "human",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = approve_rule_candidates(
+            ws,
+            project_slug=project,
+            run=run,
+            rule_ids=rule_ids,
+            all_high_confidence=all_high_confidence,
+            reviewer=reviewer,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("RULE_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@rule_app.command("reject")
+def rule_reject_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    run: Annotated[str, typer.Option("--run", help="Rule run id or path.")],
+    rule_ids: Annotated[str, typer.Option("--rule-ids", help="Comma-separated rule candidate ids.")],
+    reason: Annotated[str, typer.Option("--reason")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = reject_rule_candidates(
+            ws,
+            project_slug=project,
+            run=run,
+            rule_ids=rule_ids,
+            reason=reason,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("RULE_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result.get("task_run_id")), json_output)
+
+
+@rule_app.command("export")
+def rule_export_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    out: Annotated[Optional[Path], typer.Option("--out", help="Optional output JSON path.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = export_project_rules(ws, project_slug=project, out=out)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("RULE_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@rule_app.command("status")
+def rule_status_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = rule_status(ws, project_slug=project)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("RULE_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@rule_app.command("test")
+def rule_test_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    source_text: Annotated[str, typer.Option("--source-text", help="Chinese source chunk.")],
+    workspace: WorkspaceOption = None,
+    mode: Annotated[str, typer.Option("--mode")] = "production",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = test_project_rules(
+            ws,
+            project_slug=project,
+            source_text=source_text,
+            mode=mode,
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("RULE_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)
 
 
