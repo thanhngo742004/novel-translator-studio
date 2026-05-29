@@ -1,0 +1,89 @@
+{
+  "api_calls_used": 1,
+  "batch_dir": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch",
+  "batch_status": "success",
+  "blocking_issue_count": 10,
+  "blocking_issues": [
+    {
+      "chapter_id": "chapter_1",
+      "kind": "overlong_output",
+      "ratio": 20.0
+    },
+    {
+      "chunk": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch\\chunk_outputs\\chapter_1\\chunk_001",
+      "kind": "rules_rendered_in_prompt"
+    },
+    {
+      "chunk": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch\\chunk_outputs\\chapter_1\\chunk_001",
+      "kind": "raw_nlp_cache_in_prompt"
+    },
+    {
+      "chunk": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch\\chunk_outputs\\chapter_1\\chunk_001",
+      "kind": "truncation"
+    },
+    {
+      "chunk": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch\\chunk_outputs\\chapter_1\\chunk_001",
+      "kind": "unsafe_compression"
+    },
+    {
+      "chunk": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch\\chunk_outputs\\chapter_1\\chunk_001",
+      "kind": "quality_failed",
+      "reasons": [
+        "truncation",
+        "unsafe_compression"
+      ]
+    },
+    {
+      "chunk": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch\\chunk_outputs\\chapter_1\\chunk_001",
+      "kind": "rule_items_selected",
+      "rule_count": 1
+    },
+    {
+      "chunk": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch\\chunk_outputs\\chapter_1\\chunk_001",
+      "item_id": "pending_memory",
+      "kind": "bad_status_item_selected",
+      "status": "pending"
+    },
+    {
+      "chunk": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch\\chunk_outputs\\chapter_1\\chunk_001",
+      "kind": "prompt_budget_exceeded",
+      "support_chars": 5000
+    },
+    {
+      "chunk": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch\\chunk_outputs\\chapter_1\\chunk_001",
+      "kind": "rule_budget_selected_rules",
+      "selected_rule_count": 1
+    }
+  ],
+  "chapters_failed": 0,
+  "chapters_processed": 1,
+  "chapters_skipped": 0,
+  "chunks_seen": 1,
+  "created_at": "2026-05-28T05:30:12.696327+00:00",
+  "dictionary_hit_count": 0,
+  "dictionary_hits": {},
+  "memory_hit_count": 1,
+  "memory_hits": {
+    "pending_memory": 1
+  },
+  "pass": false,
+  "prompt_budget_rows": [
+    {
+      "chunk": "C:\\Users\\Admin\\Desktop\\NovelTranslatorStudio_Codex_Phase2_Setup\\.tmp\\pytest-of-Admin\\pytest-1\\test_production_qa_detects_blo0\\rollout\\batch\\chunk_outputs\\chapter_1\\chunk_001",
+      "selected_dictionary_count": 0,
+      "selected_memory_count": 0,
+      "selected_rule_count": 1,
+      "support_chars": 5000,
+      "support_lines": 30
+    }
+  ],
+  "rules_rendered_count": 0,
+  "schema_version": "mvp5i_production_qa_v1",
+  "warning_count": 1,
+  "warnings": [
+    {
+      "chapter_id": "chapter_1",
+      "kind": "chinese_residue"
+    }
+  ]
+}

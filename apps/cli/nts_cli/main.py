@@ -119,6 +119,7 @@ from nts_core.production_translation import (
     translate_batch_stable,
     translate_chapter_stable,
 )
+from nts_core.production_rollout import run_controlled_production_rollout
 from nts_core.rules import (
     ablate_rule_prompt_impact,
     approve_rule_candidates,
@@ -159,6 +160,7 @@ nlp_app = typer.Typer(help="Chinese NLP analysis commands.")
 dict_app = typer.Typer(help="Project dictionary commands.")
 prompt_app = typer.Typer(help="Prompt support inspection commands.")
 rule_app = typer.Typer(help="Rule candidate commands.")
+production_app = typer.Typer(help="Controlled production rollout commands.")
 app.add_typer(project_app, name="project")
 app.add_typer(config_app, name="config")
 app.add_typer(model_app, name="model")
@@ -174,6 +176,7 @@ app.add_typer(nlp_app, name="nlp")
 app.add_typer(dict_app, name="dict")
 app.add_typer(prompt_app, name="prompt")
 app.add_typer(rule_app, name="rule")
+app.add_typer(production_app, name="production")
 text_app.add_typer(text_chapters_app, name="chapters")
 text_app.add_typer(text_segments_app, name="segments")
 memory_app.add_typer(memory_evidence_app, name="evidence")
@@ -712,6 +715,57 @@ def translate_batch(
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@production_app.command("rollout")
+def production_rollout_command(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    provider: Annotated[str, typer.Option("--provider")],
+    model: Annotated[str, typer.Option("--model")],
+    workspace: WorkspaceOption = None,
+    chapters: Annotated[str, typer.Option("--chapters", help="Chapter range, e.g. 1-10.")] = "1-10",
+    max_chapters: Annotated[int, typer.Option("--max-chapters")] = 10,
+    max_real_calls: Annotated[int, typer.Option("--max-real-calls")] = 24,
+    use_stable_prompt: Annotated[bool, typer.Option("--use-stable-prompt/--no-use-stable-prompt")] = True,
+    use_hybrid_prompt: Annotated[bool, typer.Option("--use-hybrid-prompt/--no-use-hybrid-prompt")] = True,
+    use_approved_dictionary: Annotated[bool, typer.Option("--use-approved-dictionary/--no-use-approved-dictionary")] = True,
+    use_approved_rules: Annotated[bool, typer.Option("--use-approved-rules/--no-use-approved-rules")] = False,
+    dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
+    memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
+    support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
+    emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts/--no-emit-prompt-artifacts")] = True,
+    resumable: Annotated[bool, typer.Option("--resumable/--no-resumable")] = True,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output_dir: Annotated[Optional[Path], typer.Option("--output-dir")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        if not use_stable_prompt or not use_hybrid_prompt or not use_approved_dictionary:
+            raise ValueError("MVP5I production rollout requires --use-stable-prompt, --use-hybrid-prompt, and --use-approved-dictionary.")
+        if use_approved_rules:
+            raise ValueError("--use-approved-rules is not part of the MVP5I safe production profile; rules remain verifier-only.")
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = run_controlled_production_rollout(
+            ws,
+            project_slug=project,
+            provider_key=provider,
+            model=model,
+            chapters=chapters,
+            max_chapters=max_chapters,
+            max_real_calls=max_real_calls,
+            dictionary_max_entries=dictionary_max_entries,
+            memory_max_items=memory_max_items,
+            support_max_chars=support_max_chars,
+            emit_prompt_artifacts=emit_prompt_artifacts,
+            resumable=resumable,
+            dry_run=dry_run,
+            output_dir=output_dir,
+        )
+    except StablePromptBlocker as exc:
+        _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("PRODUCTION_ROLLOUT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
 
 
 @learn_app.command("correction")
