@@ -3378,6 +3378,7 @@ def compress_offending_paragraphs(
     provider: EvalProvider,
     *,
     model: str,
+    provider_call: Any | None = None,
     sample: dict[str, Any],
     paragraphs: list[dict[str, str]],
     glossary: dict[str, Any],
@@ -3415,8 +3416,8 @@ def compress_offending_paragraphs(
                 previous_failure_reasons=failure_reasons,
             )
             try:
-                raw = chat_completion_with_provider_retry(
-                    provider,
+                call = provider_call or (lambda **kwargs: chat_completion_with_provider_retry(provider, **kwargs))
+                raw = call(
                     model=model,
                     messages=[
                         {

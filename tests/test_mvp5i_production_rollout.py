@@ -384,3 +384,64 @@ def test_diagnose_qa_identifies_truncation_and_strict_max(tmp_path: Path) -> Non
     assert Path(data["diagnostic_path"]).exists()
     assert (run_dir / "chapter_2_paragraph_safety_table.csv").exists()
     assert Path(data["safety_repair_report_path"]).exists()
+
+
+def test_rollout_model_policy_artifacts_and_call_usage_written(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    workspace_path = _workspace_with_text(tmp_path, "第1章 一\n\nHero enters Dao Sect and checks Dao talent.")
+    _write_stable_prompt(workspace_path)
+    result = runner.invoke(app, ["production", "rollout", "--workspace", str(workspace_path), "--project", "demo", "--provider", "mock", "--model", "mock-production", "--fallback-model", "mock-fallback", "--chapters", "1", "--max-chapters", "1", "--max-real-calls", "2", "--json"])
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    policy_path = Path(data["model_policy_snapshot_path"])
+    assert policy_path.exists()
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert policy["chosen_model"] == "mock-production"
+    batch_dir = Path(data["batch_dir"])
+    usage_files = list((batch_dir / "chunk_outputs").glob("*/chunk_001/per_call_model_usage.jsonl"))
+    assert usage_files
+    rows = [json.loads(line) for line in usage_files[0].read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert {row["call_type"] for row in rows} >= {"selector"}
+    assert any(row["call_type"] == "translation" and row["chosen_model"] == "mock-production" for row in rows)
+    assert (usage_files[0].parent / "compression_model_usage_report.json").exists()
+    assert (usage_files[0].parent / "repair_model_usage_report.json").exists()
+
+
+def test_fallback_policy_prevents_bad_primary_route_in_translation(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    workspace_path = _workspace_with_text(tmp_path, "第1章 一\n\nHero enters Dao Sect.")
+    _write_stable_prompt(workspace_path)
+    result = runner.invoke(app, ["production", "rollout", "--workspace", str(workspace_path), "--project", "demo", "--provider", "mock", "--model", "mock-404", "--fallback-model", "mock-production", "--chapters", "1", "--max-chapters", "1", "--max-real-calls", "2", "--json"])
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["fallback_model_used"] is True
+    assert data["chosen_model"] == "mock-production"
+    usage_file = next((Path(data["batch_dir"]) / "chunk_outputs").glob("*/chunk_001/per_call_model_usage.jsonl"))
+    rows = [json.loads(line) for line in usage_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(row["call_type"] == "translation" and row["chosen_model"] == "mock-production" for row in rows)
+    assert not any(row["call_type"] == "translation" and row["chosen_model"] == "mock-404" for row in rows)
+
+
+def test_diagnostic_markdown_maps_unit_rows(tmp_path: Path) -> None:
+    workspace = init_workspace(tmp_path / "ws2")
+    run_dir = workspace.path / "artifacts" / "production_rollout" / "demo_run2"
+    batch_dir = workspace.path / "artifacts" / "prod_batch" / "demo_run2"
+    chunk_dir = batch_dir / "chunk_outputs" / "chapter_2" / "chunk_001"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    (chunk_dir / "source.txt").write_text("源一。\n\n源二。", encoding="utf-8")
+    (chunk_dir / "translation.vi.txt").write_text("Ra một.\n\nRa hai", encoding="utf-8")
+    (chunk_dir / "per_call_model_usage.jsonl").write_text(json.dumps({"call_type":"compression","chapter":"2","unit_id":"u002","provider":"mock","requested_model":"mock-production","chosen_model":"mock-production","fallback_model_used":False,"route_status":"ok","error_class":None})+"\n", encoding="utf-8")
+    quality = {"status":"fail","verification":{"reasons":["paragraph_truncation_detected"],"truncated_paragraphs":[{"paragraph_id":"u002","reasons":["missing_terminal_punctuation"]}],"per_paragraph_length_table":[{"paragraph_id":"u002","source_text":"源二。","source_char_count":3,"output_char_count":5}]}}
+    (chunk_dir / "quality_report.json").write_text(json.dumps(quality), encoding="utf-8")
+    (batch_dir / "chapter_results.json").parent.mkdir(parents=True, exist_ok=True)
+    (batch_dir / "chapter_results.json").write_text(json.dumps({"chapters":[{"chapter_id":"chapter_2","chapter_no":2,"status":"failed","error":"qa"}]}), encoding="utf-8")
+    (batch_dir / "batch_manifest.json").write_text(json.dumps({"status":"partial_failure"}), encoding="utf-8")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "production_rollout_summary.json").write_text(json.dumps({"batch_dir": str(batch_dir)}), encoding="utf-8")
+    result = runner.invoke(app, ["production", "diagnose-qa", "--workspace", str(workspace.path), "--run", str(run_dir), "--chapter", "2", "--json"])
+    assert result.exit_code == 0, result.output
+    md = (run_dir / "chapter_2_qa_diagnostic.md").read_text(encoding="utf-8")
+    assert "### u002" in md
+    assert "源二。" in md
+    assert "Ra hai" in md
+    assert "mock-production" in md

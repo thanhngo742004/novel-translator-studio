@@ -9,6 +9,7 @@ from typing import Any
 
 from nts_core.dictionary import load_project_dictionary
 from nts_core.production_translation import (
+    build_rollout_model_policy,
     load_production_provider,
     DEFAULT_CHUNK_OVERLAP_PARAGRAPHS,
     DEFAULT_CHUNK_SIZE_CHARS,
@@ -332,6 +333,34 @@ def diagnose_production_qa(workspace: Workspace, *, rollout_run_path: str | Path
     table = []
     for i, (sp, op) in enumerate(zip(source_paras or [source_text], output_paras or [output_text]), start=1):
         table.append({"paragraph_index": i, "source_length": len(sp), "output_length": len(op), "source_output_ratio": round(len(op)/max(len(sp),1),3)})
+    per_call_usage = []
+    usage_path = chunk_dir / "per_call_model_usage.jsonl" if chunk_dir else None
+    if usage_path and usage_path.exists():
+        per_call_usage = [json.loads(line) for line in usage_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    issue_rows = []
+    quality_table = ((quality.get("verification") or {}).get("per_paragraph_length_table") or [])
+    source_lookup = {row.get("paragraph_id"): row for row in quality_table}
+    output_lookup = {}
+    for idx, para in enumerate(output_paras, start=1):
+        output_lookup[idx] = para
+    for pid, info in by_pid.items():
+        row = source_lookup.get(pid, {})
+        para_index = None
+        try:
+            para_index = int(str(pid).lstrip("u"))
+        except Exception:
+            para_index = None
+        issue_rows.append({
+            "unit_id": pid,
+            "source_text": row.get("source_text") or "",
+            "output_text": output_lookup.get(para_index, ""),
+            "source_length": int(row.get("source_char_count") or 0),
+            "output_length": int(row.get("output_char_count") or 0),
+            "source_output_ratio": round(int(row.get("output_char_count") or 0) / max(int(row.get("source_char_count") or 1), 1), 3),
+            "detected_issue": ",".join((info.get("truncation") or {}).get("reasons") or (["strict_max"] if info.get("strict_max") else [])),
+            "repair_or_compression_attempted": any(call.get("unit_id") == pid and call.get("call_type") in {"compression","repair","retry"} for call in per_call_usage),
+            "repair_or_compression_models": sorted({str(call.get("chosen_model")) for call in per_call_usage if call.get("unit_id") == pid and call.get("call_type") in {"compression","repair","retry"}}),
+        })
     diagnostic = {
         "schema_version": "mvp5i_chapter_qa_diagnostic_v1",
         "created_at": utc_now(),
@@ -351,7 +380,25 @@ def diagnose_production_qa(workspace: Workspace, *, rollout_run_path: str | Path
         "paragraph_safety_table": table,
     }
     _write_json(run_dir / f"chapter_{chapter}_qa_diagnostic.json", diagnostic)
-    _write_text(run_dir / f"chapter_{chapter}_qa_diagnostic.md", "# Chapter QA Diagnostic\n\n" + "\n".join(f"- {k}: `{v}`" for k,v in diagnostic.items() if k != "paragraph_safety_table"))
+    md_lines = ["# Chapter QA Diagnostic", ""]
+    md_lines.extend(f"- {k}: `{v}`" for k, v in diagnostic.items() if k not in {"paragraph_safety_table", "issue_rows", "per_call_model_usage"})
+    md_lines.extend(["", "## Unit Mapping", ""])
+    for row in issue_rows:
+        md_lines.extend([
+            f"### {row['unit_id']}",
+            f"- Source length: `{row['source_length']}`",
+            f"- Output length: `{row['output_length']}`",
+            f"- Source/output ratio: `{row['source_output_ratio']}`",
+            f"- Detected issue: `{row['detected_issue']}`",
+            f"- Repair/compression attempted: `{row['repair_or_compression_attempted']}`",
+            f"- Repair/compression models: `{', '.join(row['repair_or_compression_models']) if row['repair_or_compression_models'] else 'none'}`",
+            "- Source text:",
+            row["source_text"] or "",
+            "- Output text:",
+            row["output_text"] or "",
+            "",
+        ])
+    _write_text(run_dir / f"chapter_{chapter}_qa_diagnostic.md", "\n".join(md_lines))
     _write_text(run_dir / f"chapter_{chapter}_source_output_comparison.md", f"# Chapter {chapter} Source/Output Comparison\n\n## Source\n\n{source_text[:8000]}\n\n## Output\n\n{output_text[:8000]}")
     csv = "paragraph_index,source_length,output_length,source_output_ratio\n" + "\n".join(f"{r['paragraph_index']},{r['source_length']},{r['output_length']},{r['source_output_ratio']}" for r in table)
     _write_text(run_dir / f"chapter_{chapter}_paragraph_safety_table.csv", csv)
@@ -666,6 +713,16 @@ def run_controlled_production_rollout(
         fallback_model=fallback_model,
     )
     chosen_model = preflight.get("chosen_model")
+    model_policy = build_rollout_model_policy(
+        provider_key=provider_key,
+        primary_model=model,
+        fallback_model=fallback_model,
+        chosen_model=chosen_model,
+        fallback_model_used=bool(preflight.get("fallback_model_used")),
+        primary_status=preflight.get("primary_status"),
+        fallback_status=preflight.get("fallback_status"),
+    )
+    _write_json(run_dir / "model_policy_snapshot.json", model_policy)
     if not preflight.get("pass"):
         summary = {
             "schema_version": PRODUCTION_ROLLOUT_SCHEMA,
@@ -679,6 +736,7 @@ def run_controlled_production_rollout(
             "fallback_model_status": preflight.get("fallback_status"),
             "chosen_model": None,
             "fallback_model_used": False,
+            "model_policy_snapshot_path": str(run_dir / "model_policy_snapshot.json"),
             "chapters_processed": 0,
             "chapters_failed": 0,
             "chapters_skipped": 0,
@@ -701,6 +759,7 @@ def run_controlled_production_rollout(
         project_slug=project_slug,
         provider_key=provider_key,
         model=str(chosen_model),
+        rollout_model_policy=model_policy,
         use_stable_prompt=True,
         chapters=chapters,
         max_chapters=max_chapters,
@@ -752,6 +811,7 @@ def run_controlled_production_rollout(
         "fallback_model_status": preflight.get("fallback_status"),
         "chosen_model": chosen_model,
         "fallback_model_used": bool(preflight.get("fallback_model_used")),
+        "model_policy_snapshot_path": str(run_dir / "model_policy_snapshot.json"),
         "qa_pass": qa["pass"],
         "qa_blocking_issue_count": qa["blocking_issue_count"],
         "qa_warning_count": qa["warning_count"],

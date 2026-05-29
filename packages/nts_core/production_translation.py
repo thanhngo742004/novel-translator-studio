@@ -50,6 +50,117 @@ DEFAULT_CHUNK_SIZE_CHARS = 3000
 DEFAULT_CHUNK_OVERLAP_PARAGRAPHS = 0
 
 
+
+def build_rollout_model_policy(
+    *,
+    provider_key: str,
+    primary_model: str,
+    fallback_model: str | None,
+    chosen_model: str | None,
+    fallback_model_used: bool,
+    primary_status: dict[str, Any] | None,
+    fallback_status: dict[str, Any] | None,
+) -> dict[str, Any]:
+    route_status = str((primary_status or {}).get("status") or "unknown")
+    warning = None
+    if fallback_model_used and fallback_model:
+        route_status = "fallback_selected"
+        warning = f"Primary model {primary_model} failed preflight; fallback {fallback_model} selected."
+    return {
+        "schema_version": "mvp5i_rollout_model_policy_v1",
+        "provider": provider_key,
+        "primary_model": primary_model,
+        "fallback_model": fallback_model,
+        "chosen_model": chosen_model or primary_model,
+        "fallback_model_used": bool(fallback_model_used),
+        "primary_status": primary_status or {},
+        "fallback_status": fallback_status or {},
+        "model_route_status": route_status,
+        "warning": warning,
+    }
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json_dumps(payload) + "\n")
+
+
+def _record_model_usage(artifact_dir: Path | None, payload: dict[str, Any]) -> None:
+    if artifact_dir is None:
+        return
+    _append_jsonl(artifact_dir / "per_call_model_usage.jsonl", payload)
+
+
+def _policy_call(
+    provider: EvalProvider,
+    *,
+    policy: dict[str, Any],
+    artifact_dir: Path | None,
+    call_type: str,
+    chapter: str,
+    unit_id: str | None,
+    messages: list[dict[str, str]],
+    max_tokens: int | None,
+    retry_attempts: int,
+    retry_backoff_seconds: float,
+    retry_context: dict[str, Any],
+) -> str:
+    requested_model = str(policy.get("chosen_model") or policy.get("primary_model") or "")
+    fallback_model = policy.get("fallback_model")
+    models_to_try = [requested_model]
+    if fallback_model and fallback_model not in models_to_try:
+        models_to_try.append(str(fallback_model))
+    last_exc: Exception | None = None
+    for index, model_name in enumerate(models_to_try):
+        try:
+            raw = chat_completion_with_provider_retry(
+                provider,
+                model=model_name,
+                messages=messages,
+                max_tokens=max_tokens,
+                retry_attempts=retry_attempts,
+                retry_backoff_seconds=retry_backoff_seconds,
+                retry_context=retry_context,
+            )
+            payload = {
+                "call_type": call_type,
+                "chapter": chapter,
+                "unit_id": unit_id,
+                "provider": policy.get("provider") or provider.key,
+                "requested_model": requested_model,
+                "chosen_model": model_name,
+                "fallback_model_used": index > 0 or bool(policy.get("fallback_model_used")),
+                "route_status": "fallback_runtime_success" if index > 0 else str(policy.get("model_route_status") or "ok"),
+                "error_class": None,
+            }
+            _record_model_usage(artifact_dir, payload)
+            return raw
+        except Exception as exc:
+            last_exc = exc
+            error_class = classify_provider_error(exc)
+            if error_class.get("http_status") == 404:
+                error_class["provider_error_type"] = "model_route_not_found"
+            payload = {
+                "call_type": call_type,
+                "chapter": chapter,
+                "unit_id": unit_id,
+                "provider": policy.get("provider") or provider.key,
+                "requested_model": requested_model,
+                "chosen_model": model_name,
+                "fallback_model_used": index > 0 or bool(policy.get("fallback_model_used")),
+                "route_status": error_class.get("provider_error_type") or "provider_error",
+                "error_class": error_class,
+            }
+            _record_model_usage(artifact_dir, payload)
+            if error_class.get("http_status") == 404 and index + 1 < len(models_to_try):
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise ValueError("Rollout model policy call failed without exception.")
+
+
 def _sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -472,6 +583,7 @@ def translate_chapter_stable(
     rule_max_hints: int = 4,
     support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = False,
+    rollout_model_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
         from nts_core.translation import translate_chapter_mock
@@ -482,6 +594,8 @@ def translate_chapter_stable(
         use_approved_dictionary = True
     stable_prompt = load_approved_stable_prompt(workspace, prompt_id=prompt_id)
     provider = load_production_provider(workspace, provider_key)
+    policy = rollout_model_policy or build_rollout_model_policy(provider_key=provider_key, primary_model=model, fallback_model=None, chosen_model=model, fallback_model_used=False, primary_status={"status": "direct"}, fallback_status={})
+    model = str(policy.get("chosen_model") or model)
     chapter, _segments, source_text = _chapter_source_text(workspace, chapter_id, max_source_chars)
     if source_override is not None:
         source_text = source_override
@@ -623,6 +737,7 @@ def translate_chapter_stable(
                 "chapter_id": chapter_id,
                 "provider": provider_key,
                 "model": model,
+                "rollout_model_policy": policy,
                 "prompt_id": stable_prompt.prompt_id,
                 "dry_run": dry_run,
                 "use_approved_dictionary": use_approved_dictionary,
@@ -656,10 +771,25 @@ def translate_chapter_stable(
     else:
         if provider.key == "mock":
             raw_response = _mock_paragraph_response(model, sample, glossary)
+            _record_model_usage(artifact_dir, {
+                "call_type": "translation",
+                "chapter": str(chapter.get("chapter_no") or chapter_id),
+                "unit_id": None,
+                "provider": policy.get("provider") or provider.key,
+                "requested_model": str(policy.get("primary_model") or model),
+                "chosen_model": str(policy.get("chosen_model") or model),
+                "fallback_model_used": bool(policy.get("fallback_model_used")),
+                "route_status": str(policy.get("model_route_status") or "ok"),
+                "error_class": None,
+            })
         else:
-            raw_response = chat_completion_with_provider_retry(
+            raw_response = _policy_call(
                 provider,
-                model=model,
+                policy=policy,
+                artifact_dir=artifact_dir,
+                call_type="translation",
+                chapter=str(chapter.get("chapter_no") or chapter_id),
+                unit_id=None,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -681,9 +811,13 @@ def translate_chapter_stable(
                 original_user_prompt=user_prompt,
                 raw_output=raw_response,
             )
-            raw_response = chat_completion_with_provider_retry(
+            raw_response = _policy_call(
                 provider,
-                model=model,
+                policy=policy,
+                artifact_dir=artifact_dir,
+                call_type="retry",
+                chapter=str(chapter.get("chapter_no") or chapter_id),
+                unit_id=None,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": retry_prompt},
@@ -705,6 +839,19 @@ def translate_chapter_stable(
             final_paragraphs, compression_result = compress_offending_paragraphs(
                 provider,
                 model=model,
+                provider_call=lambda **kwargs: _policy_call(
+                    provider,
+                    policy=policy,
+                    artifact_dir=artifact_dir,
+                    call_type="compression",
+                    chapter=str(chapter.get("chapter_no") or chapter_id),
+                    unit_id=str((kwargs.get("retry_context") or {}).get("paragraph_id") or "" ) or None,
+                    messages=kwargs["messages"],
+                    max_tokens=kwargs.get("max_tokens"),
+                    retry_attempts=kwargs.get("retry_attempts", 1),
+                    retry_backoff_seconds=kwargs.get("retry_backoff_seconds", 0.0),
+                    retry_context=kwargs.get("retry_context") or {},
+                ),
                 sample=sample,
                 paragraphs=parsed,
                 glossary=glossary,
@@ -716,6 +863,17 @@ def translate_chapter_stable(
             verify_paragraph_output(sample, final_paragraphs, glossary=glossary),
             sample=sample,
         )
+        _record_model_usage(artifact_dir, {
+            "call_type": "selector",
+            "chapter": str(chapter.get("chapter_no") or chapter_id),
+            "unit_id": None,
+            "provider": policy.get("provider") or provider.key,
+            "requested_model": str(policy.get("primary_model") or model),
+            "chosen_model": str(policy.get("chosen_model") or model),
+            "fallback_model_used": bool(policy.get("fallback_model_used")),
+            "route_status": str(policy.get("model_route_status") or "ok"),
+            "error_class": None,
+        })
         selector = final_output_selector(
             sample=sample,
             before_paragraphs=parsed,
@@ -811,6 +969,12 @@ def translate_chapter_stable(
         )
         conn.commit()
 
+    usage_rows = []
+    usage_path = artifact_dir / "per_call_model_usage.jsonl"
+    if usage_path.exists():
+        usage_rows = [json.loads(line) for line in usage_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    (artifact_dir / "compression_model_usage_report.json").write_text(json_dumps({"rows": [row for row in usage_rows if row.get("call_type") == "compression"]}) + "\n", encoding="utf-8")
+    (artifact_dir / "repair_model_usage_report.json").write_text(json_dumps({"rows": [row for row in usage_rows if row.get("call_type") in {"repair", "retry", "selector"}]}) + "\n", encoding="utf-8")
     manifest = {
         "run_id": run_id,
         "project_id": project["id"],
@@ -839,7 +1003,11 @@ def translate_chapter_stable(
         "hybrid_conflict_count": int((hybrid_context or {}).get("conflict_count") or 0),
         "dictionary_prompt_block_rendered": bool((dictionary_context or {}).get("block_rendered")),
         "dictionary_selected_hit_count": len((dictionary_context or {}).get("selected_hits") or []),
+        "rollout_model_policy": policy,
+        "model_policy_snapshot_path": str(artifact_dir / "model_policy_snapshot.json"),
+        "per_call_model_usage_path": str(artifact_dir / "per_call_model_usage.jsonl"),
     }
+    (artifact_dir / "model_policy_snapshot.json").write_text(json_dumps(policy) + "\n", encoding="utf-8")
     manifest_path.write_text(json_dumps(manifest) + "\n", encoding="utf-8")
     if status == "quality_failed":
         raise ValueError("Production translation failed deterministic quality checks.")
@@ -869,7 +1037,11 @@ def translate_chapter_stable(
         "hybrid_selected_rule_count": len((hybrid_context or {}).get("selected_rule_items") or []),
         "hybrid_conflict_count": int((hybrid_context or {}).get("conflict_count") or 0),
         "dictionary_selected_hit_count": len((dictionary_context or {}).get("selected_hits") or []),
+        "rollout_model_policy": policy,
+        "model_policy_snapshot_path": str(artifact_dir / "model_policy_snapshot.json"),
+        "per_call_model_usage_path": str(artifact_dir / "per_call_model_usage.jsonl"),
     }
+    (artifact_dir / "model_policy_snapshot.json").write_text(json_dumps(policy) + "\n", encoding="utf-8")
 
 
 def parse_chapter_range(value: str) -> list[int]:
@@ -999,6 +1171,7 @@ def translate_batch_stable(
     rule_max_hints: int = 4,
     support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = False,
+    rollout_model_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
         raise ValueError("--use-stable-prompt is required for MVP5A batch translation.")
@@ -1135,6 +1308,7 @@ def translate_batch_stable(
                     rule_max_hints=rule_max_hints,
                     support_max_chars=support_max_chars,
                     emit_prompt_artifacts=emit_prompt_artifacts,
+                    rollout_model_policy=rollout_model_policy,
                 )
                 actual_api_calls += 1
                 chunk_text = Path(chunk_result["output_path"]).read_text(encoding="utf-8")
@@ -1222,6 +1396,7 @@ def translate_batch_stable(
                 "chapter_no": chapter.get("chapter_no"),
                 "provider": provider_key,
                 "model": model,
+                "rollout_model_policy": rollout_model_policy,
                 "no_translation_output_produced": True,
                 **provider_failure,
             }
@@ -1268,6 +1443,7 @@ def translate_batch_stable(
         "use_approved_rules": use_approved_rules,
         "rule_max_hints": rule_max_hints,
         "support_max_chars": support_max_chars,
+        "rollout_model_policy": rollout_model_policy,
         "started_at": started_at,
         "completed_at": completed_at,
         "status": status,
