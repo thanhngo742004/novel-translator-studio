@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -119,7 +120,7 @@ from nts_core.production_translation import (
     translate_batch_stable,
     translate_chapter_stable,
 )
-from nts_core.production_rollout import run_controlled_production_rollout
+from nts_core.production_rollout import diagnose_production_qa, run_controlled_production_rollout, write_provider_preflight
 from nts_core.rules import (
     ablate_rule_prompt_impact,
     approve_rule_candidates,
@@ -621,6 +622,7 @@ def translate_batch(
     project: Annotated[str, typer.Option("--project", help="Project slug.")],
     provider: Annotated[str, typer.Option("--provider")],
     model: Annotated[str, typer.Option("--model")],
+    fallback_model: Annotated[Optional[str], typer.Option("--fallback-model")] = None,
     workspace: WorkspaceOption = None,
     use_stable_prompt: Annotated[
         bool,
@@ -722,6 +724,7 @@ def production_rollout_command(
     project: Annotated[str, typer.Option("--project", help="Project slug.")],
     provider: Annotated[str, typer.Option("--provider")],
     model: Annotated[str, typer.Option("--model")],
+    fallback_model: Annotated[Optional[str], typer.Option("--fallback-model")] = None,
     workspace: WorkspaceOption = None,
     chapters: Annotated[str, typer.Option("--chapters", help="Chapter range, e.g. 1-10.")] = "1-10",
     max_chapters: Annotated[int, typer.Option("--max-chapters")] = 10,
@@ -735,6 +738,7 @@ def production_rollout_command(
     support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
     emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts/--no-emit-prompt-artifacts")] = True,
     resumable: Annotated[bool, typer.Option("--resumable/--no-resumable")] = True,
+    canary: Annotated[bool, typer.Option("--canary/--no-canary")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     output_dir: Annotated[Optional[Path], typer.Option("--output-dir")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
@@ -750,6 +754,7 @@ def production_rollout_command(
             project_slug=project,
             provider_key=provider,
             model=model,
+            fallback_model=fallback_model,
             chapters=chapters,
             max_chapters=max_chapters,
             max_real_calls=max_real_calls,
@@ -759,12 +764,49 @@ def production_rollout_command(
             emit_prompt_artifacts=emit_prompt_artifacts,
             resumable=resumable,
             dry_run=dry_run,
+            canary=canary,
             output_dir=output_dir,
         )
     except StablePromptBlocker as exc:
         _fail("STABLE_PROMPT_BLOCKED", str(exc), 4, json_output)
     except (WorkspaceError, ValueError) as exc:
         _fail("PRODUCTION_ROLLOUT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@production_app.command("preflight")
+def production_preflight_command(
+    provider: Annotated[str, typer.Option("--provider")],
+    model: Annotated[str, typer.Option("--model")],
+    workspace: WorkspaceOption = None,
+    fallback_model: Annotated[Optional[str], typer.Option("--fallback-model")] = None,
+    project: Annotated[str, typer.Option("--project")] = "preflight",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        run_dir = ws.path / "artifacts" / "production_rollout" / f"{project}_preflight_{int(time.time() * 1000)}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        result = write_provider_preflight(ws, run_dir=run_dir, provider_key=provider, primary_model=model, fallback_model=fallback_model)
+        result["run_dir"] = str(run_dir)
+        result["provider_preflight_path"] = str(run_dir / "provider_preflight.json")
+    except (WorkspaceError, ValueError) as exc:
+        _fail("PROVIDER_PREFLIGHT_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@production_app.command("diagnose-qa")
+def production_diagnose_qa_command(
+    run: Annotated[str, typer.Option("--run", help="Rollout run path or id.")],
+    chapter: Annotated[int, typer.Option("--chapter")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = diagnose_production_qa(ws, rollout_run_path=run, chapter=chapter)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("PRODUCTION_QA_DIAGNOSTIC_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)
 
 

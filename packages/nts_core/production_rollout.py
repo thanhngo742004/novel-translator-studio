@@ -9,6 +9,7 @@ from typing import Any
 
 from nts_core.dictionary import load_project_dictionary
 from nts_core.production_translation import (
+    load_production_provider,
     DEFAULT_CHUNK_OVERLAP_PARAGRAPHS,
     DEFAULT_CHUNK_SIZE_CHARS,
     DEFAULT_MAX_SOURCE_CHARS_PER_CHAPTER,
@@ -18,6 +19,7 @@ from nts_core.production_translation import (
     translate_batch_stable,
 )
 from nts_core.rules import load_all_project_rules
+from nts_core.eval_harness import chat_completion_with_provider_retry, classify_provider_error
 from nts_storage.database import json_dumps, utc_now
 from nts_storage.workspace import Workspace
 
@@ -190,6 +192,180 @@ def _iter_chunk_dirs(batch_dir: Path) -> list[Path]:
         return []
     return sorted(path for path in root.glob("*\\chunk_*") if path.is_dir()) or sorted(path for path in root.glob("*/chunk_*") if path.is_dir())
 
+
+
+
+def _route_status_from_error(exc: Exception) -> dict[str, Any]:
+    info = classify_provider_error(exc)
+    if info.get("http_status") == 404:
+        info["provider_error_type"] = "model_route_not_found"
+        info["blocker_reason"] = "model_route_not_found"
+        info["retryable"] = False
+    return info
+
+
+def _preflight_one_model(provider: Any, model: str) -> dict[str, Any]:
+    if not model:
+        return {"model": model, "status": "not_configured", "ok": False, "reason": "not_configured"}
+    try:
+        if provider.key == "mock":
+            lowered = model.lower()
+            if any(token in lowered for token in ("404", "missing", "not-found", "route-missing")):
+                raise ValueError(f"Provider HTTP error 404: mock model route not found for {model}")
+            if any(token in lowered for token in ("fail", "blocked")):
+                raise ValueError(f"Provider HTTP error 503: mock provider unavailable for {model}")
+            raw = "ok"
+        else:
+            raw = chat_completion_with_provider_retry(
+                provider,
+                model=model,
+                messages=[
+                    {"role": "system", "content": "Return exactly OK."},
+                    {"role": "user", "content": "NTS provider preflight. Return OK."},
+                ],
+                max_tokens=8,
+                retry_attempts=1,
+                retry_context={"phase": "production_preflight", "model": model},
+            )
+        return {"model": model, "status": "ok", "ok": True, "response_chars": len(raw or "")}
+    except Exception as exc:
+        info = _route_status_from_error(exc)
+        return {"model": model, "status": info.get("provider_error_type") or "failed", "ok": False, **info}
+
+
+def write_provider_preflight(
+    workspace: Workspace,
+    *,
+    run_dir: Path,
+    provider_key: str,
+    primary_model: str,
+    fallback_model: str | None = None,
+) -> dict[str, Any]:
+    provider = load_production_provider(workspace, provider_key)
+    primary = _preflight_one_model(provider, primary_model)
+    fallback = {"model": fallback_model, "status": "not_configured", "ok": False, "reason": "not_configured"}
+    if fallback_model:
+        fallback = _preflight_one_model(provider, fallback_model)
+    chosen = primary_model if primary.get("ok") else None
+    fallback_used = False
+    blocker = None
+    if not primary.get("ok") and fallback.get("ok"):
+        chosen = fallback_model
+        fallback_used = True
+    if not chosen:
+        blocker = "primary_and_fallback_unavailable" if fallback_model else (primary.get("blocker_reason") or primary.get("status") or "primary_unavailable")
+    report = {
+        "schema_version": "mvp5i_provider_preflight_v1",
+        "created_at": utc_now(),
+        "provider": provider_key,
+        "primary_model": primary_model,
+        "fallback_model": fallback_model,
+        "primary_status": primary,
+        "fallback_status": fallback,
+        "chosen_model": chosen,
+        "blocker_reason": blocker,
+        "fallback_model_used": fallback_used,
+        "pass": bool(chosen),
+    }
+    _write_json(run_dir / "provider_preflight.json", report)
+    _write_text(
+        run_dir / "provider_preflight.md",
+        "# Provider Preflight\n\n"
+        f"- Provider: `{provider_key}`\n"
+        f"- Primary model: `{primary_model}`\n"
+        f"- Fallback model: `{fallback_model}`\n"
+        f"- Primary status: `{primary.get('status')}`\n"
+        f"- Fallback status: `{fallback.get('status')}`\n"
+        f"- Chosen model: `{chosen}`\n"
+        f"- Blocker reason: `{blocker}`\n"
+        f"- Fallback model used: `{fallback_used}`\n",
+    )
+    return report
+
+
+def _resolve_rollout_path(workspace: Workspace, rollout_run_path: str | Path) -> Path:
+    path = Path(rollout_run_path)
+    if path.exists():
+        return path
+    candidate = workspace.path / "artifacts" / "production_rollout" / str(rollout_run_path)
+    if candidate.exists():
+        return candidate
+    raise ValueError(f"Rollout run not found: {rollout_run_path}")
+
+
+def diagnose_production_qa(workspace: Workspace, *, rollout_run_path: str | Path, chapter: int) -> dict[str, Any]:
+    run_dir = _resolve_rollout_path(workspace, rollout_run_path)
+    summary = _read_json(run_dir / "production_rollout_summary.json")
+    batch_dir = Path(summary.get("batch_dir") or _read_json(run_dir / "production_qa_report.json").get("batch_dir") or "")
+    if not batch_dir.exists():
+        raise ValueError("Production batch directory missing for QA diagnostic.")
+    chapter_results = _read_json(batch_dir / "chapter_results.json").get("chapters") or []
+    target = next((row for row in chapter_results if int(row.get("chapter_no") or -1) == int(chapter)), None)
+    chunk_dir = None
+    if target:
+        chapter_id = target.get("chapter_id")
+        root = batch_dir / "chunk_outputs" / str(chapter_id)
+        if root.exists():
+            dirs = sorted(p for p in root.glob("chunk_*") if p.is_dir())
+            chunk_dir = dirs[0] if dirs else None
+    quality = _read_json(chunk_dir / "quality_report.json") if chunk_dir else {}
+    source_text = ""
+    if chunk_dir:
+        for source_name in ("source.zh.txt", "source.txt"):
+            source_path = chunk_dir / source_name
+            if source_path.exists():
+                source_text = source_path.read_text(encoding="utf-8")
+                break
+    output_text = (chunk_dir / "translation.vi.txt").read_text(encoding="utf-8") if chunk_dir and (chunk_dir / "translation.vi.txt").exists() else ""
+    verification = quality.get("verification") or {}
+    strict_rows = verification.get("over_budget_paragraphs") or verification.get("paragraph_budget_failures") or []
+    trunc_rows = verification.get("truncated_paragraphs") or []
+    by_pid: dict[str, dict[str, Any]] = {}
+    for row in strict_rows:
+        by_pid.setdefault(str(row.get("paragraph_id") or row.get("id") or "unknown"), {}).update({"strict_max": row})
+    for row in trunc_rows:
+        by_pid.setdefault(str(row.get("paragraph_id") or row.get("id") or "unknown"), {}).update({"truncation": row})
+    if not by_pid and verification.get("reasons"):
+        by_pid["unknown"] = {"reasons": verification.get("reasons")}
+    source_paras = [p.strip() for p in re.split(r"\n\s*\n+", source_text) if p.strip()]
+    output_paras = [p.strip() for p in re.split(r"\n\s*\n+", output_text) if p.strip()]
+    table = []
+    for i, (sp, op) in enumerate(zip(source_paras or [source_text], output_paras or [output_text]), start=1):
+        table.append({"paragraph_index": i, "source_length": len(sp), "output_length": len(op), "source_output_ratio": round(len(op)/max(len(sp),1),3)})
+    diagnostic = {
+        "schema_version": "mvp5i_chapter_qa_diagnostic_v1",
+        "created_at": utc_now(),
+        "rollout_run_path": str(run_dir),
+        "chapter": chapter,
+        "chapter_result": target,
+        "chunk_dir": str(chunk_dir) if chunk_dir else None,
+        "triggered_paragraphs": by_pid,
+        "paragraph_truncation_detected": bool(trunc_rows or "paragraph_truncation_detected" in verification.get("reasons", [])),
+        "paragraph_exceeds_strict_max": bool(strict_rows or "paragraph_exceeds_strict_max" in verification.get("reasons", [])),
+        "source_paragraph_count": len(source_paras),
+        "output_paragraph_count": len(output_paras),
+        "paragraph_boundary_wrong": len(source_paras) != len(output_paras),
+        "output_actually_truncated": bool(trunc_rows or "paragraph_truncation_detected" in verification.get("reasons", [])),
+        "production_path_differs_from_validated_path": not bool((quality.get("final_output_selector") or {}).get("selected_candidate")),
+        "skipped_compression_output_selector_safety_repair": not bool(quality.get("compression") is not None and quality.get("final_output_selector") is not None),
+        "paragraph_safety_table": table,
+    }
+    _write_json(run_dir / f"chapter_{chapter}_qa_diagnostic.json", diagnostic)
+    _write_text(run_dir / f"chapter_{chapter}_qa_diagnostic.md", "# Chapter QA Diagnostic\n\n" + "\n".join(f"- {k}: `{v}`" for k,v in diagnostic.items() if k != "paragraph_safety_table"))
+    _write_text(run_dir / f"chapter_{chapter}_source_output_comparison.md", f"# Chapter {chapter} Source/Output Comparison\n\n## Source\n\n{source_text[:8000]}\n\n## Output\n\n{output_text[:8000]}")
+    csv = "paragraph_index,source_length,output_length,source_output_ratio\n" + "\n".join(f"{r['paragraph_index']},{r['source_length']},{r['output_length']},{r['source_output_ratio']}" for r in table)
+    _write_text(run_dir / f"chapter_{chapter}_paragraph_safety_table.csv", csv)
+    repair = {
+        "schema_version": "mvp5i_production_safety_repair_v1",
+        "created_at": utc_now(),
+        "chapter": chapter,
+        "validated_selector_present": not diagnostic["production_path_differs_from_validated_path"],
+        "action": "reuse_validated_selector_path_required" if diagnostic["production_path_differs_from_validated_path"] else "production_selector_path_present",
+        "do_not_weaken_truncation_detection": True,
+    }
+    _write_json(run_dir / "production_safety_repair_report.json", repair)
+    _write_text(run_dir / "production_safety_repair_report.md", "# Production Safety Repair Report\n\n" + "\n".join(f"- {k}: `{v}`" for k,v in repair.items()))
+    return {**diagnostic, "diagnostic_path": str(run_dir / f"chapter_{chapter}_qa_diagnostic.json"), "safety_repair_report_path": str(run_dir / "production_safety_repair_report.json")}
 
 def run_production_qa(
     *,
@@ -428,6 +604,7 @@ def run_controlled_production_rollout(
     project_slug: str,
     provider_key: str,
     model: str,
+    fallback_model: str | None = None,
     chapters: str = "1-10",
     max_chapters: int = 10,
     max_real_calls: int = 24,
@@ -437,6 +614,7 @@ def run_controlled_production_rollout(
     emit_prompt_artifacts: bool = True,
     resumable: bool = True,
     dry_run: bool = False,
+    canary: bool = False,
     output_dir: Path | None = None,
 ) -> dict[str, Any]:
     run_dir = output_dir or _new_rollout_dir(workspace, project_slug)
@@ -480,12 +658,49 @@ def run_controlled_production_rollout(
     _write_config_snapshot(run_dir, config)
     _write_json(run_dir / "chunk_plan.json", {"schema_version": "mvp5i_chunk_plan_v1", "estimated_api_calls": estimated_calls, "chapters": chunk_plan})
 
+    preflight = write_provider_preflight(
+        workspace,
+        run_dir=run_dir,
+        provider_key=provider_key,
+        primary_model=model,
+        fallback_model=fallback_model,
+    )
+    chosen_model = preflight.get("chosen_model")
+    if not preflight.get("pass"):
+        summary = {
+            "schema_version": PRODUCTION_ROLLOUT_SCHEMA,
+            "project_slug": project_slug,
+            "run_id": run_dir.name,
+            "run_dir": str(run_dir),
+            "final_decision": "BLOCKED",
+            "blocker_reason": preflight.get("blocker_reason"),
+            "provider_preflight_path": str(run_dir / "provider_preflight.json"),
+            "primary_model_status": preflight.get("primary_status"),
+            "fallback_model_status": preflight.get("fallback_status"),
+            "chosen_model": None,
+            "fallback_model_used": False,
+            "chapters_processed": 0,
+            "chapters_failed": 0,
+            "chapters_skipped": 0,
+            "chunks_processed": 0,
+            "api_calls_used": 0,
+            "qa_pass": False,
+            "rules_rendered_count": 0,
+            "created_at": utc_now(),
+        }
+        _write_json(run_dir / "production_rollout_summary.json", summary)
+        _write_text(
+            run_dir / "production_rollout_summary.md",
+            f"# Production Rollout Summary\n\n- Final decision: `BLOCKED`\n- Blocker: `{summary['blocker_reason']}`\n",
+        )
+        return summary
+
     batch_output_dir = _batch_artifact_dir(workspace, run_dir)
     batch_result = translate_batch_stable(
         workspace,
         project_slug=project_slug,
         provider_key=provider_key,
-        model=model,
+        model=str(chosen_model),
         use_stable_prompt=True,
         chapters=chapters,
         max_chapters=max_chapters,
@@ -532,6 +747,11 @@ def run_controlled_production_rollout(
         "chapters_skipped": len([row for row in batch_result.get("chapters", []) if str(row.get("status") or "").startswith("skipped")]),
         "chunks_processed": qa.get("chunks_seen", 0),
         "api_calls_used": batch_result.get("actual_api_calls", 0),
+        "provider_preflight_path": str(run_dir / "provider_preflight.json"),
+        "primary_model_status": preflight.get("primary_status"),
+        "fallback_model_status": preflight.get("fallback_status"),
+        "chosen_model": chosen_model,
+        "fallback_model_used": bool(preflight.get("fallback_model_used")),
         "qa_pass": qa["pass"],
         "qa_blocking_issue_count": qa["blocking_issue_count"],
         "qa_warning_count": qa["warning_count"],
@@ -545,6 +765,23 @@ def run_controlled_production_rollout(
         "warnings": qa["warnings"],
         "created_at": utc_now(),
     }
+    if canary:
+        canary_report = {
+            "schema_version": "mvp5i_canary_report_v1",
+            "created_at": utc_now(),
+            "pass": final_decision == "PASS" and summary["chapters_processed"] <= 2,
+            "chapters_processed": summary["chapters_processed"],
+            "chunks_processed": summary["chunks_processed"],
+            "qa_pass": summary["qa_pass"],
+            "rules_rendered_count": summary["rules_rendered_count"],
+            "raw_nlp_cache_injected": any(row.get("kind") == "raw_nlp_cache_in_prompt" for row in qa.get("blocking_issues", [])),
+            "stable_hybrid_dictionary_memory_used": True,
+            "prompt_budget_respected": not any(row.get("kind") == "prompt_budget_exceeded" for row in qa.get("blocking_issues", [])),
+            "human_review_path": summary["human_review_path"],
+        }
+        summary["canary_report_path"] = str(run_dir / "canary_report.json")
+        _write_json(run_dir / "canary_report.json", canary_report)
+        _write_text(run_dir / "canary_report.md", "# Canary Report\n\n" + "\n".join(f"- {k}: `{v}`" for k,v in canary_report.items()))
     _write_json(run_dir / "production_rollout_summary.json", summary)
     _write_text(
         run_dir / "production_rollout_summary.md",

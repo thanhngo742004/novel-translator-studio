@@ -16,6 +16,7 @@ from nts_core.dictionary import build_dictionary_prompt_support
 from nts_core.hybrid_prompt import build_hybrid_prompt_support
 from nts_core.eval_harness import (
     EvalProvider,
+    classify_provider_error,
     active_eval_pairs,
     chat_completion_with_provider_retry,
     compress_offending_paragraphs,
@@ -1208,6 +1209,23 @@ def translate_batch_stable(
             )
         except Exception as exc:  # keep batch resumable; caller controls stop_on_error
             failed.append(chapter_id)
+            provider_failure = classify_provider_error(exc)
+            if provider_failure.get("http_status") == 404:
+                provider_failure["provider_error_type"] = "model_route_not_found"
+                provider_failure["retryable"] = False
+            report_path = batch_dir / "provider_failure_reports" / f"{chapter_label}_provider_failure_report.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_payload = {
+                "schema_version": "mvp5i_provider_failure_report_v1",
+                "created_at": utc_now(),
+                "chapter_id": chapter_id,
+                "chapter_no": chapter.get("chapter_no"),
+                "provider": provider_key,
+                "model": model,
+                "no_translation_output_produced": True,
+                **provider_failure,
+            }
+            report_path.write_text(json_dumps(report_payload) + "\n", encoding="utf-8")
             chapter_results.append(
                 {
                     "chapter_id": chapter_id,
@@ -1219,6 +1237,8 @@ def translate_batch_stable(
                     "quality_summary": {},
                     "warnings": [],
                     "error": str(exc),
+                    "provider_failure_report": str(report_path),
+                    "provider_failure_type": provider_failure.get("provider_error_type"),
                     "chunk_count": 0,
                 }
             )

@@ -308,3 +308,79 @@ def test_production_rollout_rejects_rule_prompt_rendering_flag(tmp_path: Path, m
     assert result.exit_code != 0
     payload = parse_json(result.output)
     assert "verifier-only" in payload["error"]["message"]
+
+
+def test_provider_preflight_primary_404_fallback_success(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    workspace_path = _workspace_with_text(tmp_path, "第1章 一\n\nHero enters Dao Sect.")
+    _write_stable_prompt(workspace_path)
+    result = runner.invoke(app, ["production", "preflight", "--workspace", str(workspace_path), "--provider", "mock", "--model", "mock-404", "--fallback-model", "mock-production", "--json"])
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["pass"] is True
+    assert data["primary_status"]["status"] == "model_route_not_found"
+    assert data["chosen_model"] == "mock-production"
+    assert data["fallback_model_used"] is True
+    assert Path(data["provider_preflight_path"]).exists()
+
+
+def test_provider_preflight_both_404_blocked(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    workspace_path = _workspace_with_text(tmp_path, "第1章 一\n\nHero enters Dao Sect.")
+    result = runner.invoke(app, ["production", "preflight", "--workspace", str(workspace_path), "--provider", "mock", "--model", "mock-404", "--fallback-model", "fallback-404", "--json"])
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["pass"] is False
+    assert data["blocker_reason"] == "primary_and_fallback_unavailable"
+
+
+def test_rollout_stops_before_batch_when_preflight_blocked(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    workspace_path = _workspace_with_text(tmp_path, "第1章 一\n\nHero enters Dao Sect.")
+    _write_stable_prompt(workspace_path)
+    result = runner.invoke(app, ["production", "rollout", "--workspace", str(workspace_path), "--project", "demo", "--provider", "mock", "--model", "mock-404", "--fallback-model", "fallback-404", "--chapters", "1", "--max-chapters", "1", "--json"])
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["final_decision"] == "BLOCKED"
+    assert data["api_calls_used"] == 0
+    assert Path(data["provider_preflight_path"]).exists()
+    assert not (Path(data["run_dir"]).parent.parent / "prod_batch" / Path(data["run_dir"]).name / "batch_manifest.json").exists()
+
+
+def test_canary_mode_limited_and_no_rule_rendering(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    workspace_path = _workspace_with_text(tmp_path, "第1章 一\n\nHero enters Dao Sect.\n\n第2章 二\n\nHero keeps practicing Dao.")
+    _write_stable_prompt(workspace_path)
+    result = runner.invoke(app, ["production", "rollout", "--workspace", str(workspace_path), "--project", "demo", "--provider", "mock", "--model", "mock-production", "--chapters", "1-2", "--max-chapters", "2", "--canary", "--json"])
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["final_decision"] == "PASS"
+    assert data["chapters_processed"] <= 2
+    assert data["rules_rendered_count"] == 0
+    canary = json.loads(Path(data["canary_report_path"]).read_text(encoding="utf-8"))
+    assert canary["pass"] is True
+    assert canary["raw_nlp_cache_injected"] is False
+
+
+def test_diagnose_qa_identifies_truncation_and_strict_max(tmp_path: Path) -> None:
+    workspace = init_workspace(tmp_path / "ws")
+    run_dir = workspace.path / "artifacts" / "production_rollout" / "demo_run"
+    batch_dir = workspace.path / "artifacts" / "prod_batch" / "demo_run"
+    chunk_dir = batch_dir / "chunk_outputs" / "chapter_2" / "chunk_001"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    (chunk_dir / "source.zh.txt").write_text("源段一很长。\n\n源段二也很长。", encoding="utf-8")
+    (chunk_dir / "translation.vi.txt").write_text("Đoạn một bị", encoding="utf-8")
+    (chunk_dir / "quality_report.json").write_text(json.dumps({"status":"fail","verification":{"reasons":["paragraph_exceeds_strict_max","paragraph_truncation_detected"],"truncated_paragraphs":[{"paragraph_id":"p1"}],"over_budget_paragraphs":[{"paragraph_id":"p1","strict_max":10,"output_length":20}]}}), encoding="utf-8")
+    (batch_dir / "chapter_results.json").parent.mkdir(parents=True, exist_ok=True)
+    (batch_dir / "chapter_results.json").write_text(json.dumps({"chapters":[{"chapter_id":"chapter_2","chapter_no":2,"status":"failed","error":"Production translation failed deterministic quality checks."}]}), encoding="utf-8")
+    (batch_dir / "batch_manifest.json").write_text(json.dumps({"status":"partial_failure"}), encoding="utf-8")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "production_rollout_summary.json").write_text(json.dumps({"batch_dir": str(batch_dir)}), encoding="utf-8")
+    result = runner.invoke(app, ["production", "diagnose-qa", "--workspace", str(workspace.path), "--run", str(run_dir), "--chapter", "2", "--json"])
+    assert result.exit_code == 0, result.output
+    data = parse_json(result.output)["data"]
+    assert data["paragraph_truncation_detected"] is True
+    assert data["paragraph_exceeds_strict_max"] is True
+    assert Path(data["diagnostic_path"]).exists()
+    assert (run_dir / "chapter_2_paragraph_safety_table.csv").exists()
+    assert Path(data["safety_repair_report_path"]).exists()
