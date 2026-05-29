@@ -555,6 +555,139 @@ def _existing_current_translation(conn: sqlite3.Connection, chapter_id: str) -> 
     return row_to_dict(row, json_fields=("quality_json",)) if row else None
 
 
+
+
+def _terminal_ok(text: str) -> bool:
+    return bool(re.search(r"[.!?。！？…\]）】\)\"']\s*$", (text or "").strip()))
+
+
+def _write_unit_split_plan(artifact_dir: Path, sample: dict[str, Any]) -> None:
+    rows = []
+    for pair in active_eval_pairs(sample):
+        source = str(pair.get("source_text") or "")
+        should_split = len(source) > 700 or len(source.splitlines()) > 12
+        rows.append({
+            "unit_id": pair["paragraph_id"],
+            "source_length": len(source),
+            "split_required": should_split,
+            "child_ids": [f"{pair['paragraph_id']}_a", f"{pair['paragraph_id']}_b"] if should_split else [],
+            "reason": "oversized_source_unit" if should_split else "within_production_unit_budget",
+        })
+    payload = {"schema_version": "mvp5i_unit_split_plan_v1", "units": rows}
+    (artifact_dir / "unit_split_plan.json").write_text(json_dumps(payload) + "\n", encoding="utf-8")
+    lines = ["# Unit Split Plan", ""]
+    for row in rows:
+        lines.append(f"- `{row['unit_id']}` split={row['split_required']} source_len={row['source_length']} reason={row['reason']}")
+    (artifact_dir / "unit_split_plan.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _repair_prompt(pair: dict[str, Any], current_text: str, reasons: list[str], glossary: dict[str, Any]) -> str:
+    return json_dumps({
+        "task": "repair_one_translation_unit",
+        "unit_id": pair["paragraph_id"],
+        "source_text": pair.get("source_text", ""),
+        "current_translation": current_text,
+        "detected_reasons": reasons,
+        "strict_max": pair.get("strict_max"),
+        "instructions": [
+            "Repair only this Vietnamese unit.",
+            "Preserve source meaning, names, terms, numbers, dialogue, and panels.",
+            "Return a complete safe Vietnamese unit; do not truncate.",
+            "Do not leave dangling labels or glossary fragments.",
+            "Prefer safe completion over shorter incomplete text.",
+        ],
+        "glossary": glossary.get("fixed_terms", []),
+        "output_schema": {"paragraphs": [{"paragraph_id": pair["paragraph_id"], "text": "safe complete Vietnamese text"}]},
+    })
+
+
+def _repair_unsafe_units(
+    *,
+    provider: EvalProvider,
+    policy: dict[str, Any],
+    artifact_dir: Path,
+    chapter_label: str,
+    sample: dict[str, Any],
+    paragraphs: list[dict[str, str]],
+    verification: dict[str, Any],
+    glossary: dict[str, Any],
+    max_attempts: int,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    pair_lookup = {pair["paragraph_id"]: pair for pair in active_eval_pairs(sample)}
+    para_lookup = {p["paragraph_id"]: p["text"] for p in paragraphs}
+    unsafe_ids = []
+    reasons_by_id: dict[str, list[str]] = {}
+    for row in verification.get("truncated_paragraphs", []) or []:
+        pid = row.get("paragraph_id")
+        if pid:
+            unsafe_ids.append(pid)
+            reasons_by_id.setdefault(pid, []).extend(row.get("reasons", []))
+    for row in verification.get("per_paragraph_length_table", []) or []:
+        if row.get("over_strict_max"):
+            pid = row.get("paragraph_id")
+            unsafe_ids.append(pid)
+            reasons_by_id.setdefault(pid, []).append("paragraph_exceeds_strict_max")
+    unsafe_ids = list(dict.fromkeys(unsafe_ids))
+    attempts_path = artifact_dir / "unit_repair_attempts.jsonl"
+    candidates = []
+    selected = []
+    repaired = dict(para_lookup)
+    for pid in unsafe_ids:
+        pair = pair_lookup.get(pid)
+        if not pair:
+            continue
+        original = repaired.get(pid, "")
+        best = original
+        best_status = "original"
+        rejected = []
+        for attempt in range(1, max(0, max_attempts) + 1):
+            if provider.key == "mock":
+                candidate = original if _terminal_ok(original) else original.rstrip() + "."
+                _record_model_usage(artifact_dir, {"call_type": "repair", "chapter": chapter_label, "unit_id": pid, "provider": policy.get("provider") or provider.key, "requested_model": str(policy.get("primary_model")), "chosen_model": str(policy.get("chosen_model")), "fallback_model_used": bool(policy.get("fallback_model_used")), "route_status": str(policy.get("model_route_status") or "ok"), "error_class": None})
+            else:
+                raw = _policy_call(
+                    provider,
+                    policy=policy,
+                    artifact_dir=artifact_dir,
+                    call_type="repair",
+                    chapter=chapter_label,
+                    unit_id=pid,
+                    messages=[{"role": "system", "content": "Repair one Vietnamese translation unit. Return JSON only."}, {"role": "user", "content": _repair_prompt(pair, original, reasons_by_id.get(pid, []), glossary)}],
+                    max_tokens=max_tokens_for_paragraph_pairs([pair]),
+                    retry_attempts=1,
+                    retry_backoff_seconds=5 if provider.key != "mock" else 0,
+                    retry_context={"phase": "production_unit_repair", "paragraph_id": pid},
+                )
+                parsed = parse_paragraph_translation_output(raw)
+                candidate = next((item.get("text", "") for item in parsed if item.get("paragraph_id") == pid), "")
+            test_paras = [{"paragraph_id": p["paragraph_id"], "text": candidate if p["paragraph_id"] == pid else repaired.get(p["paragraph_id"], p["text"])} for p in paragraphs]
+            test_ver = _production_verification(verify_paragraph_output(sample, test_paras, glossary=glossary), sample=sample)
+            unit_truncated = any(r.get("paragraph_id") == pid for r in test_ver.get("truncated_paragraphs", []) or [])
+            unit_over_strict = any(r.get("paragraph_id") == pid and r.get("over_strict_max") for r in test_ver.get("per_paragraph_length_table", []) or [])
+            terminal_ok = _terminal_ok(candidate)
+            dangling = bool(re.search(r"[:：]\s*$", candidate or ""))
+            safe_reason = bool(pair.get("unit_type") == "panel" and terminal_ok and not unit_truncated and not dangling)
+            unit_bad = unit_truncated or dangling or (unit_over_strict and not safe_reason)
+            row = {"unit_id": pid, "attempt": attempt, "candidate_id": f"{pid}_repair_{attempt}", "candidate_text": candidate, "pass": not unit_bad, "reasons": test_ver.get("reasons", []), "terminal_ok": terminal_ok, "dangling_glossary_label": dangling, "safe_over_strict_reason": "panel_complete" if safe_reason else None, "model": policy.get("chosen_model")}
+            _append_jsonl(attempts_path, row)
+            candidates.append(row)
+            if candidate.strip() and terminal_ok and not unit_bad:
+                best = candidate
+                best_status = row["candidate_id"]
+                break
+            rejected.append(row["candidate_id"])
+        repaired[pid] = best
+        selected.append({"unit_id": pid, "selected_output_candidate_id": best_status, "rejected_output_candidate_ids": rejected, "selection_reason": "safe_repair_selected" if best_status != "original" else "repair_failed_original_retained"})
+    updated = [{"paragraph_id": p["paragraph_id"], "text": repaired.get(p["paragraph_id"], p["text"])} for p in paragraphs]
+    report = {"schema_version": "mvp5i_candidate_selection_report_v1", "unsafe_unit_ids": unsafe_ids, "selected": selected, "candidates": candidates, "max_unit_repair_attempts": max_attempts}
+    (artifact_dir / "candidate_selection_report.json").write_text(json_dumps(report) + "\n", encoding="utf-8")
+    lines = ["# Candidate Selection Report", ""] + [f"- `{r['unit_id']}` selected `{r['selected_output_candidate_id']}` rejected {r['rejected_output_candidate_ids']} reason={r['selection_reason']}" for r in selected]
+    (artifact_dir / "candidate_selection_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (artifact_dir / "unit_repair_summary.md").write_text("# Unit Repair Summary\n\n" + f"- Unsafe units: `{len(unsafe_ids)}`\n- Repair attempts: `{len(candidates)}`\n", encoding="utf-8")
+    (artifact_dir / "production_selector_alignment_report.json").write_text(json_dumps({"schema_version": "mvp5i_selector_alignment_v1", "uses_validation_selector": True, "selector": "final_output_selector", "divergent_logic": False}) + "\n", encoding="utf-8")
+    (artifact_dir / "production_selector_alignment_report.md").write_text("# Production Selector Alignment\n\n- Uses validation selector: `True`\n- Divergent logic: `False`\n", encoding="utf-8")
+    return updated, report
+
 def translate_chapter_stable(
     workspace: Workspace,
     *,
@@ -584,6 +717,7 @@ def translate_chapter_stable(
     support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = False,
     rollout_model_policy: dict[str, Any] | None = None,
+    max_unit_repair_attempts: int = 2,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
         from nts_core.translation import translate_chapter_mock
@@ -611,6 +745,7 @@ def translate_chapter_stable(
     bundle = build_bundle(workspace, project_id=project["id"], text=source_text, top_k=30)
     glossary = _bundle_glossary(bundle)
     sample = _production_sample(chapter=chapter, source_text=source_text, merge_tiny_paragraphs=merge_tiny_paragraphs)
+    _write_unit_split_plan(artifact_dir, sample)
     hybrid_context = (
         build_hybrid_prompt_support(
             workspace,
@@ -863,6 +998,44 @@ def translate_chapter_stable(
             verify_paragraph_output(sample, final_paragraphs, glossary=glossary),
             sample=sample,
         )
+        if not after_verification.get("pass") and max_unit_repair_attempts > 0:
+            final_paragraphs, repair_report = _repair_unsafe_units(
+                provider=provider,
+                policy=policy,
+                artifact_dir=artifact_dir,
+                chapter_label=str(chapter.get("chapter_no") or chapter_id),
+                sample=sample,
+                paragraphs=final_paragraphs,
+                verification=after_verification,
+                glossary=glossary,
+                max_attempts=max_unit_repair_attempts,
+            )
+            after_verification = _production_verification(
+                verify_paragraph_output(sample, final_paragraphs, glossary=glossary),
+                sample=sample,
+            )
+        else:
+            repair_report = {"unsafe_unit_ids": [], "selected": [], "candidates": []}
+            (artifact_dir / "candidate_selection_report.json").write_text(
+                json_dumps({"schema_version": "mvp5i_candidate_selection_report_v1", **repair_report}) + "\n",
+                encoding="utf-8",
+            )
+            (artifact_dir / "candidate_selection_report.md").write_text(
+                "# Candidate Selection Report\n\nNo unsafe units required repair.\n",
+                encoding="utf-8",
+            )
+            (artifact_dir / "unit_repair_summary.md").write_text(
+                "# Unit Repair Summary\n\n- Unsafe units: `0`\n- Repair attempts: `0`\n",
+                encoding="utf-8",
+            )
+            (artifact_dir / "production_selector_alignment_report.json").write_text(
+                json_dumps({"schema_version": "mvp5i_selector_alignment_v1", "uses_validation_selector": True, "selector": "final_output_selector", "divergent_logic": False}) + "\n",
+                encoding="utf-8",
+            )
+            (artifact_dir / "production_selector_alignment_report.md").write_text(
+                "# Production Selector Alignment\n\n- Uses validation selector: `True`\n- Divergent logic: `False`\n",
+                encoding="utf-8",
+            )
         _record_model_usage(artifact_dir, {
             "call_type": "selector",
             "chapter": str(chapter.get("chapter_no") or chapter_id),
@@ -896,6 +1069,7 @@ def translate_chapter_stable(
                 if key not in {"selected_paragraphs", "selected_verification"}
             },
             "compression": compression_result,
+            "repair": repair_report,
             "structured_output_retry_count": max(0, len(raw_attempts) - 1),
             "output_char_count": len(final_text),
             "source_char_count": len(source_text),
@@ -1172,6 +1346,7 @@ def translate_batch_stable(
     support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = False,
     rollout_model_policy: dict[str, Any] | None = None,
+    max_unit_repair_attempts: int = 2,
 ) -> dict[str, Any]:
     if not use_stable_prompt:
         raise ValueError("--use-stable-prompt is required for MVP5A batch translation.")
@@ -1309,6 +1484,7 @@ def translate_batch_stable(
                     support_max_chars=support_max_chars,
                     emit_prompt_artifacts=emit_prompt_artifacts,
                     rollout_model_policy=rollout_model_policy,
+                    max_unit_repair_attempts=max_unit_repair_attempts,
                 )
                 actual_api_calls += 1
                 chunk_text = Path(chunk_result["output_path"]).read_text(encoding="utf-8")

@@ -120,7 +120,7 @@ from nts_core.production_translation import (
     translate_batch_stable,
     translate_chapter_stable,
 )
-from nts_core.production_rollout import diagnose_production_qa, run_controlled_production_rollout, write_provider_preflight
+from nts_core.production_rollout import diagnose_production_qa, diagnose_unit_safety, run_controlled_production_rollout, write_provider_preflight
 from nts_core.rules import (
     ablate_rule_prompt_impact,
     approve_rule_candidates,
@@ -581,6 +581,7 @@ def translate_text(
     memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
     rule_max_hints: Annotated[int, typer.Option("--rule-max-hints")] = 4,
     support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
+    max_unit_repair_attempts: Annotated[int, typer.Option("--max-unit-repair-attempts")] = 2,
     emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
@@ -608,6 +609,7 @@ def translate_text(
             memory_max_items=memory_max_items,
             rule_max_hints=rule_max_hints,
             support_max_chars=support_max_chars,
+            max_unit_repair_attempts=max_unit_repair_attempts,
             emit_prompt_artifacts=emit_prompt_artifacts,
         )
     except StablePromptBlocker as exc:
@@ -674,6 +676,7 @@ def translate_batch(
     memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
     rule_max_hints: Annotated[int, typer.Option("--rule-max-hints")] = 4,
     support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
+    max_unit_repair_attempts: Annotated[int, typer.Option("--max-unit-repair-attempts")] = 2,
     emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
@@ -710,6 +713,7 @@ def translate_batch(
             memory_max_items=memory_max_items,
             rule_max_hints=rule_max_hints,
             support_max_chars=support_max_chars,
+            max_unit_repair_attempts=max_unit_repair_attempts,
             emit_prompt_artifacts=emit_prompt_artifacts,
         )
     except StablePromptBlocker as exc:
@@ -736,6 +740,7 @@ def production_rollout_command(
     dictionary_max_entries: Annotated[int, typer.Option("--dictionary-max-entries")] = 8,
     memory_max_items: Annotated[int, typer.Option("--memory-max-items")] = 6,
     support_max_chars: Annotated[int, typer.Option("--support-max-chars")] = 1200,
+    max_unit_repair_attempts: Annotated[int, typer.Option("--max-unit-repair-attempts")] = 2,
     emit_prompt_artifacts: Annotated[bool, typer.Option("--emit-prompt-artifacts/--no-emit-prompt-artifacts")] = True,
     resumable: Annotated[bool, typer.Option("--resumable/--no-resumable")] = True,
     canary: Annotated[bool, typer.Option("--canary/--no-canary")] = False,
@@ -761,6 +766,7 @@ def production_rollout_command(
             dictionary_max_entries=dictionary_max_entries,
             memory_max_items=memory_max_items,
             support_max_chars=support_max_chars,
+            max_unit_repair_attempts=max_unit_repair_attempts,
             emit_prompt_artifacts=emit_prompt_artifacts,
             resumable=resumable,
             dry_run=dry_run,
@@ -807,6 +813,21 @@ def production_diagnose_qa_command(
         result = diagnose_production_qa(ws, rollout_run_path=run, chapter=chapter)
     except (WorkspaceError, ValueError) as exc:
         _fail("PRODUCTION_QA_DIAGNOSTIC_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
+
+
+@production_app.command("diagnose-unit-safety")
+def production_diagnose_unit_safety_command(
+    run: Annotated[str, typer.Option("--run", help="Rollout run path or id.")],
+    chapter: Annotated[int, typer.Option("--chapter")],
+    workspace: WorkspaceOption = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = diagnose_unit_safety(ws, rollout_run_path=run, chapter=chapter)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("PRODUCTION_UNIT_SAFETY_DIAGNOSTIC_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)
 
 

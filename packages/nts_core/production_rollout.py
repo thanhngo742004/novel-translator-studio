@@ -414,6 +414,76 @@ def diagnose_production_qa(workspace: Workspace, *, rollout_run_path: str | Path
     _write_text(run_dir / "production_safety_repair_report.md", "# Production Safety Repair Report\n\n" + "\n".join(f"- {k}: `{v}`" for k,v in repair.items()))
     return {**diagnostic, "diagnostic_path": str(run_dir / f"chapter_{chapter}_qa_diagnostic.json"), "safety_repair_report_path": str(run_dir / "production_safety_repair_report.json")}
 
+
+
+def diagnose_unit_safety(workspace: Workspace, *, rollout_run_path: str | Path, chapter: int) -> dict[str, Any]:
+    base = diagnose_production_qa(workspace, rollout_run_path=rollout_run_path, chapter=chapter)
+    run_dir = _resolve_rollout_path(workspace, rollout_run_path)
+    chunk_dir = Path(base.get("chunk_dir") or "")
+    quality = _read_json(chunk_dir / "quality_report.json") if chunk_dir.exists() else {}
+    output_text = (chunk_dir / "translation.vi.txt").read_text(encoding="utf-8") if (chunk_dir / "translation.vi.txt").exists() else ""
+    output_paras = [p.strip() for p in re.split(r"\n\s*\n+", output_text) if p.strip()]
+    verification = quality.get("verification") or {}
+    rows = []
+    unsafe = set()
+    issue_by_id: dict[str, list[str]] = {}
+    for row in verification.get("truncated_paragraphs", []) or []:
+        pid = str(row.get("paragraph_id"))
+        unsafe.add(pid)
+        issue_by_id.setdefault(pid, []).extend(row.get("reasons", []))
+    for row in verification.get("per_paragraph_length_table", []) or []:
+        if row.get("over_strict_max"):
+            pid = str(row.get("paragraph_id"))
+            unsafe.add(pid)
+            issue_by_id.setdefault(pid, []).append("paragraph_exceeds_strict_max")
+    usage = []
+    usage_path = chunk_dir / "per_call_model_usage.jsonl"
+    if usage_path.exists():
+        usage = [json.loads(line) for line in usage_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    selection = _read_json(chunk_dir / "candidate_selection_report.json") if (chunk_dir / "candidate_selection_report.json").exists() else {}
+    selected_by_id = {row.get("unit_id"): row for row in selection.get("selected", []) or []}
+    for item in verification.get("per_paragraph_length_table", []) or []:
+        pid = str(item.get("paragraph_id"))
+        if pid not in unsafe:
+            continue
+        idx = None
+        try:
+            idx = int(pid.lstrip("u"))
+        except ValueError:
+            pass
+        output = output_paras[idx - 1] if idx and idx <= len(output_paras) else ""
+        sel = selected_by_id.get(pid, {})
+        rows.append({
+            "unit_id": pid,
+            "source_text": item.get("source_text") or "",
+            "output_text": output,
+            "source_length": item.get("source_char_count", 0),
+            "output_length": item.get("output_char_count", len(output)),
+            "ratio": round((item.get("output_char_count", len(output)) or 0) / max(int(item.get("source_char_count") or 1), 1), 3),
+            "issue_type": sorted(set(issue_by_id.get(pid, []))),
+            "terminal_punctuation_status": _terminal_ok(output),
+            "dangling_glossary_label_status": bool(re.search(r"[:：]\s*$", output)),
+            "repair_attempted": any(call.get("call_type") == "repair" and call.get("unit_id") == pid for call in usage),
+            "compression_attempted": any(call.get("call_type") == "compression" and call.get("unit_id") == pid for call in usage),
+            "selected_output_candidate_id": sel.get("selected_output_candidate_id"),
+            "rejected_output_candidate_ids": sel.get("rejected_output_candidate_ids", []),
+            "selection_reason": sel.get("selection_reason"),
+        })
+    payload = {"schema_version": "mvp5i_unit_safety_diagnostic_v1", "chapter": chapter, "unsafe_unit_count": len(rows), "unsafe_units": rows}
+    _write_json(run_dir / f"chapter_{chapter}_unit_safety_diagnostic.json", payload)
+    md = ["# Unit Safety Diagnostic", ""]
+    for row in rows:
+        md.extend([f"## {row['unit_id']}", f"- Issues: `{', '.join(row['issue_type'])}`", f"- Source/output: `{row['source_length']}` / `{row['output_length']}` ratio `{row['ratio']}`", f"- Terminal punctuation ok: `{row['terminal_punctuation_status']}`", f"- Dangling label: `{row['dangling_glossary_label_status']}`", f"- Repair/compression attempted: `{row['repair_attempted']}` / `{row['compression_attempted']}`", f"- Selected candidate: `{row['selected_output_candidate_id']}`", f"- Rejected candidates: `{row['rejected_output_candidate_ids']}`", "### Source", row['source_text'], "### Output", row['output_text'], ""])
+    _write_text(run_dir / f"chapter_{chapter}_unit_safety_diagnostic.md", "\n".join(md))
+    csv = "unit_id,source_length,output_length,ratio,issue_type,terminal_punctuation_ok,dangling_label,repair_attempted,compression_attempted,selected_candidate\n" + "\n".join(f"{r['unit_id']},{r['source_length']},{r['output_length']},{r['ratio']},{'|'.join(r['issue_type'])},{r['terminal_punctuation_status']},{r['dangling_glossary_label_status']},{r['repair_attempted']},{r['compression_attempted']},{r.get('selected_output_candidate_id') or ''}" for r in rows)
+    _write_text(run_dir / f"chapter_{chapter}_unit_safety_table.csv", csv)
+    _write_text(run_dir / f"chapter_{chapter}_source_output_alignment.md", "# Source Output Alignment\n\n" + "\n\n".join(f"## {r['unit_id']}\n\nSource:\n{r['source_text']}\n\nOutput:\n{r['output_text']}" for r in rows))
+    return {**payload, "diagnostic_path": str(run_dir / f"chapter_{chapter}_unit_safety_diagnostic.json"), "table_path": str(run_dir / f"chapter_{chapter}_unit_safety_table.csv")}
+
+
+def _terminal_ok(text: str) -> bool:
+    return bool(re.search(r"[.!?。！？…\]）】\)\"']\s*$", (text or "").strip()))
+
 def run_production_qa(
     *,
     rollout_dir: Path,
@@ -659,6 +729,7 @@ def run_controlled_production_rollout(
     memory_max_items: int = 6,
     support_max_chars: int = 1200,
     emit_prompt_artifacts: bool = True,
+    max_unit_repair_attempts: int = 2,
     resumable: bool = True,
     dry_run: bool = False,
     canary: bool = False,
@@ -777,6 +848,7 @@ def run_controlled_production_rollout(
         use_approved_rules=False,
         support_max_chars=support_max_chars,
         emit_prompt_artifacts=emit_prompt_artifacts,
+        max_unit_repair_attempts=max_unit_repair_attempts,
     )
     qa = run_production_qa(rollout_dir=run_dir, batch_dir=Path(batch_result["batch_dir"]), max_support_chars=support_max_chars)
     provider_blocked = (
