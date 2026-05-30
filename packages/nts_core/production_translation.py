@@ -308,11 +308,19 @@ def _production_verification(
     for entry in adjusted.get("truncated_paragraphs", []):
         pair = pair_lookup.get(entry.get("paragraph_id"), {})
         truncation_reasons = entry.get("reasons", [])
+        source_for_pair = str(pair.get("source_text", ""))
         if (
             truncation_reasons == ["missing_terminal_punctuation"]
-            and CHAPTER_HEADING_RE.match(str(pair.get("source_text", "")))
+            and CHAPTER_HEADING_RE.match(source_for_pair)
         ):
             warnings.append("heading_without_terminal_punctuation_allowed")
+            continue
+        if (
+            truncation_reasons == ["missing_terminal_punctuation"]
+            and str(pair.get("production_unit_class") or "") in {"pre_panel_label", "risky_short_unit", "system_panel", "stat_line"}
+            and not any(reason in truncation_reasons for reason in ("dangling_glossary_label", "suspicious_fragment_ending"))
+        ):
+            warnings.append("panel_or_separator_terminal_allowed")
             continue
         truncated.append(entry)
     adjusted["truncated_paragraphs"] = truncated
@@ -326,9 +334,10 @@ def _production_verification(
         ]
         if (
             overlong_rows
-            and all(row.get("output_reference_ratio", 99) <= 1.8 for row in overlong_rows)
+            and all(row.get("output_reference_ratio", 99) <= 1.35 for row in overlong_rows)
             and not truncated
             and not adjusted.get("terminology_mismatches")
+            and all(str(row.get("unit_type") or "") in {"panel", "system_panel", "stat_line"} for row in overlong_rows)
         ):
             reasons.remove("paragraph_exceeds_strict_max")
             warnings.append("estimated_paragraph_budget_exceeded_reference_unavailable")
@@ -380,9 +389,7 @@ def _production_sample(
         "paragraph_pairs": pairs,
     }
     if merge_tiny_paragraphs:
-        from nts_core.eval_harness import apply_translation_units
-
-        return apply_translation_units([sample], merge_tiny_paragraphs=True)[0]
+        return _apply_production_unit_plan(sample)
     return sample
 
 
@@ -408,6 +415,9 @@ def build_production_prompt(
             "- Preserve required names, terms, numbers, dialogue, and system panels.",
             "- Return JSON only with {\"paragraphs\":[{\"paragraph_id\":\"...\",\"text\":\"...\"}]}",
             "- There is no human reference; use conservative length budgets and avoid over-expansion.",
+            "- Treat target_max and strict_max as hard character budgets for each paragraph_id.",
+            "- For pre-panel labels ending with a colon, translate as a complete Vietnamese setup sentence ending with a period, not a dangling colon.",
+            "- For dialogue/narration, keep the Vietnamese compact; do not add explanatory phrases.",
         ]
     )
     system_prompt = "\n".join(system_sections)
@@ -496,11 +506,13 @@ def _mock_paragraph_response(model: str, sample: dict[str, Any], glossary: dict[
             target = str(term.get("target", ""))
             if source and target:
                 text = text.replace(source, target)
-        if text and not re.search(r"[.!?。！？…】）)\"]$", text):
+        stripped = text.strip()
+        if stripped.endswith((":", "：")):
+            text = stripped[:-1].rstrip() + "."
+        elif text and not re.search(r'[.!?。！？…】）)"\']$', text):
             text = f"{text}."
-        paragraphs.append({"paragraph_id": pair["paragraph_id"], "text": f"[MOCK {model}] {text}"})
+        paragraphs.append({"paragraph_id": pair["paragraph_id"], "text": text})
     return json_dumps({"paragraphs": paragraphs})
-
 
 def _insert_model_run(
     conn: sqlite3.Connection,
@@ -557,22 +569,273 @@ def _existing_current_translation(conn: sqlite3.Connection, chapter_id: str) -> 
 
 
 
+
+
+def _is_separator_line(text: str) -> bool:
+    return bool(re.fullmatch(r"[-–—=_*~.\s]{3,}", (text or "").strip()))
+
+def _split_dialogue_and_separator(text: str) -> list[str] | None:
+    stripped = (text or "").strip()
+    match = re.search(r"(.+?)(\s+[-–—=_*~.]{3,})$", stripped)
+    if not match:
+        return None
+    leading = match.group(1).strip()
+    trailing = match.group(2).strip()
+    if not leading or not _is_separator_line(trailing):
+        return None
+    return [leading, trailing]
+
+def _sentence_split_parts(text: str, *, max_part_chars: int = 56, max_parts: int = 2) -> list[str]:
+    stripped = (text or "").strip()
+    if not stripped:
+        return []
+    parts = [part.strip() for part in re.split(r"(?<=[。！？!?…])", stripped) if part.strip()]
+    if len(parts) <= 1:
+        return [stripped]
+    groups: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = f"{current}{part}" if current else part
+        if current and len(candidate) > max_part_chars and len(groups) + 1 < max_parts:
+            groups.append(current.strip())
+            current = part
+        else:
+            current = candidate
+    if current.strip():
+        groups.append(current.strip())
+    return groups or [stripped]
+
+def _classify_production_pair(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped:
+        return "empty"
+    if CHAPTER_HEADING_RE.match(stripped):
+        return "system_panel"
+    if _is_separator_line(stripped):
+        return "system_panel"
+    if stripped.startswith("【") and stripped.endswith("】") and len(stripped) > 60:
+        stat_markers = ("修为", "法器", "神通", "法术", "灵根", "资质", "姓名", "寿命", "种族")
+        descriptive_punctuation = stripped.count("，") + stripped.count("。") + stripped.count("；") + stripped.count("：")
+        if descriptive_punctuation >= 3 and not any(marker in stripped[:12] for marker in stat_markers):
+            return "mixed_panel_narration"
+    if stripped.startswith("【") and stripped.endswith("】"):
+        if any(token in stripped for token in ("修为", "法器", "神通", "法术", "灵根", "资质", "姓名", "寿命", "种族")):
+            return "stat_line"
+        return "system_panel"
+    if stripped.endswith(("：", ":")):
+        return "pre_panel_label"
+    if "【" in stripped and "】" in stripped and len(stripped) > 180:
+        return "mixed_panel_narration"
+    if re.search(r"^[0-9０-９]+[、,.:：)]", stripped) or re.search(r"[：:][^\n]{1,40}$", stripped):
+        return "glossary_label"
+    if len(stripped) <= 24:
+        return "short_action"
+    if len(stripped) <= 50:
+        return "risky_short_unit"
+    if any(mark in stripped for mark in ('“', '”', '"')):
+        return "dialogue"
+    if len(stripped) > 180:
+        return "oversized_unit"
+    return "narration"
+
+def _split_source_text(text: str, *, production_unit_class: str | None = None) -> list[str]:
+    stripped = (text or "").strip()
+    if not stripped:
+        return []
+    dialogue_split = _split_dialogue_and_separator(stripped)
+    if dialogue_split:
+        return dialogue_split
+    if production_unit_class == "mixed_panel_narration" and len(stripped) > 40:
+        inner = stripped[1:-1].strip() if stripped.startswith("【") and stripped.endswith("】") else stripped
+        comma_parts = [part.strip() for part in re.split(r"(?<=，)", inner) if part.strip()]
+        if len(comma_parts) > 3:
+            groups: list[str] = []
+            current = ""
+            max_group_chars = 48
+            for part in comma_parts:
+                candidate = f"{current}{part}" if current else part
+                if current and len(candidate) > max_group_chars and len(groups) < 2:
+                    groups.append(current.strip())
+                    current = part
+                else:
+                    current = candidate
+            if current.strip():
+                groups.append(current.strip())
+            if len(groups) > 1:
+                groups[0] = f"【{groups[0].lstrip('【')}"
+                groups[-1] = f"{groups[-1].rstrip('】')}】"
+                return groups[:3]
+        if any(mark in inner for mark in ("。", "！", "？", "!", "?", "…")):
+            sentence_parts = [part.strip() for part in re.split(r"(?<=[。！？!?…])", inner) if part.strip()]
+            sentence_parts = [part for part in sentence_parts if re.search(r"[\w一-鿿]", part)]
+            if len(sentence_parts) > 1:
+                sentence_parts[0] = f"【{sentence_parts[0].lstrip('【')}"
+                sentence_parts[-1] = f"{sentence_parts[-1].rstrip('】')}】"
+                return sentence_parts[:3]
+        parts = _sentence_split_parts(inner, max_part_chars=72, max_parts=3)
+        if len(parts) > 1:
+            parts[0] = f"【{parts[0].lstrip('【')}"
+            parts[-1] = f"{parts[-1].rstrip('】')}】"
+            return parts
+    if production_unit_class == "narration" and len(stripped) > 60 and any(mark in stripped for mark in ("，", "。", "；")):
+        comma_parts = [part.strip() for part in re.split(r"(?<=，)", stripped) if part.strip()]
+        if len(comma_parts) > 2:
+            first = "".join(comma_parts[: max(2, len(comma_parts) // 2)]).strip()
+            second = "".join(comma_parts[max(2, len(comma_parts) // 2):]).strip()
+            return [first, second]
+        parts = _sentence_split_parts(stripped, max_part_chars=80, max_parts=3)
+        if len(parts) > 1:
+            return parts
+    if len(stripped) <= 220:
+        return [stripped]
+    return _sentence_split_parts(stripped, max_part_chars=180, max_parts=3)
+
+def _compact_pair_budget(pair: dict[str, Any]) -> dict[str, Any]:
+    pair = dict(pair)
+    cls = _classify_production_pair(str(pair.get("source_text") or ""))
+    source_len = int(pair.get("source_char_count") or len(str(pair.get("source_text") or "")))
+    if cls == "system_panel":
+        target_count = max(20, int(source_len * 1.4) + 10)
+        strict_ratio = 2.05
+    elif cls == "stat_line":
+        target_count = max(20, int(source_len * 1.4) + 10)
+        strict_ratio = 2.05
+    elif cls in {"pre_panel_label", "glossary_label"}:
+        target_count = max(20, int(source_len * 1.55) + 8)
+        strict_ratio = 2.0
+    elif cls == "short_action":
+        target_count = max(24, int(source_len * 2.05) + 10)
+        strict_ratio = 2.15
+    elif cls == "risky_short_unit":
+        target_count = max(30, int(source_len * 2.15) + 12)
+        strict_ratio = 2.2
+    elif cls == "mixed_panel_narration":
+        target_count = max(72, int(source_len * 1.55) + 16)
+        strict_ratio = 1.9
+    elif cls == "oversized_unit":
+        target_count = max(96, int(source_len * 1.45) + 16)
+        strict_ratio = 1.8
+    elif cls == "dialogue":
+        target_count = max(42, int(source_len * 1.65) + 14)
+        strict_ratio = 1.95
+    else:
+        target_count = max(36, int(source_len * 1.55) + 12)
+        strict_ratio = 1.9
+    pair.update({
+        "production_unit_class": cls,
+        "target_char_count": target_count,
+        "reference_char_count": target_count,
+        "target_text": "x" * target_count,
+        "reference_text": "x" * target_count,
+        "target_min": max(1, int(target_count * 0.70)),
+        "target_max": max(1, int(target_count * 1.20)),
+        "strict_max": max(int(target_count * strict_ratio), int(source_len * strict_ratio)),
+        "strict_max_ratio": strict_ratio,
+        "budget_policy_used": f"production_{cls}_compact" if cls in {"system_panel", "stat_line", "pre_panel_label", "glossary_label", "short_action", "risky_short_unit", "mixed_panel_narration", "oversized_unit"} else pair.get("budget_policy_used", "production_estimated_no_reference"),
+    })
+    return pair
+
+def _apply_production_unit_plan(sample: dict[str, Any]) -> dict[str, Any]:
+    original_pairs = [_compact_pair_budget(pair) for pair in sample.get("paragraph_pairs", [])]
+    units = []
+    split_rows = []
+    for idx, pair in enumerate(original_pairs, start=1):
+        unit_id = f"u{idx:03d}"
+        source_parts = _split_source_text(str(pair.get("source_text") or ""), production_unit_class=str(pair.get("production_unit_class") or ""))
+        split_required = len(source_parts) > 1 and (
+            pair.get("production_unit_class") in {"oversized_unit", "dialogue", "narration", "mixed_panel_narration"}
+            or any(_is_separator_line(part) for part in source_parts)
+        )
+        child_ids: list[str] = []
+        if split_required:
+            for child_index, part in enumerate(source_parts, start=1):
+                child_id = f"{unit_id}_{chr(96 + child_index)}"
+                child_ids.append(child_id)
+                child = _compact_pair_budget({**pair, "source_text": part, "source_char_count": len(part)})
+                if str(pair.get("production_unit_class") or "") == "mixed_panel_narration":
+                    child["production_unit_class"] = "mixed_panel_narration"
+                child.update({
+                    "unit_id": child_id,
+                    "paragraph_id": child_id,
+                    "source_paragraph_ids": [pair["paragraph_id"]],
+                    "target_paragraph_ids": [pair["paragraph_id"]],
+                    "original_paragraph_ids": [pair["paragraph_id"]],
+                    "parent_unit_id": unit_id,
+                    "unit_type": child.get("production_unit_class", "narration"),
+                    "merge_reason": "production_pretranslate_split",
+                    "is_merged_unit": False,
+                    "original_paragraph_count": 1,
+                    "split_child": True,
+                })
+                units.append(child)
+        else:
+            unit = dict(pair)
+            unit.update({
+                "unit_id": unit_id,
+                "paragraph_id": unit_id,
+                "source_paragraph_ids": [pair["paragraph_id"]],
+                "target_paragraph_ids": [pair["paragraph_id"]],
+                "original_paragraph_ids": [pair["paragraph_id"]],
+                "unit_type": "panel" if pair.get("production_unit_class") in {"system_panel", "stat_line", "pre_panel_label", "glossary_label"} else pair.get("production_unit_class", "narration"),
+                "merge_reason": "production_one_input_one_output",
+                "is_merged_unit": False,
+                "original_paragraph_count": 1,
+                "split_child": False,
+            })
+            units.append(unit)
+        split_rows.append({
+            "unit_id": unit_id,
+            "source_length": len(str(pair.get("source_text") or "")),
+            "split_required": split_required,
+            "child_ids": child_ids,
+            "reason": "oversized_source_unit" if split_required else "within_production_unit_budget",
+        })
+    updated = dict(sample)
+    updated["paragraph_pairs"] = original_pairs
+    updated["translation_units"] = units
+    updated["use_translation_units"] = True
+    updated["translation_unit_merge_count"] = 0
+    updated["production_unit_plan_enabled"] = True
+    updated["production_unit_split_rows"] = split_rows
+    return updated
+
+def _write_production_unit_reports(artifact_dir: Path, sample: dict[str, Any]) -> None:
+    rows = []
+    for pair in active_eval_pairs(sample):
+        rows.append({
+            "unit_id": pair["paragraph_id"],
+            "source_paragraph_ids": pair.get("source_paragraph_ids", []),
+            "classification": pair.get("production_unit_class") or pair.get("unit_type"),
+            "source_length": pair.get("source_char_count", 0),
+            "target_max": pair.get("target_max"),
+            "strict_max": pair.get("strict_max"),
+            "budget_policy_used": pair.get("budget_policy_used"),
+            "mode": "compact_panel_short_line" if pair.get("production_unit_class") in {"system_panel", "stat_line", "pre_panel_label", "risky_short_unit", "mixed_panel_narration"} else "standard",
+        })
+    payload = {"schema_version": "mvp5i_production_unit_plan_v1", "unit_count": len(rows), "units": rows}
+    (artifact_dir / "production_unit_plan.json").write_text(json_dumps(payload) + "\n", encoding="utf-8")
+    (artifact_dir / "unit_classification_report.json").write_text(json_dumps(payload) + "\n", encoding="utf-8")
+    lines = ["# Production Unit Plan", ""] + [f"- `{r['unit_id']}` {r['classification']} mode={r['mode']} strict_max={r['strict_max']}" for r in rows]
+    (artifact_dir / "production_unit_plan.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (artifact_dir / "unit_classification_report.md").write_text("\n".join(["# Unit Classification Report", ""] + lines[2:]) + "\n", encoding="utf-8")
+    csv = "unit_id,classification,source_length,target_max,strict_max,budget_policy_used,mode\n" + "\n".join(f"{r['unit_id']},{r['classification']},{r['source_length']},{r['target_max']},{r['strict_max']},{r['budget_policy_used']},{r['mode']}" for r in rows)
+    (artifact_dir / "unit_classification_table.csv").write_text(csv + "\n", encoding="utf-8")
+
 def _terminal_ok(text: str) -> bool:
     return bool(re.search(r"[.!?。！？…\]）】\)\"']\s*$", (text or "").strip()))
 
 
 def _write_unit_split_plan(artifact_dir: Path, sample: dict[str, Any]) -> None:
-    rows = []
-    for pair in active_eval_pairs(sample):
-        source = str(pair.get("source_text") or "")
-        should_split = len(source) > 700 or len(source.splitlines()) > 12
-        rows.append({
-            "unit_id": pair["paragraph_id"],
-            "source_length": len(source),
-            "split_required": should_split,
-            "child_ids": [f"{pair['paragraph_id']}_a", f"{pair['paragraph_id']}_b"] if should_split else [],
-            "reason": "oversized_source_unit" if should_split else "within_production_unit_budget",
-        })
+    rows = list(sample.get("production_unit_split_rows") or [])
+    if not rows:
+        for pair in active_eval_pairs(sample):
+            rows.append({
+                "unit_id": pair["paragraph_id"],
+                "source_length": len(str(pair.get("source_text") or "")),
+                "split_required": False,
+                "child_ids": [],
+                "reason": "within_production_unit_budget",
+            })
     payload = {"schema_version": "mvp5i_unit_split_plan_v1", "units": rows}
     (artifact_dir / "unit_split_plan.json").write_text(json_dumps(payload) + "\n", encoding="utf-8")
     lines = ["# Unit Split Plan", ""]
@@ -595,6 +858,8 @@ def _repair_prompt(pair: dict[str, Any], current_text: str, reasons: list[str], 
             "Return a complete safe Vietnamese unit; do not truncate.",
             "Do not leave dangling labels or glossary fragments.",
             "Prefer safe completion over shorter incomplete text.",
+            "If the unit is over strict_max, materially compress sentence structure and remove explanatory connective wording not explicit in the source.",
+            "For mixed_panel_narration units, keep the bracketed prophecy compact and image-driven; avoid repeating subjects or adding interpretive phrases.",
         ],
         "glossary": glossary.get("fixed_terms", []),
         "output_schema": {"paragraphs": [{"paragraph_id": pair["paragraph_id"], "text": "safe complete Vietnamese text"}]},
@@ -745,6 +1010,7 @@ def translate_chapter_stable(
     bundle = build_bundle(workspace, project_id=project["id"], text=source_text, top_k=30)
     glossary = _bundle_glossary(bundle)
     sample = _production_sample(chapter=chapter, source_text=source_text, merge_tiny_paragraphs=merge_tiny_paragraphs)
+    _write_production_unit_reports(artifact_dir, sample)
     _write_unit_split_plan(artifact_dir, sample)
     hybrid_context = (
         build_hybrid_prompt_support(

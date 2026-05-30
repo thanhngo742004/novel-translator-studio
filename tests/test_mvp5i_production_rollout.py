@@ -6,9 +6,18 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from nts_cli.main import app
+from nts_core.eval_harness import terminology_mismatches_for
 from nts_core.memory import create_memory_item
 from nts_core.production_rollout import run_production_qa
 from nts_core.projects import get_project_by_slug
+from nts_core.production_translation import (
+    _apply_production_unit_plan,
+    _compact_pair_budget,
+    _classify_production_pair,
+    _production_verification,
+    _repair_unsafe_units,
+    _split_source_text,
+)
 from nts_storage.database import connection, json_dumps, utc_now
 from nts_storage.workspace import init_workspace
 
@@ -445,3 +454,180 @@ def test_diagnostic_markdown_maps_unit_rows(tmp_path: Path) -> None:
     assert "源二。" in md
     assert "Ra hai" in md
     assert "mock-production" in md
+
+
+def test_oversized_unit_creates_split_plan_and_preserves_order() -> None:
+    sample = {
+        "paragraph_pairs": [
+            {
+                "paragraph_id": "p001",
+                "source_text": "短句。",
+                "source_char_count": 3,
+                "target_char_count": 8,
+                "target_min": 5,
+                "target_max": 10,
+                "strict_max": 12,
+                "strict_max_ratio": 1.5,
+            },
+            {
+                "paragraph_id": "p002",
+                "source_text": "第一句。第二句。第三句。第四句。第五句。第六句。" * 12,
+                "source_char_count": len("第一句。第二句。第三句。第四句。第五句。第六句。" * 12),
+                "target_char_count": 120,
+                "target_min": 80,
+                "target_max": 140,
+                "strict_max": 180,
+                "strict_max_ratio": 1.5,
+            },
+        ]
+    }
+    planned = _apply_production_unit_plan(sample)
+    unit_ids = [unit["unit_id"] for unit in planned["translation_units"]]
+    assert unit_ids[0] == "u001"
+    assert unit_ids[1].startswith("u002_")
+    assert planned["production_unit_split_rows"][1]["split_required"] is True
+    assert planned["production_unit_split_rows"][1]["child_ids"] == [unit_id for unit_id in unit_ids if unit_id.startswith("u002_")]
+
+
+def test_production_classifier_covers_short_and_glossary_units() -> None:
+    assert _classify_production_pair("姓名：") == "pre_panel_label"
+    assert _classify_production_pair("1、剑修") == "glossary_label"
+    assert _classify_production_pair("冲！") == "short_action"
+
+
+def test_long_bracketed_destiny_panel_classified_as_mixed_panel_narration() -> None:
+    text = "【韩绝，你出生在凡间一修仙宗门内，从小到大，容颜绝世，受人喜爱，你的父母在你年幼时弃你而去，冥冥之中，似乎有什么命运需要你背负。】"
+    assert _classify_production_pair(text) == "mixed_panel_narration"
+
+
+def test_mixed_panel_narration_splits_before_translation() -> None:
+    source_text = "【韩绝，你出生在凡间一修仙宗门内，从小到大，容颜绝世，受人喜爱，你的父母在你年幼时弃你而去，冥冥之中，似乎有什么命运需要你背负。】"
+    sample = {
+        "paragraph_pairs": [
+            {
+                "paragraph_id": "p001",
+                "source_text": source_text,
+                "source_char_count": len(source_text),
+                "target_char_count": 120,
+                "target_min": 80,
+                "target_max": 140,
+                "strict_max": 180,
+                "strict_max_ratio": 1.5,
+            }
+        ]
+    }
+    planned = _apply_production_unit_plan(sample)
+    unit_ids = [unit["unit_id"] for unit in planned["translation_units"]]
+    assert unit_ids == ["u001_a", "u001_b"]
+    assert all(unit["production_unit_class"] == "mixed_panel_narration" for unit in planned["translation_units"])
+
+
+def test_production_stat_line_budget_allows_safe_panel_complete_length() -> None:
+    pair = _compact_pair_budget({"paragraph_id": "p001", "source_text": "【身法绝尘：身法资质顶级】", "source_char_count": 13})
+    assert pair["production_unit_class"] == "stat_line"
+    assert pair["strict_max"] >= 50
+
+
+def test_production_verification_keeps_non_panel_strict_max_blocking() -> None:
+    verification = {
+        "reasons": ["paragraph_exceeds_strict_max"],
+        "warnings": [],
+        "per_paragraph_length_table": [
+            {"paragraph_id": "u002", "over_strict_max": True, "output_reference_ratio": 1.2, "unit_type": "dialogue"}
+        ],
+        "truncated_paragraphs": [],
+        "terminology_mismatches": [],
+    }
+    sample = {"translation_units": [{"paragraph_id": "u002", "source_text": "他说。", "production_unit_class": "dialogue"}], "use_translation_units": True}
+    adjusted = _production_verification(verification, sample=sample)
+    assert "paragraph_exceeds_strict_max" in adjusted["reasons"]
+    assert adjusted["pass"] is False
+
+
+def test_repair_attempt_cap_works(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    sample = {
+        "translation_units": [
+            {
+                "paragraph_id": "u001",
+                "source_text": "原文一。",
+                "source_char_count": 4,
+                "target_char_count": 8,
+                "target_min": 4,
+                "target_max": 8,
+                "strict_max": 8,
+                "unit_type": "narration",
+            }
+        ],
+        "use_translation_units": True,
+        "target_char_count": 8,
+        "accepted_for_stable_validation": True,
+        "source_text": "原文一。",
+    }
+    paragraphs = [{"paragraph_id": "u001", "text": "dangling:"}]
+    verification = {
+        "truncated_paragraphs": [{"paragraph_id": "u001", "reasons": ["dangling_glossary_label", "missing_terminal_punctuation"]}],
+        "per_paragraph_length_table": [{"paragraph_id": "u001", "over_strict_max": False}],
+    }
+    policy = {"provider": "mock", "primary_model": "mock-production", "chosen_model": "mock-production", "fallback_model_used": False, "model_route_status": "ok"}
+    class Provider: key = "mock"
+    updated, report = _repair_unsafe_units(
+        provider=Provider(),
+        policy=policy,
+        artifact_dir=artifact_dir,
+        chapter_label="2",
+        sample=sample,
+        paragraphs=paragraphs,
+        verification=verification,
+        glossary={"fixed_terms": []},
+        max_attempts=2,
+    )
+    assert updated[0]["text"] == "dangling:"
+    assert report["max_unit_repair_attempts"] == 2
+    rows = [json.loads(line) for line in (artifact_dir / "unit_repair_attempts.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 2
+
+
+def test_separator_line_classified_as_system_panel() -> None:
+    assert _classify_production_pair("------------") == "system_panel"
+
+
+def test_dialogue_with_separator_splits_into_child_units() -> None:
+    source_text = '"他说完了。" ------------'
+    sample = {
+        "paragraph_pairs": [
+            {
+                "paragraph_id": "p001",
+                "source_text": source_text,
+                "source_char_count": len(source_text),
+                "target_char_count": 30,
+                "target_min": 18,
+                "target_max": 36,
+                "strict_max": 45,
+                "strict_max_ratio": 1.5,
+            }
+        ]
+    }
+    planned = _apply_production_unit_plan(sample)
+    unit_ids = [unit["unit_id"] for unit in planned["translation_units"]]
+    assert unit_ids == ["u001_a", "u001_b"]
+    assert planned["translation_units"][1]["production_unit_class"] == "system_panel"
+
+
+def test_sentence_split_parts_long_narration_before_translation() -> None:
+    parts = _split_source_text("第一句。第二句。第三句。第四句。第五句。第六句。" * 12)
+    assert len(parts) >= 2
+    assert all(part.strip() for part in parts)
+
+
+def test_medium_narration_splits_before_translation_when_over_budget_risk() -> None:
+    text = "韩绝是重生人士，前世来自地球二十一世纪，年纪轻轻就被查出癌症晚期，他不愿痛苦地治疗，回家等死，当天晚上为了麻痹自己，他找了一款怀旧修仙游戏玩。"
+    parts = _split_source_text(text, production_unit_class="narration")
+    assert len(parts) >= 2
+    assert all(part.strip() for part in parts)
+
+
+def test_terminology_mismatch_accepts_alignment_alias_for_longer_dictionary_term() -> None:
+    glossary = {"fixed_terms": [{"source": "灵根资质", "target": "Linh căn tư chất"}]}
+    assert terminology_mismatches_for("灵根资质", "Hắn có linh căn cực phẩm.", glossary) == []

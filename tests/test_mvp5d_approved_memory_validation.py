@@ -249,6 +249,24 @@ def test_validate_approved_memory_checkpoint_resume_and_memory_sets(
     assert excluded["excluded_memory_ids"] == [used["items"][0]["id"]]
 
 
+def test_hybrid_validation_baseline_excludes_memory_but_keeps_dictionary(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    result = validate_command(
+        workspace,
+        extra=["--dry-run", "--use-approved-dictionary", "--use-hybrid-prompt"],
+    )
+    assert result.exit_code == 0, result.output
+    run_dir = Path(parse_json(result.output)["data"]["run_dir"])
+    used = json.loads((run_dir / "approved_memory_used.json").read_text(encoding="utf-8"))
+    excluded = json.loads((run_dir / "baseline_memory_exclusion.json").read_text(encoding="utf-8"))
+    assert excluded["comparison_mode"] == "hybrid_prompt_support"
+    assert excluded["baseline_memory_ids"] == []
+    assert set(excluded["excluded_memory_ids"]) == {item["id"] for item in used["items"]}
+
+
 def test_validate_approved_memory_snapshot_splits_new_mined_candidates(
     tmp_path: Path,
     monkeypatch,

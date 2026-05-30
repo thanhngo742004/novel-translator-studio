@@ -4546,10 +4546,15 @@ def terminology_mismatches_for(
     glossary: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
     mismatches = []
+    lowered_output = (output or "").lower()
     for term in (glossary or {}).get("fixed_terms", []):
         source_term = str(term.get("source", ""))
         target_term = str(term.get("target", ""))
-        if source_term and target_term and source_term in source and target_term.lower() not in output.lower():
+        aliases = {target_term.lower()} if target_term else set()
+        for anchor_id, alias_map in ALIGNMENT_ANCHORS.items():
+            if source_term in alias_map.get("zh", []):
+                aliases.update(alias.lower() for alias in alias_map.get("vi", []) if alias)
+        if source_term and aliases and source_term in source and not any(alias in lowered_output for alias in aliases):
             mismatches.append({"source": source_term, "expected": target_term})
     return mismatches
 

@@ -4055,8 +4055,8 @@ def start_approved_memory_validation(
     all_project_rule_entries = load_all_project_rules(workspace, project_slug) if use_approved_rules else []
     mined_approved_memory = [item for item in approved_memory if _is_mined_approved_memory(item)]
     if use_approved_dictionary or use_hybrid_prompt:
-        baseline_excluded_memory = []
-        baseline_memory = list(all_active_memory)
+        baseline_excluded_memory = list(all_active_memory)
+        baseline_memory = []
         min_improvement = 0.0
     else:
         baseline_excluded_memory = mined_approved_memory if mined_approved_memory else approved_memory
@@ -4146,6 +4146,7 @@ def start_approved_memory_validation(
     write_json(
         run_dir / "baseline_memory_exclusion.json",
         {
+            "baseline_memory_ids": [item["id"] for item in baseline_memory],
             "excluded_memory_ids": state["baseline_excluded_memory_ids"],
             "excluded_candidate_ids": state["newly_approved_mined_candidate_ids"],
             "excluded_items": baseline_excluded_memory,
@@ -4276,8 +4277,8 @@ def resume_approved_memory_validation(
         or state.get("approved_memory_ids", [])
     )
     if state.get("use_approved_dictionary") or state.get("use_hybrid_prompt"):
-        baseline_memory = list(all_active_memory)
-        baseline_excluded = []
+        baseline_memory = []
+        baseline_excluded = list(all_active_memory)
     else:
         baseline_memory = [item for item in all_active_memory if item["id"] not in baseline_excluded_ids]
     memory_pass_memory = list(all_active_memory)
