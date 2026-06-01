@@ -103,10 +103,14 @@ def discover_workspace(explicit: Path | None = None) -> Workspace:
     env_workspace = os.getenv("NTS_WORKSPACE")
     if env_workspace:
         candidates.append(Path(env_workspace))
-    cwd = Path.cwd()
-    candidates.append(cwd / "workspace")
-    candidates.append(cwd)
-    candidates.extend(cwd.parents)
+    try:
+        cwd = Path.cwd()
+    except FileNotFoundError:
+        cwd = None
+    if cwd is not None:
+        candidates.append(cwd / "workspace")
+        candidates.append(cwd)
+        candidates.extend(cwd.parents)
 
     seen: set[Path] = set()
     for candidate in candidates:

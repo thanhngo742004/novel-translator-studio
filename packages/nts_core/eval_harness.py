@@ -254,12 +254,20 @@ def project_eval_root(project: str) -> Path:
     return eval_root() / project
 
 
+def _short_run_slug(value: str, *, max_chars: int = 16) -> str:
+    safe = safe_model_name(value).replace(" ", "_")
+    if len(safe) <= max_chars:
+        return safe
+    digest = hashlib.sha1(safe.encode("utf-8")).hexdigest()[:8]
+    return f"{safe[: max_chars - 9]}_{digest}"
+
+
 def new_run_dir(project: str, phase: str) -> Path:
-    run_id = f"{project}_{phase}_{int(time.time() * 1000)}"
+    run_id = f"{_short_run_slug(project)}_{_short_run_slug(phase, max_chars=12)}_{int(time.time() * 1000)}"
     path = eval_root() / run_id
     path.mkdir(parents=True, exist_ok=True)
     (project_eval_root(project)).mkdir(parents=True, exist_ok=True)
-    (project_eval_root(project) / "latest.txt").write_text(str(path), encoding="utf-8")
+    write_text_file(project_eval_root(project) / "latest.txt", str(path))
     return path
 
 
@@ -273,9 +281,21 @@ def latest_run_dir(project: str) -> Path:
     return path
 
 
+def _windows_long_path(path: Path) -> str:
+    resolved = str(path.resolve())
+    if os.name == "nt" and not resolved.startswith("\\\\?\\"):
+        return "\\\\?\\" + resolved
+    return resolved
+
+
+def write_text_file(path: Path, text: str) -> None:
+    os.makedirs(_windows_long_path(path.parent), exist_ok=True)
+    with open(_windows_long_path(path), "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json_dumps(payload) + "\n", encoding="utf-8")
+    write_text_file(path, json_dumps(payload) + "\n")
 
 
 def read_json(path: Path) -> Any:
@@ -436,6 +456,19 @@ def split_chapters(text: str, *, max_chapters: int | None = None) -> list[dict[s
 def extract_raw_chapters(raw_path: Path, *, max_chapters: int) -> list[dict[str, Any]]:
     if not raw_path.exists():
         raise ValueError(f"Raw file not found: {raw_path}")
+    # Keep large novel ingestion bounded: collect only the requested chapter
+    # window plus the next heading needed to close the final chapter.
+    if max_chapters and max_chapters > 0:
+        chunks: list[str] = []
+        heading_count = 0
+        with raw_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if CHAPTER_HEADING_RE.match(line):
+                    heading_count += 1
+                    if heading_count > max_chapters:
+                        break
+                chunks.append(line)
+        return split_chapters("".join(chunks), max_chapters=max_chapters)
     text = raw_path.read_text(encoding="utf-8")
     return split_chapters(text, max_chapters=max_chapters)
 
@@ -445,6 +478,10 @@ def _strip_html(raw: str) -> str:
     raw = re.sub(r"(?i)</\s*(p|div|h1|h2|h3|h4|li|section|chapter)\s*>", "\n\n", raw)
     raw = HTML_TAG_RE.sub(" ", raw)
     return normalize_text(html.unescape(raw))
+
+
+def _natural_sort_key(value: str) -> list[Any]:
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", value)]
 
 
 def _opf_spine_names(epub: zipfile.ZipFile) -> list[str]:
@@ -485,16 +522,24 @@ def extract_epub_chapters(epub_path: Path, *, max_chapters: int) -> list[dict[st
         names = _opf_spine_names(epub)
         if not names:
             names = sorted(
-                name
-                for name in epub.namelist()
-                if name.lower().endswith((".html", ".xhtml", ".htm"))
+                (
+                    name
+                    for name in epub.namelist()
+                    if name.lower().endswith((".html", ".xhtml", ".htm"))
+                ),
+                key=_natural_sort_key,
             )
         for name in names:
+            lower_name = name.lower()
+            if any(marker in lower_name for marker in ("toc", "nav", "contents", "mucluc", "muc_luc", "mục_lục")):
+                continue
             text = _strip_html(epub.read(name).decode("utf-8", errors="ignore"))
             if not text or len(text) < 20:
                 continue
             split = split_chapters(text)
             chapter_like = [chapter for chapter in split if chapter.get("title")]
+            if any(len(str(chapter.get("text") or "")) >= 200 for chapter in chapter_like):
+                chapter_like = [chapter for chapter in chapter_like if len(str(chapter.get("text") or "")) >= 200]
             if chapter_like:
                 for chapter in chapter_like:
                     chapters.append(
@@ -891,6 +936,35 @@ def _paragraph_pair(
     }
 
 
+
+
+def _ratio_balanced_target_groups(
+    source_paragraphs: list[dict[str, Any]],
+    target_paragraphs: list[dict[str, Any]],
+    *,
+    max_ratio: float = 3.6,
+) -> list[list[int]]:
+    groups: list[list[int]] = []
+    target_index = 0
+    for source in source_paragraphs:
+        if target_index >= len(target_paragraphs):
+            groups.append([len(target_paragraphs) - 1])
+            continue
+        source_chars = max(int(source.get("char_count") or 0), 1)
+        current: list[int] = []
+        current_chars = 0
+        while target_index < len(target_paragraphs):
+            next_chars = int(target_paragraphs[target_index].get("char_count") or 0)
+            if current and (current_chars + next_chars) / source_chars > max_ratio:
+                break
+            current.append(target_index)
+            current_chars += next_chars
+            target_index += 1
+            if current_chars / source_chars >= 1.8:
+                break
+        groups.append(current or [min(target_index, len(target_paragraphs) - 1)])
+    return groups
+
 def create_paragraph_alignment(source_text: str, target_text: str) -> dict[str, Any]:
     source_paragraphs = split_text_paragraphs(source_text, kind="s")
     target_paragraphs = split_text_paragraphs(target_text, kind="t")
@@ -917,6 +991,19 @@ def create_paragraph_alignment(source_text: str, target_text: str) -> dict[str, 
         )
     source_groups = _group_indexes(len(source_paragraphs), pair_count)
     target_groups = _group_indexes(len(target_paragraphs), pair_count)
+    source_total = sum(paragraph["char_count"] for paragraph in source_paragraphs)
+    target_total = sum(paragraph["char_count"] for paragraph in target_paragraphs)
+    if (
+        source_total
+        and target_total / source_total > 2.8
+        and len(target_paragraphs) > len(source_paragraphs)
+        and pair_count == len(source_paragraphs)
+    ):
+        target_groups = _ratio_balanced_target_groups(source_paragraphs, target_paragraphs)
+        pair_count = min(len(source_groups), len(target_groups))
+        source_groups = source_groups[:pair_count]
+        target_groups = target_groups[:pair_count]
+        warnings.append("ratio_balanced_target_paragraph_windows")
     pairs = [
         _paragraph_pair(
             pair_index=index,
@@ -1495,6 +1582,17 @@ def block_window_candidate(
     )
     source_panel_ratio = _block_panel_ratio(source_blocks)
     target_panel_ratio = _block_panel_ratio(target_blocks)
+    body_shape_score = 0.0
+    if (
+        not shared
+        and 1.5 <= length_ratio <= 3.6
+        and avg_pair_score >= 0.45
+        and gap_ratio >= 0.90
+        and len(source_text) >= 160
+        and len(target_text) >= 360
+    ):
+        # Low-anchor prose chapters can still have safe monotonic body windows.
+        body_shape_score = 0.30
     quality = round(
         min(
             1.0,
@@ -1502,12 +1600,14 @@ def block_window_candidate(
             + 0.32 * anchor_score
             + 0.15 * length_score
             + 0.10 * gap_ratio
+            + body_shape_score
             + (0.08 if len(shared) >= 2 else 0.0),
         ),
         3,
     )
     rejection_reasons = []
-    if not shared:
+    body_shape_fallback = body_shape_score > 0 and quality >= ALIGNMENT_QUALITY_THRESHOLD
+    if not shared and not body_shape_fallback:
         rejection_reasons.append("no_shared_anchors")
     if len(source_text) < 40 or len(target_text) < 80:
         rejection_reasons.append("window_too_short")
@@ -1536,6 +1636,7 @@ def block_window_candidate(
         "matched_pair_count": len(matched_pairs),
         "avg_pair_score": round(avg_pair_score, 3),
         "gap_score": round(gap_ratio, 3),
+        "body_shape_fallback": body_shape_fallback,
         "alignment_quality": quality,
         "accepted": not rejection_reasons,
         "rejection_reasons": rejection_reasons,
@@ -3694,7 +3795,7 @@ def translate_samples(
 
             if model in failed_models:
                 provider_error = "skipped_after_previous_provider_error"
-                initial_path.write_text("", encoding="utf-8")
+                write_text_file(initial_path, "")
                 parsed = [
                     {"paragraph_id": paragraph_id, "text": ""}
                     for paragraph_id in expected_paragraph_ids(sample)
@@ -3847,7 +3948,7 @@ def translate_samples(
                     parsed.extend(parsed_chunk)
                 initial_raw = "\n".join(raw_chunks)
                 initial_output_char_count = len(initial_raw)
-                initial_path.write_text(initial_raw + "\n", encoding="utf-8")
+                write_text_file(initial_path, initial_raw + "\n")
                 paragraph_validation = validate_paragraph_translation(sample, parsed)
                 if not paragraph_validation["valid"]:
                     best_effort_used = True
@@ -3862,9 +3963,9 @@ def translate_samples(
                     paragraph_validation["used_best_effort_rendering"] = True
                 if provider_json_failures:
                     paragraph_validation["provider_json_failures"] = provider_json_failures
-                (sample_dir / f"{safe_model}_structured_initial.json").write_text(
+                write_text_file(
+                    sample_dir / f"{safe_model}_structured_initial.json",
                     json_dumps({"paragraphs": parsed}) + "\n",
-                    encoding="utf-8",
                 )
                 before_compression = render_paragraph_translation(sample, parsed)
                 global_ratio_before_compression = round(
@@ -3909,9 +4010,9 @@ def translate_samples(
                                 **compression_result,
                             }
                         )
-                        (sample_dir / f"{safe_model}_compression.json").write_text(
+                        write_text_file(
+                            sample_dir / f"{safe_model}_compression.json",
                             json_dumps(compression_result) + "\n",
-                            encoding="utf-8",
                         )
                         retry_path_value = str(
                             (sample_dir / f"{safe_model}_compression.json").relative_to(run_dir)
@@ -4000,9 +4101,9 @@ def translate_samples(
                     / max(sample["target_char_count"], 1),
                     3,
                 )
-                (sample_dir / f"{safe_model}_structured_after_compression.json").write_text(
+                write_text_file(
+                    sample_dir / f"{safe_model}_structured_after_compression.json",
                     json_dumps({"paragraphs": after_compression_paragraphs}) + "\n",
-                    encoding="utf-8",
                 )
                 final_output_selection = final_output_selector(
                     sample=sample,
@@ -4019,9 +4120,9 @@ def translate_samples(
                     if key not in {"selected_paragraphs", "selected_verification"}
                 }
                 final = render_paragraph_translation(sample, final_paragraphs)
-                (sample_dir / f"{safe_model}_structured_final.json").write_text(
+                write_text_file(
+                    sample_dir / f"{safe_model}_structured_final.json",
                     json_dumps({"paragraphs": final_paragraphs}) + "\n",
-                    encoding="utf-8",
                 )
             else:
                 initial = chat_completion_with_provider_retry(
@@ -4044,7 +4145,7 @@ def translate_samples(
                     },
                 ).strip()
                 initial_output_char_count = len(initial)
-                initial_path.write_text(initial + "\n", encoding="utf-8")
+                write_text_file(initial_path, initial + "\n")
                 final = initial
                 if enable_length_retry and should_retry_length(initial, sample):
                     retry_triggered = True
@@ -4073,12 +4174,12 @@ def translate_samples(
                         },
                     ).strip()
                     retry_path = sample_dir / f"{safe_model}_retry.txt"
-                    retry_path.write_text(retry + "\n", encoding="utf-8")
+                    write_text_file(retry_path, retry + "\n")
                     retry_path_value = str(retry_path.relative_to(run_dir))
                     final = retry
-            final_path.write_text(final + "\n", encoding="utf-8")
+            write_text_file(final_path, final + "\n")
             if len(samples) == 1:
-                (run_dir / f"translation_{safe_model}.txt").write_text(final + "\n", encoding="utf-8")
+                write_text_file(run_dir / f"translation_{safe_model}.txt", final + "\n")
             metadata = {
                 "path": str(final_path.relative_to(run_dir)),
                 "initial_path": str(initial_path.relative_to(run_dir)),
@@ -6575,7 +6676,7 @@ def validate_stable_prompt(
     report["report_paths"] = report_paths
     report["human_review_final"] = human_review_final
     write_json(validation_root / "stable_validation_report.json", report)
-    (project_eval_root(project) / "latest.txt").write_text(str(validation_root), encoding="utf-8")
+    write_text_file(project_eval_root(project) / "latest.txt", str(validation_root))
     return {
         "validation_root": str(validation_root),
         "pass": gate["pass"],

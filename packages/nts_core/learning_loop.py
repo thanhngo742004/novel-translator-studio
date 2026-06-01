@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import shutil
 import time
@@ -18,6 +19,7 @@ from nts_core.eval_harness import (
     prepare_parallel,
     read_json,
     safe_model_name,
+    _windows_long_path,
     translate_samples,
     write_json,
 )
@@ -41,6 +43,28 @@ BASE_RESUMABLE_STAGES = [
     "extract_candidates",
     "build_test_memory_bundle",
 ]
+
+
+
+def _copy_file_long(src: Path, dst: Path) -> None:
+    os.makedirs(_windows_long_path(dst.parent), exist_ok=True)
+    with open(_windows_long_path(src), "rb") as source_handle:
+        with open(_windows_long_path(dst), "wb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle)
+
+
+def _copytree_long(src: Path, dst: Path) -> None:
+    if dst.exists():
+        shutil.rmtree(dst)
+    for root, dirs, files in os.walk(src):
+        root_path = Path(root)
+        rel = root_path.relative_to(src)
+        target_root = dst / rel
+        os.makedirs(_windows_long_path(target_root), exist_ok=True)
+        for dirname in dirs:
+            os.makedirs(_windows_long_path(target_root / dirname), exist_ok=True)
+        for filename in files:
+            _copy_file_long(root_path / filename, target_root / filename)
 
 RETRYABLE_PROVIDER_MARKERS = (
     "408",
@@ -445,9 +469,7 @@ def run_learning_evaluation(
         src = eval_dir / name
         dst = eval_dest / name
         if src.is_dir():
-            if dst.exists():
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
+            _copytree_long(src, dst)
         else:
             _copy_if_exists(src, dst)
     replay = _build_cached_replay(eval_dir, report, model)

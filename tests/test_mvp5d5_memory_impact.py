@@ -899,3 +899,87 @@ def test_original_memory_regression_diagnose_ablate_and_scope(
     assert items.exit_code == 0, items.output
     shown = parse_json(items.output)["data"]["item"]
     assert shown["value_json"]["validation_status"] == "deprecated_for_validation"
+
+
+def test_auto_review_activates_project_scoped_safe_candidates(tmp_path: Path, monkeypatch) -> None:
+    from nts_core.memory_impact import auto_review_memory_candidates
+
+    workspace = init_workspace(tmp_path, monkeypatch)
+    created = runner.invoke(app, ["project", "create", "--workspace", str(workspace), "--slug", "auto-review", "--name", "Auto Review", "--source-lang", "zh", "--target-lang", "vi", "--json"])
+    assert created.exit_code == 0, created.output
+    ws = __import__("nts_storage.workspace", fromlist=["Workspace"]).Workspace(workspace)
+    run_dir = workspace / "artifacts" / "memory_candidate_mining" / "auto-review_mining_fixture"
+    run_dir.mkdir(parents=True)
+    candidate = {
+        "candidate_id": "candidate_safe_auto",
+        "memory_type": "term",
+        "candidate_type": "term_memory",
+        "source_pattern": "青冥魔教",
+        "preferred_target": "Thanh Minh ma giáo",
+        "rejected_variants": ["Thanh Minh Ma Giáo"],
+        "scope": {"project_id": "project_auto-review", "project_slug": "auto-review", "language_pair": "zh-vi"},
+        "confidence": 0.9,
+        "evidence_count": 2,
+        "chapter_spread": 2,
+        "evidence": [{"source_excerpt": "青冥魔教", "human_reference_excerpt": "Thanh Minh ma giáo"}],
+        "status": "pending_review",
+        "review_status": "high_confidence_approve_candidate",
+    }
+    (run_dir / "mined_memory_candidates.jsonl").write_text(json.dumps(candidate, ensure_ascii=False) + "\n", encoding="utf-8")
+    (run_dir / "candidate_conflicts.json").write_text(json.dumps({"conflicts": []}), encoding="utf-8")
+
+    result = auto_review_memory_candidates(ws, project_slug="auto-review", candidate_run=str(run_dir))
+
+    assert result["activated_candidate_ids"] == ["candidate_safe_auto"]
+    assert Path(result["candidate_bundle"]).exists()
+    assert Path(result["auto_approval_audit"]).exists()
+    audit = json.loads(Path(result["auto_approval_audit"]).read_text(encoding="utf-8"))
+    assert audit["rules_rendered_count"] == 0
+    assert audit["use_approved_rules"] is False
+
+
+def test_auto_review_rejects_conflict_and_insufficient_evidence(tmp_path: Path, monkeypatch) -> None:
+    from nts_core.memory_impact import auto_review_memory_candidates
+
+    workspace = init_workspace(tmp_path, monkeypatch)
+    created = runner.invoke(app, ["project", "create", "--workspace", str(workspace), "--slug", "auto-review", "--name", "Auto Review", "--source-lang", "zh", "--target-lang", "vi", "--json"])
+    assert created.exit_code == 0, created.output
+    ws = __import__("nts_storage.workspace", fromlist=["Workspace"]).Workspace(workspace)
+    project = parse_json(created.output)["data"]
+    made = runner.invoke(app, ["memory", "create", "--workspace", str(workspace), "--type", "term", "--status", "active", "--layer", "learning_candidate", "--project", "auto-review", "--source-key", "青冥魔教", "--target-text", "Conflicting target", "--value-json", json.dumps({"source_pattern":"青冥魔教","preferred_target":"Conflicting target"}, ensure_ascii=False), "--rules-json", "{}", "--confidence-score", "0.8", "--json"])
+    assert made.exit_code == 0, made.output
+    run_dir = workspace / "artifacts" / "memory_candidate_mining" / "auto-review_mining_fixture"
+    run_dir.mkdir(parents=True)
+    rows = [
+        {"candidate_id": "candidate_conflict", "memory_type": "term", "candidate_type": "term_memory", "source_pattern": "青冥魔教", "preferred_target": "Thanh Minh ma giáo", "scope": {"project_slug": "auto-review", "project_id": project["id"]}, "confidence": 0.9, "evidence_count": 2, "evidence": [{"source_excerpt":"x"}], "status": "pending_review"},
+        {"candidate_id": "candidate_weak", "memory_type": "term", "candidate_type": "term_memory", "source_pattern": "弱", "preferred_target": "Yếu", "scope": {"project_slug": "auto-review", "project_id": project["id"]}, "confidence": 0.4, "evidence_count": 1, "evidence": [{"source_excerpt":"x"}], "status": "pending_review"},
+    ]
+    (run_dir / "mined_memory_candidates.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False)+"\n" for r in rows), encoding="utf-8")
+    (run_dir / "candidate_conflicts.json").write_text(json.dumps({"conflicts": [{"candidate_id": "candidate_conflict"}]}), encoding="utf-8")
+
+    result = auto_review_memory_candidates(ws, project_slug="auto-review", candidate_run=str(run_dir))
+
+    assert result["activated_candidate_ids"] == []
+    bundle = json.loads(Path(result["candidate_bundle"]).read_text(encoding="utf-8"))
+    classes = {c["candidate_id"]: c["auto_review_classification"] for c in bundle["candidates"]}
+    assert classes["candidate_conflict"] == "conflict"
+    assert classes["candidate_weak"] == "insufficient_evidence"
+
+
+def test_tien_nghich_mining_excludes_han_jue_specific_pattern(tmp_path: Path, monkeypatch) -> None:
+    workspace = init_workspace(tmp_path, monkeypatch)
+    created = runner.invoke(app, ["project", "create", "--workspace", str(workspace), "--slug", "tien-nghich", "--name", "Tien Nghich", "--source-lang", "zh", "--target-lang", "vi", "--json"])
+    assert created.exit_code == 0, created.output
+    run_dir = workspace / "artifacts" / "approved_memory_validation" / "fake_tien_nghich_validation"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    summary = {"schema_version": "approved_memory_validation_summary_v1", "validation_run_id": run_dir.name, "final_decision": "FAIL"}
+    (run_dir / "final_validation_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    (run_dir / "validation_job_state.json").write_text(json.dumps({"project_slug": "tien-nghich", "validation_run_id": run_dir.name}), encoding="utf-8")
+    evidence_rows = {"rows": [{"round": 1, "chapter_id": 1, "sample_id": "sample_1", "source_text": "王林看着众人。", "human_reference": "Vương Lâm nhìn mọi người.", "baseline_output": "Hắn nhìn mọi người.", "memory_output": "Hắn nhìn mọi người.", "score_delta": -1.0}]}
+    (run_dir / "evaluation_rows.json").write_text(json.dumps(evidence_rows, ensure_ascii=False), encoding="utf-8")
+
+    mined = runner.invoke(app, ["learn", "mine-memory-candidates", "--workspace", str(workspace), "--project", "tien-nghich", "--validation-run", str(run_dir), "--json"])
+    assert mined.exit_code == 0, mined.output
+    data = parse_json(mined.output)["data"]
+    text = Path(data["report_paths"]["jsonl"]).read_text(encoding="utf-8")
+    assert "韩绝" not in text

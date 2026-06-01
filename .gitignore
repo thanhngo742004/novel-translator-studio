@@ -1,41 +1,111 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
 .pytest_cache/
-.ruff_cache/
 .mypy_cache/
-.venv/
-venv/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
 dist/
 build/
-*.egg-info/
 
-# Node/Desktop later
+# Virtual env
+.venv/
+venv/
+env/
+ENV/
+
+# Node
 node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
 
-# Env/secrets
+# Secrets
 .env
 .env.*
 !.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials/
+token*
+*api_key*
+*apikey*
 
-# Local workspaces / data
-workspace/
-workspace_mvp*_smoke_*/
+# Local Codex / agent memory / personal configs
+.codex/
+.agentmemory/
+.agents/
+agentmemory_data/
+iii-data/
+
+# NTS local workspaces and generated artifacts
+workspace*/
 artifacts/
-data/local/
-data/private/
 *.sqlite
 *.sqlite3
 *.db
-*.db-wal
-*.db-shm
 
-# Logs/cache
-*.log
-.cache/
+# Large novel / copyrighted data
+test_data/translation_eval/
+*.epub
+*.mobi
+*.azw3
+*.txt
+
+# Unless you intentionally want to publish docs
+# Keep implementation docs if useful, but exclude bulky generated logs
+docs/implementation/NTS_GOAL_PROGRESS.md
 
 # OS/editor
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+
+# Logs
+*.log
+logs/
+# temp/test artifacts
+.tmp/
+.codex_pytest_tmp/
+.p1/
+.t/
+.pytest_cache/
+
+# local workspaces/artifacts
+workspace*/
+artifacts/
+
+# secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials/
+token*
+*api_key*
+*apikey*
+
+# large/copyrighted novel data
+test_data/translation_eval/
+*.epub
+*.mobi
+*.azw3
+
+# local agent/codex
+.codex/
+.agents/
+.agentmemory/
+agentmemory_data/
+iii-data/

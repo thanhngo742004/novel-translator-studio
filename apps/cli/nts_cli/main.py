@@ -108,6 +108,7 @@ from nts_core.memory_impact import (
     review_active_memory_risk,
     rollback_approved_memory,
     scope_approved_memory,
+    auto_review_memory_candidates,
     simulate_memory_bundle,
 )
 from nts_core.model_test import run_mock_model_test
@@ -1326,6 +1327,23 @@ def learn_simulate_memory_bundle(
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result), json_output)
 
+
+@learn_app.command("auto-review-memory-candidates")
+def learn_auto_review_memory_candidates(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    candidate_run: Annotated[str, typer.Option("--candidate-run", help="Mining run id or path.")],
+    workspace: WorkspaceOption = None,
+    validation_run: Annotated[Optional[str], typer.Option("--validation-run")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = auto_review_memory_candidates(
+            ws, project_slug=project, candidate_run=candidate_run, validation_run=validation_run
+        )
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result), json_output)
 
 @learn_app.command("diagnose-memory-regression")
 def learn_diagnose_memory_regression(

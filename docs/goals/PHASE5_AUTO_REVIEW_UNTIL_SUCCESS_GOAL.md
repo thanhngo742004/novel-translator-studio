@@ -1,3 +1,6 @@
+The maximum context window for codex is 256000
+
+
 \# PHASE5\_AUTO\_REVIEW\_UNTIL\_SUCCESS\_GOAL
 
 

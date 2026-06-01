@@ -78,6 +78,7 @@ def _insert_dictionary_entry(
     entry_type: str = "fixed_phrase",
     status: str = "active",
     confidence: float = 0.9,
+    scope: dict | None = None,
 ) -> None:
     now = utc_now()
     with connection(workspace.db_path) as conn:
@@ -100,7 +101,7 @@ def _insert_dictionary_entry(
                 source,
                 target.casefold(),
                 json_dumps([]),
-                json_dumps({"project_slug": project["slug"]}),
+                json_dumps(scope or {"project_slug": project["slug"]}),
                 confidence,
                 json_dumps({"source_run_id": "pytest"}),
                 status,
@@ -159,6 +160,44 @@ def _insert_approved_rule(
             ),
         )
         conn.commit()
+
+
+
+def test_dictionary_support_respects_chapter_exclusions(tmp_path: Path) -> None:
+    workspace, project = _workspace_with_project(tmp_path)
+    _insert_dictionary_entry(
+        workspace,
+        project,
+        entry_id="dict_scoped",
+        source="王林",
+        target="Vương Lâm",
+        entry_type="name",
+        scope={"project_slug": "han-jue", "exclude_chapters": [3]},
+    )
+
+    included = build_hybrid_prompt_support(
+        workspace,
+        "han-jue",
+        "王林进入山门。",
+        max_dictionary_entries=8,
+        max_memory_items=0,
+        max_support_chars=1200,
+        chapters={1},
+    )
+    excluded = build_hybrid_prompt_support(
+        workspace,
+        "han-jue",
+        "王林进入山门。",
+        max_dictionary_entries=8,
+        max_memory_items=0,
+        max_support_chars=1200,
+        chapters={3},
+    )
+
+    assert included["selected_dictionary_items"]
+    assert included["selected_dictionary_items"][0]["source_anchor"] == "王林"
+    assert excluded["selected_dictionary_items"] == []
+    assert "王林 => Vương Lâm" not in excluded["block_text"]
 
 
 def test_hybrid_support_dedupes_conflicts_and_filters_ineligible_memory(tmp_path: Path) -> None:

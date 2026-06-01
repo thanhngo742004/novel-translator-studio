@@ -361,18 +361,43 @@ def _inactive_dictionary_matches(workspace: Workspace, project_slug: str, source
     return rows[:50]
 
 
+def _dictionary_scope_gate(entry: dict[str, Any], chapters: set[int] | None) -> tuple[bool, str | None]:
+    if not chapters:
+        return True, None
+    scope = entry.get("scope_json") or {}
+    scoped = {
+        int(chapter)
+        for chapter in (scope.get("chapters") or [])
+        if str(chapter).strip().lstrip("-").isdigit()
+    }
+    if scoped and not (scoped & chapters):
+        return False, "scope_gate:chapter_not_in_dictionary_scope"
+    excluded = {
+        int(chapter)
+        for chapter in (scope.get("exclude_chapters") or [])
+        if str(chapter).strip().lstrip("-").isdigit()
+    }
+    overlap = excluded & chapters
+    if overlap:
+        return False, "scope_gate:dictionary_excluded_chapter=" + ",".join(str(chapter) for chapter in sorted(overlap))
+    return True, None
+
+
 def _dictionary_items(
     workspace: Workspace,
     project_slug: str,
     source_text: str,
     *,
     max_scan_entries: int = 1000,
+    chapters: set[int] | None = None,
 ) -> list[SupportItem]:
-    entries = [
-        entry
-        for entry in load_project_dictionary(workspace, project_slug)
-        if entry.get("source_text") and str(entry["source_text"]) in source_text
-    ]
+    entries = []
+    for entry in load_project_dictionary(workspace, project_slug):
+        if not entry.get("source_text") or str(entry["source_text"]) not in source_text:
+            continue
+        ok, _reason = _dictionary_scope_gate(entry, chapters)
+        if ok:
+            entries.append(entry)
     entries.sort(
         key=lambda entry: (
             -len(str(entry.get("source_text") or "")),
@@ -985,7 +1010,7 @@ def build_hybrid_prompt_support(
         raise ValueError("support budgets must be positive.")
 
     project = get_project_by_slug(workspace, project_slug)
-    dictionary_items = _dictionary_items(workspace, project_slug, source_text)
+    dictionary_items = _dictionary_items(workspace, project_slug, source_text, chapters=chapters)
     memory_items, excluded_memory, active_memory_count = _memory_items(
         workspace,
         project,

@@ -88,6 +88,20 @@ ADDITIONAL_MINING_PATTERNS: list[dict[str, Any]] = [
 MINING_PATTERNS: list[dict[str, Any]] = [*KNOWN_LEARNING_PATTERNS, *ADDITIONAL_MINING_PATTERNS]
 
 
+
+def _project_mining_patterns(project_slug: str) -> list[dict[str, Any]]:
+    project_key = project_slug.strip().lower()
+    patterns: list[dict[str, Any]] = []
+    for pattern in KNOWN_LEARNING_PATTERNS:
+        source = str(pattern.get("source_pattern") or "")
+        reason = str(pattern.get("reason") or "")
+        # Han Jue-specific canon/support must not be mined into other projects.
+        if project_key != "han-jue" and (source == "韩绝" or "han_jue" in reason or "han_jue" in source.lower()):
+            continue
+        patterns.append(pattern)
+    patterns.extend(ADDITIONAL_MINING_PATTERNS)
+    return patterns
+
 def approved_memory_ablation_root(workspace: Workspace) -> Path:
     return workspace.path / "artifacts" / "approved_memory_ablation"
 
@@ -726,6 +740,13 @@ def _candidate_id(pattern: dict[str, Any], evidence: dict[str, Any]) -> str:
     digest = sha256_text(basis).replace("sha256:", "")
     return "candidate_" + digest[:24]
 
+def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        value = str(item.get(key) or "")
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
 
 def _existing_memory_index(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     index: dict[str, list[dict[str, Any]]] = {}
@@ -799,7 +820,7 @@ def mine_memory_candidates(
     conflicts: list[dict[str, Any]] = []
     seen_candidate_keys: set[tuple[str, str, str]] = set()
 
-    for pattern in MINING_PATTERNS:
+    for pattern in _project_mining_patterns(project_slug):
         evidence = _pattern_evidence(pattern, rows)
         if evidence["evidence_count"] <= 0:
             continue
@@ -1776,6 +1797,121 @@ def rollback_approved_memory(
     }
 
 
+
+def auto_review_memory_candidates(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    candidate_run: str,
+    validation_run: str | None = None,
+    reviewer: str = "codex_auto_review",
+) -> dict[str, Any]:
+    """Classify mined candidates and activate only evidence-backed project-scoped safe rows."""
+    project = get_project_by_slug(workspace, project_slug)
+    run_path = Path(candidate_run)
+    if not run_path.exists():
+        run_path = memory_candidate_mining_root(workspace) / candidate_run
+    if not run_path.exists():
+        raise ValueError(f"Candidate run not found: {candidate_run}")
+    candidates_path = run_path / "mined_memory_candidates.jsonl"
+    if not candidates_path.exists():
+        raise ValueError(f"Mined candidates file not found: {candidates_path}")
+    candidates = _read_candidates_jsonl(candidates_path)
+    conflicts_payload = read_json(run_path / "candidate_conflicts.json") if (run_path / "candidate_conflicts.json").exists() else {"conflicts": []}
+    conflict_ids = {str(item.get("candidate_id")) for item in conflicts_payload.get("conflicts", [])}
+    active_index = _existing_memory_index(_memory_rows(workspace, project_slug, statuses={"active", "pending"}))
+    rejected_sources = {
+        _memory_source(item)
+        for item in _memory_rows(workspace, project_slug, statuses={"deprecated", "rejected"})
+        if (item.get("value_json") or {}).get("candidate_id")
+    }
+    classified: list[dict[str, Any]] = []
+    activatable: list[str] = []
+    for candidate in candidates:
+        cid = str(candidate.get("candidate_id") or "")
+        scope = candidate.get("scope") or {}
+        evidence = candidate.get("evidence") or []
+        source = str(candidate.get("source_pattern") or "")
+        target = str(candidate.get("preferred_target") or "")
+        status = str(candidate.get("status") or "")
+        review_status = str(candidate.get("review_status") or "")
+        reasons: list[str] = []
+        classification = "safe_project_scoped"
+        if scope.get("project_slug") != project_slug or scope.get("project_id") != project.get("id"):
+            classification = "needs_scope"
+            reasons.append("scope_applied_to_current_project")
+            candidate["scope"] = {**scope, "project_id": project["id"], "project_slug": project_slug}
+        if not evidence or int(candidate.get("evidence_count") or 0) <= 0:
+            classification = "insufficient_evidence"
+            reasons.append("missing_aligned_evidence")
+        if cid in conflict_ids or candidate.get("related_existing_memory_id"):
+            classification = "conflict"
+            reasons.append("conflicts_with_existing_memory")
+        if status in {"rejected", "rejected_after_validation", "harmful"} or review_status in {"rejected_after_validation", "harmful"}:
+            classification = "harmful"
+            reasons.append("negative_or_rejected_status")
+        if not source or not target:
+            classification = "insufficient_evidence"
+            reasons.append("missing_trigger_or_target")
+        existing = active_index.get(source, [])
+        if source in rejected_sources:
+            classification = "harmful"
+            reasons.append("previously_rolled_back_or_rejected_source")
+        if any(_normalize_text(_memory_target(item)) != _normalize_text(target) for item in existing):
+            classification = "conflict"
+            reasons.append("active_target_conflict")
+        if classification in {"safe_project_scoped", "needs_scope"}:
+            if float(candidate.get("confidence") or 0) >= 0.75 and int(candidate.get("evidence_count") or 0) >= 2:
+                classification = "safe_positive" if classification == "safe_project_scoped" else "needs_scope"
+                activatable.append(cid)
+            else:
+                classification = "insufficient_evidence"
+                reasons.append("confidence_or_evidence_below_auto_gate")
+        candidate["auto_review_classification"] = classification
+        candidate["auto_review_reasons"] = reasons or ["passes_auto_review_evidence_scope_conflict_gates"]
+        classified.append(candidate)
+
+    run_id = f"auto_review_{project_slug}_{int(time.time() * 1000)}"
+    out_dir = workspace.path / "artifacts" / "auto_review" / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bundle = {
+        "schema_version": "phase5_auto_review_candidate_bundle_v1",
+        "run_id": run_id,
+        "project_slug": project_slug,
+        "candidate_run": str(run_path),
+        "validation_run": validation_run,
+        "candidates": classified,
+        "activatable_candidate_ids": activatable,
+        "created_at": utc_now(),
+    }
+    write_json(out_dir / "candidate_bundle.json", bundle)
+    _write_text(out_dir / "candidate_bundle.md", "# Candidate Bundle\n\n" + "\n".join(f"- `{c.get('candidate_id')}`: `{c.get('auto_review_classification')}`" for c in classified) + "\n")
+    approval_result: dict[str, Any] | None = None
+    if activatable:
+        from nts_core.learning_loop import approve_learning_memory
+        approval_result = approve_learning_memory(
+            workspace,
+            project_slug=project_slug,
+            run=str(run_path),
+            candidate_ids=",".join(activatable),
+            approve_all=False,
+        )
+    audit = {
+        "schema_version": "phase5_auto_approval_audit_v1",
+        "run_id": run_id,
+        "project_slug": project_slug,
+        "reviewer": reviewer,
+        "activated_candidate_ids": activatable,
+        "classification_counts": _count_by(classified, "auto_review_classification"),
+        "approval_result": approval_result,
+        "rules_rendered_count": 0,
+        "use_approved_rules": False,
+        "created_at": utc_now(),
+    }
+    write_json(out_dir / "auto_approval_audit.json", audit)
+    _write_text(out_dir / "auto_approval_audit.md", "# Auto Approval Audit\n\n" + f"- Activated candidates: `{', '.join(activatable) or 'none'}`\n- Rules rendered count: `0`\n")
+    return {"auto_review_run_id": run_id, "run_dir": str(out_dir), "activated_candidate_ids": activatable, "classification_counts": audit["classification_counts"], "candidate_bundle": str(out_dir / "candidate_bundle.json"), "auto_approval_audit": str(out_dir / "auto_approval_audit.json")}
+
 def _latest_memory_regression_payload(workspace: Workspace, filename: str) -> dict[str, Any]:
     root = memory_regression_root(workspace)
     if not root.exists():
@@ -2104,7 +2240,7 @@ def diagnose_original_memory_regression(
     else:
         root_cause = "original_memory_effect_inconclusive"
 
-    run_dir = _new_run_dir(memory_regression_root(workspace), project_slug, f"original_chapter_{chapter}_diagnostic")
+    run_dir = _new_run_dir(memory_regression_root(workspace), project_slug, f"orig_ch{chapter}_diag")
     report = {
         "schema_version": "original_memory_regression_diagnostic_v1",
         "regression_run_id": run_dir.name,
@@ -2296,7 +2432,7 @@ def ablate_original_memory_regression(
         }
     )
 
-    run_dir = _new_run_dir(memory_regression_root(workspace), project_slug, f"original_chapter_{chapter}_ablation")
+    run_dir = _new_run_dir(memory_regression_root(workspace), project_slug, f"orig_ch{chapter}_ablate")
     write_json(
         run_dir / f"original_memory_chapter_{chapter}_ablation_matrix.json",
         {

@@ -165,8 +165,16 @@ def _sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _short_run_slug(value: str, *, max_chars: int = 16) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-_") or "run"
+    if len(safe) <= max_chars:
+        return safe
+    digest = hashlib.sha1(safe.encode("utf-8")).hexdigest()[:8]
+    return f"{safe[: max_chars - 9]}_{digest}"
+
+
 def _new_run_id(project_slug: str, prefix: str) -> str:
-    return f"{project_slug}_{prefix}_{int(time.time() * 1000)}"
+    return f"{_short_run_slug(project_slug)}_{_short_run_slug(prefix, max_chars=12)}_{int(time.time() * 1000)}"
 
 
 def _read_workspace_provider(workspace: Workspace, provider_key: str) -> EvalProvider | None:
@@ -1719,6 +1727,7 @@ def translate_batch_stable(
                 )
                 processed.append(chapter_id)
                 continue
+            chapter_artifact_id = f"chapter_{chapter_label}"
             chunk_outputs = []
             chunk_task_ids = []
             chunk_model_run_ids = []
@@ -1736,9 +1745,9 @@ def translate_batch_stable(
                     merge_tiny_paragraphs=merge_tiny_paragraphs,
                     evaluate_after=evaluate_after,
                     dry_run=False,
-                    output_dir=batch_dir / "chunk_outputs" / chapter_id / f"chunk_{index:03d}",
+                    output_dir=batch_dir / "chunk_outputs" / chapter_artifact_id / f"chunk_{index:03d}",
                     force=True,
-                    artifact_run_id=f"{batch_run_id}_{chapter_id}_chunk_{index:03d}",
+                    artifact_run_id=f"{batch_run_id}_ch{chapter_label}_chunk_{index:03d}",
                     source_override=chunk,
                     save_translation_row=False,
                     use_approved_dictionary=use_approved_dictionary,
@@ -1757,21 +1766,21 @@ def translate_batch_stable(
                 chunk_outputs.append(chunk_text.strip())
                 chunk_task_ids.append(chunk_result["task_run_id"])
                 chunk_model_run_ids.append(chunk_result["model_run_id"])
-                (batch_dir / "chunk_prompts" / chapter_id).mkdir(parents=True, exist_ok=True)
-                (batch_dir / "chunk_quality" / chapter_id).mkdir(parents=True, exist_ok=True)
+                (batch_dir / "chunk_prompts" / chapter_artifact_id).mkdir(parents=True, exist_ok=True)
+                (batch_dir / "chunk_quality" / chapter_artifact_id).mkdir(parents=True, exist_ok=True)
                 shutil.copy2(
                     Path(chunk_result["artifact_dir"]) / "prompt_used.md",
-                    batch_dir / "chunk_prompts" / chapter_id / f"chunk_{index:03d}_prompt_used.md",
+                    batch_dir / "chunk_prompts" / chapter_artifact_id / f"chunk_{index:03d}_prompt_used.md",
                 )
                 shutil.copy2(
                     Path(chunk_result["quality_report"]),
-                    batch_dir / "chunk_quality" / chapter_id / f"chunk_{index:03d}_quality_report.json",
+                    batch_dir / "chunk_quality" / chapter_artifact_id / f"chunk_{index:03d}_quality_report.json",
                 )
             final_text = "\n\n".join(part for part in chunk_outputs if part)
             output_path.write_text(final_text + "\n", encoding="utf-8")
             prompt_copy = batch_dir / "prompts" / f"{chapter_label}_prompt_used.md"
             quality_copy = batch_dir / "quality" / f"{chapter_label}_quality_report.json"
-            first_chunk_dir = batch_dir / "chunk_outputs" / chapter_id / "chunk_001"
+            first_chunk_dir = batch_dir / "chunk_outputs" / chapter_artifact_id / "chunk_001"
             if (first_chunk_dir / "prompt_used.md").exists():
                 shutil.copy2(first_chunk_dir / "prompt_used.md", prompt_copy)
             quality_summary = {

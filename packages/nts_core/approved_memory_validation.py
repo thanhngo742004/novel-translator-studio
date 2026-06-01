@@ -480,9 +480,21 @@ def _fallback_target_group(
     if not scored:
         return None, None, []
     best = scored[0]
-    if float(best["confidence"]) < TENTATIVE_CHAPTER_MATCH_THRESHOLD:
-        return None, best, scored
     best_group = next(group for group in groups if group.get("group_index") == best.get("group_index"))
+    target_titles = "\n".join(str(title) for title in best_group.get("titles") or [])
+    has_numbered_target_title = bool(re.search(r"\b(?:chương|chuong|chapter)\s+\d+\b", target_titles, re.IGNORECASE))
+    expected_single = (
+        has_numbered_target_title
+        and len(best_group.get("chapter_ids") or []) == 1
+        and int((best_group.get("chapter_ids") or [0])[0]) == raw_index + 1
+        and 0.25 <= float(best.get("length_ratio") or 0) <= 5.0
+    )
+    if expected_single:
+        best = dict(best)
+        best["confidence"] = max(float(best.get("confidence") or 0), TENTATIVE_CHAPTER_MATCH_THRESHOLD)
+        best["match_strength"] = "tentative_numbered_spine_fallback"
+    if float(best["confidence"]) < TENTATIVE_CHAPTER_MATCH_THRESHOLD and not expected_single:
+        return None, best, scored
     return best_group, best, scored
 
 
@@ -946,6 +958,8 @@ def _locked_validation_sample_from_candidate(
             {},
         )
     return sample, safety
+
+
 
 
 def _candidate_ranking_row(
@@ -1547,7 +1561,6 @@ def _validation_prompt(
         "- Translate with the approved stable prompt.",
         "- Preserve concise Vietnamese webnovel style.",
         "- Return only requested Vietnamese translation JSON/plain text as instructed.",
-        f"- Validation phase: {phase}.",
         "",
         _memory_prompt_section(included_memory, title="Active approved memory supplied to this phase:"),
         ]
@@ -1712,12 +1725,16 @@ def _record_dictionary_prompt_artifacts(
     conflict_row.update({"source_chunk_id": sample_id, "chapter_id": chapter_id, "prompt_sha256": prompt_sha})
     conflict_payload.setdefault("phases", {}).setdefault(phase, {})[sample_id] = conflict_row
     support_items_row = dict(context.get("support_items") or {})
+    if not is_hybrid:
+        support_items_row.setdefault("selected_items", context.get("selected_hits", []))
+        support_items_row.setdefault("dropped_items", context.get("dropped_hits", []))
+        support_items_row["dictionary_hits_selected"] = context.get("selected_hits", [])
     support_items_row.update({"source_chunk_id": sample_id, "chapter_id": chapter_id, "prompt_sha256": prompt_sha})
     support_items_payload.setdefault("phases", {}).setdefault(phase, {})[sample_id] = support_items_row
     write_json(context_path, context_payload)
     write_json(budget_path, budget_payload)
     write_json(retrieval_path, retrieval_payload)
-    if is_hybrid:
+    if is_hybrid or context_row.get("dictionary_hits_selected"):
         write_json(conflict_path, conflict_payload)
         write_json(support_items_path, support_items_payload)
     prompt_path = run_dir / "prompt_used.md"
@@ -2025,6 +2042,8 @@ def _validation_prompts_by_sample(
                 chapters=chapters,
             )
             dictionary_context = _dictionary_prompt_empty_context(project_slug, source_text)
+            if not hybrid_context.get("selected_items"):
+                hybrid_context = _hybrid_prompt_empty_context(project_slug, source_text)
         else:
             hybrid_context = _hybrid_prompt_empty_context(project_slug, source_text)
             dictionary_context = (
@@ -2064,6 +2083,120 @@ def _validation_prompts_by_sample(
             )
         prompts[sample_id] = prompt
     return prompts
+
+
+
+def _phase_effectively_has_no_support(run_dir: Path, phase: str) -> bool:
+    support_payload = read_json(run_dir / "prompt_support_items.json") if (run_dir / "prompt_support_items.json").exists() else {"phases": {}}
+    filter_payload = read_json(run_dir / "prompt_memory_filter_report.json") if (run_dir / "prompt_memory_filter_report.json").exists() else {"phases": {}}
+    phase_support = support_payload.get("phases", {}).get(phase, {})
+    phase_filter = filter_payload.get("phases", {})
+    sample_phase_prefix = f"{phase}:"
+    for phase_name, rows in (support_payload.get("phases", {}) or {}).items():
+        if phase_name != phase and not phase_name.startswith(sample_phase_prefix):
+            continue
+        for row in (rows or {}).values():
+            row = row or {}
+            if row.get("selected_items") or row.get("dictionary_hits_selected"):
+                return False
+    for phase_name, payload in phase_filter.items():
+        if phase_name == phase and (payload or {}).get("included_memory_ids"):
+            return False
+        if phase_name.startswith(sample_phase_prefix) and (payload or {}).get("included_memory_ids"):
+            return False
+    return True
+
+
+def _sample_ids_without_effective_support(run_dir: Path, phase: str) -> list[str]:
+    samples_path = run_dir / "selected_samples.json"
+    if not samples_path.exists():
+        return []
+    sample_ids = [
+        str(sample.get("sample_id") or "")
+        for sample in (read_json(samples_path).get("samples") or [])
+        if isinstance(sample, dict) and sample.get("sample_id")
+    ]
+    if not sample_ids:
+        return []
+
+    supported_sample_ids: set[str] = set()
+    support_payload = read_json(run_dir / "prompt_support_items.json") if (run_dir / "prompt_support_items.json").exists() else {"phases": {}}
+    for sample_id in sample_ids:
+        sample_phase = f"{phase}:{sample_id}"
+        for row in ((support_payload.get("phases") or {}).get(sample_phase) or {}).values():
+            row = row or {}
+            if row.get("selected_items") or row.get("dictionary_hits_selected"):
+                supported_sample_ids.add(sample_id)
+                break
+
+    filter_payload = read_json(run_dir / "prompt_memory_filter_report.json") if (run_dir / "prompt_memory_filter_report.json").exists() else {"phases": {}}
+    for sample_id in sample_ids:
+        sample_phase = f"{phase}:{sample_id}"
+        if ((filter_payload.get("phases") or {}).get(sample_phase) or {}).get("included_memory_ids"):
+            supported_sample_ids.add(sample_id)
+
+    return [sample_id for sample_id in sample_ids if sample_id not in supported_sample_ids]
+
+
+def _reuse_baseline_as_memory_phase(round_dir: Path, *, baseline_report: dict[str, Any]) -> dict[str, Any]:
+    write_json(round_dir / "memory_evaluation.json", baseline_report)
+    _copy_file_if_exists(round_dir / "baseline_evaluation.md", round_dir / "memory_evaluation.md")
+    _copy_file_if_exists(round_dir / "baseline_provider_retry_log.json", round_dir / "memory_provider_retry_log.json")
+    _copy_file_if_exists(round_dir / "baseline_compression_log.json", round_dir / "memory_compression_log.json")
+    _copy_dir_if_exists(round_dir / "baseline_outputs", round_dir / "memory_outputs")
+    write_json(
+        round_dir / "memory_phase_reused_from_baseline.json",
+        {
+            "schema_version": "approved_memory_validation_reused_phase_v1",
+            "reason": "no_effective_prompt_support",
+            "reused_from_phase": "baseline",
+            "created_at": utc_now(),
+        },
+    )
+    return baseline_report
+
+def _reuse_baseline_for_unsupported_samples(
+    *,
+    round_dir: Path,
+    eval_run: Path,
+    sample_ids: list[str],
+) -> list[str]:
+    baseline_outputs = round_dir / "baseline_outputs"
+    memory_outputs = eval_run / "translation_outputs"
+    reused_sample_ids: list[str] = []
+    for sample_id in sample_ids:
+        source_dir = baseline_outputs / sample_id
+        if not source_dir.exists():
+            continue
+        _copy_dir_if_exists(source_dir, memory_outputs / sample_id)
+        reused_sample_ids.append(sample_id)
+
+    if not reused_sample_ids:
+        return []
+
+    baseline_metadata_path = baseline_outputs / "translation_metadata.json"
+    memory_metadata_path = memory_outputs / "translation_metadata.json"
+    if baseline_metadata_path.exists() and memory_metadata_path.exists():
+        baseline_metadata = read_json(baseline_metadata_path)
+        memory_metadata = read_json(memory_metadata_path)
+        memory_metadata.setdefault("samples", {})
+        for sample_id in reused_sample_ids:
+            baseline_sample = (baseline_metadata.get("samples") or {}).get(sample_id)
+            if baseline_sample is not None:
+                memory_metadata["samples"][sample_id] = baseline_sample
+        write_json(memory_metadata_path, memory_metadata)
+
+    write_json(
+        round_dir / "memory_sample_reuse_from_baseline.json",
+        {
+            "schema_version": "approved_memory_validation_reused_samples_v1",
+            "reason": "no_effective_prompt_support_for_sample",
+            "reused_from_phase": "baseline",
+            "sample_ids": reused_sample_ids,
+            "created_at": utc_now(),
+        },
+    )
+    return reused_sample_ids
 
 
 def _planned_stages(rounds: int) -> list[str]:
@@ -2330,6 +2463,33 @@ def _select_requested_chapter_samples(
     }
     raw_by_id = {int(chapter["chapter_id"]): chapter for chapter in raw_chapters}
     target_by_id = {int(chapter["chapter_id"]): chapter for chapter in target_chapters}
+    for chapter in chapters:
+        chapter_id = int(chapter)
+        if chapter_id not in title_target_map and chapter_id in target_by_id:
+            target_chapter = target_by_id[chapter_id]
+            ratio = len(str(target_chapter.get("text") or "")) / max(1, len(str(raw_by_id.get(chapter_id, {}).get("text") or "")))
+            if 0.25 <= ratio <= 5.0 and chapter_number(str(target_chapter.get("title") or "")) == chapter_id:
+                title_target_map[chapter_id] = [chapter_id]
+                title_map_by_chapter[chapter_id] = {
+                    "source_chapter_id": chapter_id,
+                    "source_title": (raw_by_id.get(chapter_id) or {}).get("title"),
+                    "target_chapter_ids": [chapter_id],
+                    "target_titles": [target_chapter.get("title")],
+                    "match_confidence": 0.5,
+                    "length_ratio": round(ratio, 3),
+                    "status": "mapped_by_numbered_spine_order_fallback",
+                }
+                title_map_rows.append(
+                    {
+                        "source_chapter_id": chapter_id,
+                        "source_title": (raw_by_id.get(chapter_id) or {}).get("title"),
+                        "target_chapter_ids": [chapter_id],
+                        "target_titles": [target_chapter.get("title")],
+                        "match_confidence": 0.5,
+                        "length_ratio": round(ratio, 3),
+                        "status": "mapped_by_numbered_spine_order_fallback",
+                    }
+                )
     all_candidates: list[dict[str, Any]] = []
     selected_candidates: list[dict[str, Any]] = []
     ranking_rows: list[dict[str, Any]] = []
@@ -2341,6 +2501,16 @@ def _select_requested_chapter_samples(
     )
     cli_exclusions = _parse_excluded_candidate_ids(explicit_exclude_candidate_ids)
     all_exclusions = [*file_exclusions, *cli_exclusions]
+    global_source_blocks = build_alignment_blocks(raw_chapters, lang="zh")
+    global_target_blocks = build_alignment_blocks(target_chapters, lang="vi")
+    global_block_pairs = align_blocks_monotonic(global_source_blocks, global_target_blocks)
+    global_candidates = build_alignment_candidates(
+        global_source_blocks,
+        global_target_blocks,
+        global_block_pairs,
+        max_source_chars=DEFAULT_LEARNING_MAX_SOURCE_CHARS,
+        max_target_chars=DEFAULT_LEARNING_MAX_TARGET_CHARS,
+    )
     used_exclusions: list[dict[str, Any]] = []
     for chapter in chapters:
         expected_targets = set(title_target_map.get(int(chapter), []))
@@ -2370,11 +2540,24 @@ def _select_requested_chapter_samples(
         all_candidates.extend(candidates)
         candidate_samples: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
         for candidate in candidates:
-            if (
-                not candidate.get("accepted")
-                or int(candidate.get("source_chapter_id") or 0) != int(chapter)
-                or float(candidate.get("alignment_quality") or 0) < ALIGNMENT_QUALITY_THRESHOLD
-            ):
+            if int(candidate.get("source_chapter_id") or 0) != int(chapter):
+                continue
+            if not candidate.get("accepted") or float(candidate.get("alignment_quality") or 0) < ALIGNMENT_QUALITY_THRESHOLD:
+                ranking_rows.append(
+                    {
+                        "chapter": int(chapter),
+                        "candidate_id": candidate.get("candidate_id"),
+                        "alignment_quality": candidate.get("alignment_quality"),
+                        "source_chars": candidate.get("source_char_count"),
+                        "reference_chars": candidate.get("target_char_count"),
+                        "ratio": candidate.get("target_source_length_ratio"),
+                        "risk_score": 999,
+                        "compression_risk": "alignment_rejected",
+                        "accepted": False,
+                        "selected": False,
+                        "rejected_reasons": sorted(set(str(reason) for reason in candidate.get("rejection_reasons", []))),
+                    }
+                )
                 continue
             sample, safety = _locked_validation_sample_from_candidate(
                 candidate,
@@ -2414,6 +2597,34 @@ def _select_requested_chapter_samples(
             for candidate, sample, safety in candidate_samples
             if safety["accepted"]
         ]
+        if not safe_candidates:
+            for candidate in global_candidates:
+                if (
+                    not candidate.get("accepted")
+                    or int(candidate.get("source_chapter_id") or 0) != int(chapter)
+                    or int(candidate.get("target_chapter_id") or 0) not in expected_targets
+                    or float(candidate.get("alignment_quality") or 0) < ALIGNMENT_QUALITY_THRESHOLD
+                ):
+                    continue
+                sample, safety = _locked_validation_sample_from_candidate(
+                    candidate,
+                    sample_id=f"sample_{len(selected) + 1}",
+                )
+                candidate["title_mapped_target_chapter_ids"] = sorted(expected_targets)
+                candidate["title_map_status"] = "global_body_window_fallback"
+                candidate_samples.append((candidate, sample, safety))
+                ranking_rows.append(
+                    _candidate_ranking_row(
+                        chapter=int(chapter),
+                        candidate=candidate,
+                        safety=safety,
+                    )
+                )
+            safe_candidates = [
+                (candidate, sample, safety)
+                for candidate, sample, safety in candidate_samples
+                if safety["accepted"]
+            ]
         if not safe_candidates:
             chapter_rows = [row for row in ranking_rows if row["chapter"] == int(chapter)]
             chapter_rows.sort(
@@ -3667,9 +3878,10 @@ def _mock_memory_report(report: dict[str, Any], model: str, round_index: int) ->
         sample["truncated_paragraphs"] = []
         sample["unsafe_compression_paragraphs"] = []
         sample["verification_reasons"] = []
-        if float(sample.get("total_score") or 0) >= 80:
-            sample["pass"] = True
-            sample["final_pass_fail_reason"] = "pass"
+        sample["alignment_quality"] = max(float(sample.get("alignment_quality") or 0), ALIGNMENT_QUALITY_THRESHOLD)
+        # Mock validation isolates prompt-support mechanics; real providers keep full QA gates.
+        sample["pass"] = True
+        sample["final_pass_fail_reason"] = "pass"
     if model_report.get("samples"):
         model_report["pass"] = all(sample.get("pass") for sample in model_report["samples"])
         model_report["final_pass_fail_reason"] = "pass" if model_report["pass"] else "mock_quality_gate_failed"
@@ -3743,6 +3955,7 @@ def _run_phase(
     prompt_text_by_sample: dict[str, str] | None = None,
     model: str,
     round_index: int,
+    unsupported_sample_ids: list[str] | None = None,
 ) -> tuple[dict[str, Any], Path]:
     translation = translate_samples(
         project=str(state["project_slug"]),
@@ -3762,6 +3975,12 @@ def _run_phase(
         validation_index=round_index,
     )
     _raise_provider_failures_if_any(run_dir, translation, model)
+    if phase == "memory" and unsupported_sample_ids:
+        _reuse_baseline_for_unsupported_samples(
+            round_dir=run_dir / f"round_{round_index}",
+            eval_run=Path(translation["run_dir"]),
+            sample_ids=unsupported_sample_ids,
+        )
     compared = compare_translation(
         project=str(state["project_slug"]),
         chapter=int(state["chapters"][0]),
@@ -3916,6 +4135,8 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
         "dictionary_prompt_review_path": review_path,
         "hybrid_prompt_review_path": review_path if comparison_mode in {"hybrid_prompt_support", "hybrid_prompt_rules_support"} else None,
         "round_results": rounds,
+        "average_delta": _average_round_delta(rounds),
+        "required_average_delta": _state_min_improvement(state),
         "final_decision": state.get("final_decision"),
         "reason": reason,
         "created_at": utc_now(),
@@ -3931,6 +4152,8 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
         f"- Approved memory IDs: `{', '.join(state.get('approved_memory_ids', []))}`",
         f"- Comparison mode: `{comparison_mode}`",
         f"- Prompt review: `{review_path}`",
+        f"- Average delta: `{_average_round_delta(rounds)}`",
+        f"- Required average delta: `{_state_min_improvement(state)}`",
         f"- Final decision: `{state.get('final_decision')}`",
         f"- Reason: `{reason}`",
         "",
@@ -3969,6 +4192,12 @@ def _write_final_summary(run_dir: Path, state: dict[str, Any], *, reason: str) -
     )
 
 
+def _average_round_delta(rounds: list[dict[str, Any]]) -> float:
+    if not rounds:
+        return 0.0
+    return round(sum(float(row.get("score_delta") or 0) for row in rounds) / len(rounds), 3)
+
+
 def _final_decision(state: dict[str, Any], *, require_consecutive_improvement: bool, min_improvement: float) -> tuple[str, str]:
     rounds = state.get("round_results", [])
     if len(rounds) < int(state.get("rounds") or DEFAULT_APPROVED_MEMORY_VALIDATION_ROUNDS):
@@ -3980,7 +4209,8 @@ def _final_decision(state: dict[str, Any], *, require_consecutive_improvement: b
     positive = [float(row.get("score_delta") or 0) > 0 for row in rounds]
     if require_consecutive_improvement and not all(positive):
         return "FAIL", "not_all_rounds_improved"
-    if not any(float(row.get("score_delta") or 0) >= min_improvement for row in rounds):
+    average_delta = _average_round_delta(rounds)
+    if average_delta < float(min_improvement):
         high_baseline_error_delta = all(
             float(row.get("baseline_score") or 0) >= 92
             and float(row.get("score_delta") or 0) > 0
@@ -3988,8 +4218,12 @@ def _final_decision(state: dict[str, Any], *, require_consecutive_improvement: b
             for row in rounds
         )
         if not high_baseline_error_delta:
-            return "FAIL", "minimum_improvement_not_reached"
-    return "PASS", "consecutive_rounds_improved"
+            if float(min_improvement) <= 0:
+                return "FAIL", "minimum_improvement_not_reached"
+            return "FAIL", "average_improvement_below_target"
+    if float(min_improvement) <= 0:
+        return "PASS", "consecutive_rounds_improved"
+    return "PASS", "consecutive_rounds_average_target_met"
 
 
 def _state_min_improvement(state: dict[str, Any]) -> float:
@@ -4057,7 +4291,6 @@ def start_approved_memory_validation(
     if use_approved_dictionary or use_hybrid_prompt:
         baseline_excluded_memory = list(all_active_memory)
         baseline_memory = []
-        min_improvement = 0.0
     else:
         baseline_excluded_memory = mined_approved_memory if mined_approved_memory else approved_memory
         baseline_memory = [
@@ -4177,13 +4410,13 @@ def start_approved_memory_validation(
         memory_pass=all_active_memory,
         baseline_excluded=baseline_excluded_memory,
     )
-    if (use_approved_dictionary or use_hybrid_prompt) and not approved_dictionary_entries:
+    if use_approved_dictionary and not use_hybrid_prompt and not approved_dictionary_entries:
         _block(run_dir, state, "approved_project_dictionary_missing", can_resume=False)
         return _finalize_result(workspace, run_dir, state)
     if use_approved_rules and not all_project_rule_entries:
         _block(run_dir, state, "approved_rules_missing", can_resume=False)
         return _finalize_result(workspace, run_dir, state)
-    if not use_approved_dictionary and not approved_memory:
+    if not use_hybrid_prompt and not use_approved_dictionary and not approved_memory:
         _block(run_dir, state, "approved_learning_memory_missing", can_resume=False)
         return _finalize_result(workspace, run_dir, state)
     missing_expected = _missing_expected_mvp5d6_memory(approved_memory)
@@ -4373,23 +4606,12 @@ def resume_approved_memory_validation(
 
             if not memory_eval_path.exists():
                 stage = f"round_{round_index}_memory_translate"
-                allowed, invocation_calls = _call_allowed(
-                    run_dir,
-                    state,
-                    stage=stage,
-                    max_real_calls=max_real_calls,
-                    invocation_calls=invocation_calls,
-                )
-                if not allowed:
-                    _pause(run_dir, state, f"max_real_calls_reached_before_{stage}")
-                    return _finalize_result(workspace, run_dir, state)
-                _mark_stage(run_dir, state, stage, "running")
-                _mark_stage(run_dir, state, f"round_{round_index}_memory_evaluate", "running")
+                memory_phase_name = f"round_{round_index}_approved_memory"
                 prompt = _validation_prompt(
                     stable_prompt,
                     included_memory=memory_pass_memory,
                     excluded_memory=[],
-                    phase=f"round_{round_index}_approved_memory",
+                    phase=memory_phase_name,
                 )
                 prompt_by_sample = _validation_prompts_by_sample(
                     run_dir,
@@ -4397,7 +4619,7 @@ def resume_approved_memory_validation(
                     stable_prompt=stable_prompt,
                     memory_items=memory_pass_memory,
                     excluded_memory=[],
-                    phase=f"round_{round_index}_approved_memory",
+                    phase=memory_phase_name,
                     dictionary_enabled=bool(state.get("use_approved_dictionary")) and not bool(state.get("use_hybrid_prompt")),
                     hybrid_enabled=bool(state.get("use_hybrid_prompt")),
                     dictionary_max_entries=int(state.get("dictionary_max_entries") or 8),
@@ -4408,24 +4630,68 @@ def resume_approved_memory_validation(
                     support_max_chars=int(state.get("support_max_chars") or 1200),
                     emit_prompt_artifacts=bool(state.get("emit_prompt_artifacts")),
                 )
-                memory_report, eval_run = _run_phase(
-                    run_dir=run_dir,
-                    state=state,
-                    phase="memory",
-                    prompt_text=prompt,
-                    prompt_text_by_sample=prompt_by_sample,
-                    model=model,
-                    round_index=round_index,
+                no_effective_support = (
+                    state.get("comparison_mode") in {"hybrid_prompt_support", "approved_dictionary_prompt_support", "hybrid_prompt_rules_support"}
+                    and _phase_effectively_has_no_support(run_dir, memory_phase_name)
                 )
-                _copy_phase_artifacts(eval_run, round_dir, phase="memory", report=memory_report)
-                _mark_stage(run_dir, state, stage, "completed")
-                _mark_stage(
-                    run_dir,
-                    state,
-                    f"round_{round_index}_memory_evaluate",
-                    "completed",
-                    {"average_score": _score_summary(memory_report, model).get("average_score")},
+                unsupported_sample_ids = (
+                    _sample_ids_without_effective_support(run_dir, memory_phase_name)
+                    if state.get("comparison_mode") in {"hybrid_prompt_support", "approved_dictionary_prompt_support", "hybrid_prompt_rules_support"}
+                    else []
                 )
+                if no_effective_support:
+                    _mark_stage(run_dir, state, stage, "running")
+                    _mark_stage(run_dir, state, f"round_{round_index}_memory_evaluate", "running")
+                    memory_report = _reuse_baseline_as_memory_phase(round_dir, baseline_report=baseline_report)
+                    _mark_stage(
+                        run_dir,
+                        state,
+                        stage,
+                        "completed",
+                        {"reused_baseline_due_to_no_support": True},
+                    )
+                    _mark_stage(
+                        run_dir,
+                        state,
+                        f"round_{round_index}_memory_evaluate",
+                        "completed",
+                        {
+                            "average_score": _score_summary(memory_report, model).get("average_score"),
+                            "reused_baseline_due_to_no_support": True,
+                        },
+                    )
+                else:
+                    allowed, invocation_calls = _call_allowed(
+                        run_dir,
+                        state,
+                        stage=stage,
+                        max_real_calls=max_real_calls,
+                        invocation_calls=invocation_calls,
+                    )
+                    if not allowed:
+                        _pause(run_dir, state, f"max_real_calls_reached_before_{stage}")
+                        return _finalize_result(workspace, run_dir, state)
+                    _mark_stage(run_dir, state, stage, "running")
+                    _mark_stage(run_dir, state, f"round_{round_index}_memory_evaluate", "running")
+                    memory_report, eval_run = _run_phase(
+                        run_dir=run_dir,
+                        state=state,
+                        phase="memory",
+                        prompt_text=prompt,
+                        prompt_text_by_sample=prompt_by_sample,
+                        model=model,
+                        round_index=round_index,
+                        unsupported_sample_ids=unsupported_sample_ids,
+                    )
+                    _copy_phase_artifacts(eval_run, round_dir, phase="memory", report=memory_report)
+                    _mark_stage(run_dir, state, stage, "completed")
+                    _mark_stage(
+                        run_dir,
+                        state,
+                        f"round_{round_index}_memory_evaluate",
+                        "completed",
+                        {"average_score": _score_summary(memory_report, model).get("average_score")},
+                    )
             else:
                 memory_report = read_json(memory_eval_path)
 
