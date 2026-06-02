@@ -374,12 +374,55 @@ def test_batch_translates_chunks_and_exports_combined(tmp_path: Path, monkeypatc
     batch_dir = Path(data["batch_dir"])
     assert (batch_dir / "batch_manifest.json").exists()
     assert (batch_dir / "chapter_results.json").exists()
+    assert (batch_dir / "chapter_status_table.csv").exists()
+    assert (batch_dir / "failed_chunk_table.csv").exists()
+    assert (batch_dir / "provider_model_cost_table.csv").exists()
+    assert (batch_dir / "cost_token_summary.json").exists()
+    assert (batch_dir / "cost_token_summary.md").exists()
     assert (batch_dir / "outputs" / "1.vi.txt").exists()
     assert (batch_dir / "outputs" / "2.vi.txt").exists()
     assert (batch_dir / "full_novel.vi.txt").exists()
     assert any((batch_dir / "chunk_outputs").glob("**/translation.vi.txt"))
+    manifest = json.loads((batch_dir / "batch_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["phase6_dashboard"]["schema_version"] == "phase6_batch_cost_token_summary_v1"
+    assert manifest["phase6_dashboard"]["api_calls"] == manifest["actual_api_calls"]
+    assert manifest["chapter_status_table"] == str(batch_dir / "chapter_status_table.csv")
+    cost_summary = json.loads((batch_dir / "cost_token_summary.json").read_text(encoding="utf-8"))
+    assert cost_summary["schema_version"] == "phase6_batch_cost_token_summary_v1"
+    assert cost_summary["chapter_status_table"] == str(batch_dir / "chapter_status_table.csv")
+    assert "chapter_no,chapter_id,status,chunk_count" in (batch_dir / "chapter_status_table.csv").read_text(encoding="utf-8")
     results = json.loads((batch_dir / "chapter_results.json").read_text(encoding="utf-8"))
     assert all(chapter["status"] == "success" for chapter in results["chapters"])
+
+    resumed = runner.invoke(
+        app,
+        [
+            "translate",
+            "batch",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "demo",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-production",
+            "--use-stable-prompt",
+            "--chapters",
+            "1-2",
+            "--max-chapters",
+            "2",
+            "--output-dir",
+            str(batch_dir),
+            "--export-combined",
+            "--json",
+        ],
+    )
+    assert resumed.exit_code == 0, resumed.output
+    resumed_manifest = json.loads((batch_dir / "batch_manifest.json").read_text(encoding="utf-8"))
+    assert all(chapter["status"] == "skipped_existing" for chapter in parse_json(resumed.output)["data"]["chapters"])
+    assert resumed_manifest["actual_api_calls"] == manifest["actual_api_calls"]
+    assert resumed_manifest["resume_session_api_calls"] == 0
 
 
 def test_batch_skip_existing_and_force_new_attempt(tmp_path: Path, monkeypatch) -> None:
@@ -426,11 +469,16 @@ def test_batch_skip_existing_and_force_new_attempt(tmp_path: Path, monkeypatch) 
             "1",
             "--max-chapters",
             "1",
+            "--export-combined",
             "--json",
         ],
     )
     assert skipped.exit_code == 0, skipped.output
-    assert parse_json(skipped.output)["data"]["chapters"][0]["status"] == "skipped_existing"
+    skipped_data = parse_json(skipped.output)["data"]
+    assert skipped_data["chapters"][0]["status"] == "skipped_existing"
+    skipped_combined = Path(skipped_data["batch_dir"]) / "full_novel.vi.txt"
+    assert skipped_combined.exists()
+    assert skipped_combined.read_text(encoding="utf-8").strip()
 
     forced = runner.invoke(
         app,

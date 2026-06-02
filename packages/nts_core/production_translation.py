@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import math
@@ -48,6 +49,191 @@ DEFAULT_BATCH_MAX_CHAPTERS = 3
 DEFAULT_MAX_SOURCE_CHARS_PER_CHAPTER = 5000
 DEFAULT_CHUNK_SIZE_CHARS = 3000
 DEFAULT_CHUNK_OVERLAP_PARAGRAPHS = 0
+
+
+def _model_run_rows(workspace: Workspace, model_run_ids: list[str]) -> dict[str, dict[str, Any]]:
+    ids = [model_run_id for model_run_id in model_run_ids if model_run_id]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    with connection(workspace.db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, provider_key, model_name, input_tokens, output_tokens, cost_estimate, status
+            FROM model_runs
+            WHERE id IN ({placeholders})
+            """,
+            ids,
+        ).fetchall()
+    return {str(row["id"]): row_to_dict(row) for row in rows}
+
+
+def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def _read_batch_quality_summary(batch_dir: Path, chapter_label: str) -> dict[str, Any]:
+    quality_path = batch_dir / "quality" / f"{chapter_label}_quality_report.json"
+    if not quality_path.exists():
+        return {}
+    try:
+        payload = json.loads(quality_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_phase6_batch_dashboard(
+    workspace: Workspace,
+    batch_dir: Path,
+    *,
+    chapter_results: list[dict[str, Any]],
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    model_run_ids: list[str] = []
+    for row in chapter_results:
+        quality = row.get("quality_summary") or {}
+        model_run_ids.extend(str(model_id) for model_id in quality.get("model_run_ids") or [] if model_id)
+        if row.get("model_run_id"):
+            model_run_ids.append(str(row["model_run_id"]))
+    model_rows = _model_run_rows(workspace, sorted(set(model_run_ids)))
+
+    chapter_rows: list[dict[str, Any]] = []
+    failed_rows: list[dict[str, Any]] = []
+    provider_model_totals: dict[tuple[str, str], dict[str, Any]] = {}
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cost_estimate = 0.0
+    for row in chapter_results:
+        quality = row.get("quality_summary") or {}
+        chapter_model_ids = [str(model_id) for model_id in quality.get("model_run_ids") or [] if model_id]
+        if not chapter_model_ids and row.get("model_run_id"):
+            chapter_model_ids = [str(row["model_run_id"])]
+        input_tokens = 0
+        output_tokens = 0
+        cost_estimate = 0.0
+        providers = set()
+        models = set()
+        for model_id in chapter_model_ids:
+            model_row = model_rows.get(model_id) or {}
+            input_tokens += int(model_row.get("input_tokens") or 0)
+            output_tokens += int(model_row.get("output_tokens") or 0)
+            cost_estimate += float(model_row.get("cost_estimate") or 0.0)
+            provider = str(model_row.get("provider_key") or manifest.get("provider") or "")
+            model = str(model_row.get("model_name") or manifest.get("model") or "")
+            if provider:
+                providers.add(provider)
+            if model:
+                models.add(model)
+            key = (provider, model)
+            totals = provider_model_totals.setdefault(
+                key,
+                {"provider": provider, "model": model, "api_calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_estimate": 0.0},
+            )
+            totals["api_calls"] += 1
+            totals["input_tokens"] += int(model_row.get("input_tokens") or 0)
+            totals["output_tokens"] += int(model_row.get("output_tokens") or 0)
+            totals["cost_estimate"] += float(model_row.get("cost_estimate") or 0.0)
+        total_input_tokens += input_tokens
+        total_output_tokens += output_tokens
+        total_cost_estimate += cost_estimate
+        chapter_row = {
+            "chapter_no": row.get("chapter_no"),
+            "chapter_id": row.get("chapter_id"),
+            "status": row.get("status"),
+            "chunk_count": row.get("chunk_count") or quality.get("chunk_count") or 0,
+            "output_path": row.get("output_path"),
+            "source_chars": quality.get("source_char_count") or 0,
+            "output_chars": quality.get("output_char_count") or 0,
+            "api_calls": len(chapter_model_ids),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_estimate": round(cost_estimate, 6),
+            "provider": ";".join(sorted(providers)) or manifest.get("provider"),
+            "model": ";".join(sorted(models)) or manifest.get("model"),
+            "warnings": "; ".join(str(warning) for warning in row.get("warnings") or []),
+            "error": row.get("error") or "",
+        }
+        chapter_rows.append(chapter_row)
+        if row.get("status") == "failed":
+            failed_rows.append(
+                {
+                    "chapter_no": row.get("chapter_no"),
+                    "chapter_id": row.get("chapter_id"),
+                    "chunk": "chapter",
+                    "provider": manifest.get("provider"),
+                    "model": manifest.get("model"),
+                    "error": row.get("error") or "",
+                    "provider_failure_report": row.get("provider_failure_report") or "",
+                }
+            )
+
+    _write_csv(
+        batch_dir / "chapter_status_table.csv",
+        [
+            "chapter_no",
+            "chapter_id",
+            "status",
+            "chunk_count",
+            "output_path",
+            "source_chars",
+            "output_chars",
+            "api_calls",
+            "input_tokens",
+            "output_tokens",
+            "cost_estimate",
+            "provider",
+            "model",
+            "warnings",
+            "error",
+        ],
+        chapter_rows,
+    )
+    _write_csv(
+        batch_dir / "failed_chunk_table.csv",
+        ["chapter_no", "chapter_id", "chunk", "provider", "model", "error", "provider_failure_report"],
+        failed_rows,
+    )
+    provider_model_rows = list(provider_model_totals.values())
+    _write_csv(
+        batch_dir / "provider_model_cost_table.csv",
+        ["provider", "model", "api_calls", "input_tokens", "output_tokens", "cost_estimate"],
+        provider_model_rows,
+    )
+    total_api_calls = sum(int(row.get("api_calls") or 0) for row in provider_model_rows)
+    summary = {
+        "schema_version": "phase6_batch_cost_token_summary_v1",
+        "api_calls": total_api_calls,
+        "estimated_api_calls": manifest.get("estimated_api_calls", 0),
+        "input_tokens": total_input_tokens,
+        "output_tokens": total_output_tokens,
+        "total_tokens": total_input_tokens + total_output_tokens,
+        "cost_estimate": round(total_cost_estimate, 6),
+        "cost_estimate_available": any(float(row.get("cost_estimate") or 0.0) for row in provider_model_rows),
+        "provider_model_rows": provider_model_rows,
+        "chapter_status_table": str(batch_dir / "chapter_status_table.csv"),
+        "failed_chunk_table": str(batch_dir / "failed_chunk_table.csv"),
+        "provider_model_cost_table": str(batch_dir / "provider_model_cost_table.csv"),
+        "cost_token_summary_path": str(batch_dir / "cost_token_summary.json"),
+        "cost_token_summary_md_path": str(batch_dir / "cost_token_summary.md"),
+    }
+    (batch_dir / "cost_token_summary.json").write_text(json_dumps(summary) + "\n", encoding="utf-8")
+    (batch_dir / "cost_token_summary.md").write_text(
+        "# Cost and Token Summary\n\n"
+        f"- API calls: `{summary['api_calls']}`\n"
+        f"- Input tokens: `{summary['input_tokens']}`\n"
+        f"- Output tokens: `{summary['output_tokens']}`\n"
+        f"- Total tokens: `{summary['total_tokens']}`\n"
+        f"- Cost estimate: `{summary['cost_estimate']}`\n"
+        f"- Cost estimate available: `{summary['cost_estimate_available']}`\n",
+        encoding="utf-8",
+    )
+    return summary
 
 
 
@@ -299,6 +485,14 @@ CHAPTER_HEADING_RE = re.compile(
 )
 
 
+def _is_nonfinal_split_child(paragraph_id: str, sample: dict[str, Any]) -> bool:
+    for row in sample.get("production_unit_split_rows") or []:
+        child_ids = [str(child_id) for child_id in row.get("child_ids") or []]
+        if paragraph_id in child_ids and child_ids and paragraph_id != child_ids[-1]:
+            return True
+    return False
+
+
 def _production_verification(
     verification: dict[str, Any],
     *,
@@ -318,10 +512,17 @@ def _production_verification(
         truncation_reasons = entry.get("reasons", [])
         source_for_pair = str(pair.get("source_text", ""))
         if (
-            truncation_reasons == ["missing_terminal_punctuation"]
+            set(truncation_reasons).issubset({"missing_terminal_punctuation", "suspicious_incomplete_final_token"})
             and CHAPTER_HEADING_RE.match(source_for_pair)
         ):
             warnings.append("heading_without_terminal_punctuation_allowed")
+            continue
+        if (
+            truncation_reasons == ["missing_terminal_punctuation"]
+            and _is_nonfinal_split_child(str(entry.get("paragraph_id") or ""), sample)
+            and not any(reason in truncation_reasons for reason in ("dangling_glossary_label", "suspicious_fragment_ending"))
+        ):
+            warnings.append("nonfinal_split_fragment_terminal_allowed")
             continue
         if (
             truncation_reasons == ["missing_terminal_punctuation"]
@@ -342,12 +543,14 @@ def _production_verification(
         ]
         if (
             overlong_rows
-            and all(row.get("output_reference_ratio", 99) <= 1.35 for row in overlong_rows)
+            and all(row.get("output_reference_ratio", 99) <= 2.35 for row in overlong_rows)
             and not truncated
             and not adjusted.get("terminology_mismatches")
+            and all(not row.get("truncation_detected") for row in overlong_rows)
             and all(str(row.get("unit_type") or "") in {"panel", "system_panel", "stat_line"} for row in overlong_rows)
         ):
             reasons.remove("paragraph_exceeds_strict_max")
+            warnings.append("complete_panel_over_strict_allowed")
             warnings.append("estimated_paragraph_budget_exceeded_reference_unavailable")
     adjusted["reasons"] = reasons
     adjusted["warnings"] = warnings
@@ -831,7 +1034,7 @@ def _write_production_unit_reports(artifact_dir: Path, sample: dict[str, Any]) -
     (artifact_dir / "unit_classification_table.csv").write_text(csv + "\n", encoding="utf-8")
 
 def _terminal_ok(text: str) -> bool:
-    return bool(re.search(r"[.!?。！？…\]）】\)\"']\s*$", (text or "").strip()))
+    return bool(re.search(r"[.!?。！？…\]）】\)\"'”’»」』]\s*$", (text or "").strip()))
 
 
 def _write_unit_split_plan(artifact_dir: Path, sample: dict[str, Any]) -> None:
@@ -866,6 +1069,9 @@ def _repair_prompt(pair: dict[str, Any], current_text: str, reasons: list[str], 
             "Preserve source meaning, names, terms, numbers, dialogue, and panels.",
             "Return a complete safe Vietnamese unit; do not truncate.",
             "Do not leave dangling labels or glossary fragments.",
+            "Balance all quotation marks; if a unit opens with “, it must close with ”.",
+            "Do not emit Chinese characters in the Vietnamese repair unless preserving an approved source term verbatim is required.",
+            "If strict_max is provided, the repaired text must be no longer than strict_max characters.",
             "Prefer safe completion over shorter incomplete text.",
             "If the unit is over strict_max, materially compress sentence structure and remove explanatory connective wording not explicit in the source.",
             "For mixed_panel_narration units, keep the bracketed prophecy compact and image-driven; avoid repeating subjects or adding interpretive phrases.",
@@ -1692,7 +1898,13 @@ def translate_batch_stable(
             output_path = batch_dir / "outputs" / f"{chapter_label}.vi.txt"
             with connection(workspace.db_path) as conn:
                 existing_translation = _existing_current_translation(conn, chapter_id)
-            if skip_existing and not force and (output_path.exists() or existing_translation):
+            existing_batch_output = output_path.exists()
+            existing_translation_can_skip = bool(existing_translation) and output_dir is None
+            if skip_existing and not force and (existing_batch_output or existing_translation_can_skip):
+                existing_text = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else str(existing_translation or "").strip()
+                quality_summary = _read_batch_quality_summary(batch_dir, chapter_label) if output_path.exists() else {}
+                if existing_text:
+                    combined_parts.append(existing_text)
                 skipped.append(chapter_id)
                 chapter_results.append(
                     {
@@ -1701,8 +1913,8 @@ def translate_batch_stable(
                         "status": "skipped_existing",
                         "output_path": str(output_path),
                         "task_run_id": None,
-                        "model_run_id": None,
-                        "quality_summary": {},
+                        "model_run_id": (quality_summary.get("model_run_ids") or [None])[-1],
+                        "quality_summary": quality_summary,
                         "warnings": ["existing current translation or output skipped"],
                         "error": None,
                         "chunk_count": len(chunks),
@@ -1905,6 +2117,20 @@ def translate_batch_stable(
         "actual_api_calls": 0 if dry_run else actual_api_calls,
         "resumed_from": str(resumed_from) if resumed_from else None,
     }
+    phase6_dashboard = _write_phase6_batch_dashboard(
+        workspace,
+        batch_dir,
+        chapter_results=chapter_results,
+        manifest=manifest,
+    )
+    if not dry_run:
+        manifest["resume_session_api_calls"] = actual_api_calls
+        manifest["actual_api_calls"] = phase6_dashboard["api_calls"]
+    manifest["phase6_dashboard"] = phase6_dashboard
+    manifest["chapter_status_table"] = phase6_dashboard["chapter_status_table"]
+    manifest["failed_chunk_table"] = phase6_dashboard["failed_chunk_table"]
+    manifest["provider_model_cost_table"] = phase6_dashboard["provider_model_cost_table"]
+    manifest["cost_token_summary"] = phase6_dashboard["cost_token_summary_path"]
     (batch_dir / "batch_manifest.json").write_text(json_dumps(manifest) + "\n", encoding="utf-8")
     (batch_dir / "chapter_results.json").write_text(json_dumps({"chapters": chapter_results}) + "\n", encoding="utf-8")
     report_lines = [
@@ -1917,6 +2143,13 @@ def translate_batch_stable(
         f"- Chapters skipped: `{len(skipped)}`",
         f"- Chapters failed: `{len(failed)}`",
         f"- Estimated API calls: `{estimated_api_calls}`",
+        f"- Actual API calls: `{manifest['actual_api_calls']}`",
+        f"- Input tokens: `{phase6_dashboard['input_tokens']}`",
+        f"- Output tokens: `{phase6_dashboard['output_tokens']}`",
+        f"- Cost estimate: `{phase6_dashboard['cost_estimate']}`",
+        f"- Chapter status table: `{phase6_dashboard['chapter_status_table']}`",
+        f"- Failed chunk table: `{phase6_dashboard['failed_chunk_table']}`",
+        f"- Provider/model cost table: `{phase6_dashboard['provider_model_cost_table']}`",
         "",
     ]
     for result in chapter_results:
@@ -1947,4 +2180,5 @@ def translate_batch_stable(
         "warnings": manifest["warnings"],
         "estimated_api_calls": estimated_api_calls,
         "actual_api_calls": manifest["actual_api_calls"],
+        "phase6_dashboard": phase6_dashboard,
     }

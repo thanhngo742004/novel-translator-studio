@@ -15,8 +15,10 @@ from nts_core.production_translation import (
     _compact_pair_budget,
     _classify_production_pair,
     _production_verification,
+    _repair_prompt,
     _repair_unsafe_units,
     _split_source_text,
+    _terminal_ok,
     build_production_prompt,
 )
 from nts_core.stable_prompts import StablePromptRecord
@@ -25,6 +27,91 @@ from nts_storage.workspace import init_workspace
 
 
 runner = CliRunner()
+
+
+def test_terminal_ok_accepts_smart_closing_quotes() -> None:
+    assert _terminal_ok("Hi Tuyền tiên tử nói: “Chọn việc liên quan Thanh Minh Ma Giáo.”")
+    assert _terminal_ok("Nàng đáp: ‘Được.’")
+
+
+def test_production_verification_allows_nonfinal_split_fragment_terminal() -> None:
+    sample = {
+        "paragraph_pairs": [
+            {"paragraph_id": "u001_a", "source_text": "Một nửa câu", "target_text": "Nửa đầu"},
+            {"paragraph_id": "u001_b", "source_text": "nửa còn lại。", "target_text": "nửa cuối."},
+        ],
+        "production_unit_split_rows": [
+            {"unit_id": "u001", "split_required": True, "child_ids": ["u001_a", "u001_b"]},
+        ],
+    }
+    adjusted = _production_verification(
+        {
+            "reasons": ["paragraph_truncation_detected"],
+            "truncated_paragraphs": [{"paragraph_id": "u001_a", "reasons": ["missing_terminal_punctuation"]}],
+            "warnings": [],
+        },
+        sample=sample,
+    )
+
+    assert "paragraph_truncation_detected" not in adjusted["reasons"]
+    assert adjusted["truncated_paragraphs"] == []
+    assert "nonfinal_split_fragment_terminal_allowed" in adjusted["warnings"]
+
+
+def test_production_verification_allows_heading_without_terminal() -> None:
+    sample = {"paragraph_pairs": [{"paragraph_id": "u001", "source_text": "第22章 获得灵宝"}]}
+    adjusted = _production_verification(
+        {
+            "reasons": ["paragraph_truncation_detected"],
+            "truncated_paragraphs": [{"paragraph_id": "u001", "reasons": ["suspicious_incomplete_final_token"]}],
+            "warnings": [],
+        },
+        sample=sample,
+    )
+
+    assert "paragraph_truncation_detected" not in adjusted["reasons"]
+    assert adjusted["truncated_paragraphs"] == []
+    assert "heading_without_terminal_punctuation_allowed" in adjusted["warnings"]
+
+
+def test_production_verification_allows_complete_panel_over_strict() -> None:
+    adjusted = _production_verification(
+        {
+            "reasons": ["paragraph_exceeds_strict_max"],
+            "truncated_paragraphs": [],
+            "terminology_mismatches": [],
+            "per_paragraph_length_table": [
+                {
+                    "paragraph_id": "u001",
+                    "unit_type": "panel",
+                    "over_strict_max": True,
+                    "output_reference_ratio": 2.2,
+                    "truncation_detected": False,
+                }
+            ],
+            "warnings": [],
+        },
+        sample={"paragraph_pairs": [{"paragraph_id": "u001", "source_text": "【法术：无】"}]},
+    )
+
+    assert "paragraph_exceeds_strict_max" not in adjusted["reasons"]
+    assert "complete_panel_over_strict_allowed" in adjusted["warnings"]
+
+
+def test_repair_prompt_requires_balanced_quotes_and_strict_max() -> None:
+    payload = json.loads(
+        _repair_prompt(
+            {"paragraph_id": "u001", "source_text": "他说。", "strict_max": 120},
+            "Ông nói: “dở dang",
+            ["unmatched_curly_quote", "paragraph_exceeds_strict_max"],
+            {"fixed_terms": []},
+        )
+    )
+    instructions = "\n".join(payload["instructions"])
+
+    assert "close with ”" in instructions
+    assert "no longer than strict_max" in instructions
+    assert payload["strict_max"] == 120
 
 
 def parse_json(output: str) -> dict:
