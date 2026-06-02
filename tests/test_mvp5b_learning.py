@@ -20,6 +20,39 @@ def parse_json(output: str) -> dict:
     return json.loads(output)
 
 
+def test_learning_prompt_strips_cross_project_stable_glossary() -> None:
+    from nts_core.learning_loop import _stable_prompt_for_learning
+    from nts_core.stable_prompts import StablePromptRecord
+
+    record = StablePromptRecord(
+        prompt_id="han-jue_mvp48_candidate",
+        prompt_version=None,
+        source_eval_run_id="han-jue_eval_123",
+        language_pair=None,
+        domain=None,
+        quality_summary={},
+        stable_gate_summary={},
+        approval_status="approved",
+        approval_path=None,
+        prompt_text=(
+            "Stable body\n"
+            "Temporary style profile: Han profile\n"
+            "Required glossary mappings when the source term appears: [{\"source\": \"韩绝\", \"target\": \"Hàn Tuyệt\"}]\n"
+            "Return JSON only"
+        ),
+        prompt_path="stable.md",
+        metadata_path="stable.json",
+        created_at=None,
+    )
+
+    prompt = _stable_prompt_for_learning(record, project_slug="tien-nghich")
+
+    assert "Stable body" in prompt
+    assert "Production learning evaluation mode:" in prompt
+    assert "韩绝" not in prompt
+    assert "Temporary style profile" not in prompt
+
+
 def init_learning_workspace(tmp_path: Path, monkeypatch, *, approved: bool = True) -> Path:
     monkeypatch.chdir(tmp_path)
     workspace = tmp_path / "workspace"

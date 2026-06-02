@@ -47,6 +47,40 @@ class StablePromptRecord:
         }
 
 
+PROJECT_SPECIFIC_PROMPT_PREFIXES = (
+    "Temporary style profile:",
+    "Required glossary mappings when the source term appears:",
+    "Candidate Vietnamese renderings to consider, not hard rules:",
+)
+
+
+def _project_key(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+
+
+def _record_project_key(record: StablePromptRecord) -> str:
+    for raw in (record.prompt_id, record.source_eval_run_id):
+        key = _project_key(raw)
+        if key.startswith("han-jue"):
+            return "han-jue"
+        if key.startswith("tien-nghich"):
+            return "tien-nghich"
+    return ""
+
+
+def prompt_text_for_project(record: StablePromptRecord, project_slug: str | None) -> str:
+    """Return stable prompt text without stale project-specific hints for other novels."""
+    record_project = _record_project_key(record)
+    requested_project = _project_key(project_slug)
+    if not requested_project or not record_project or record_project == requested_project:
+        return record.prompt_text
+    return "\n".join(
+        line
+        for line in record.prompt_text.splitlines()
+        if not line.startswith(PROJECT_SPECIFIC_PROMPT_PREFIXES)
+    ).strip()
+
+
 def _extract_prompt_text(raw_prompt: str) -> str:
     match = re.search(r"```(?:text)?\s*(.*?)\s*```", raw_prompt, flags=re.DOTALL | re.IGNORECASE)
     return match.group(1).strip() if match else raw_prompt.strip()

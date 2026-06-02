@@ -920,6 +920,55 @@ def test_validation_prompt_omits_phase_marker_to_reduce_round_variance() -> None
     assert "Approved-memory validation mode:" in prompt
 
 
+def test_validation_prompt_strips_cross_project_stable_glossary() -> None:
+    from nts_core.approved_memory_validation import _validation_prompt
+    from nts_core.stable_prompts import StablePromptRecord
+
+    record = StablePromptRecord(
+        prompt_id="han-jue_mvp48_candidate",
+        prompt_version=None,
+        source_eval_run_id="han-jue_eval_123",
+        language_pair=None,
+        domain=None,
+        quality_summary={},
+        stable_gate_summary={},
+        approval_status="approved",
+        approval_path=None,
+        prompt_text=(
+            "Stable body\n"
+            "Temporary style profile: Han profile\n"
+            "Required glossary mappings when the source term appears: [{\"source\": \"韩绝\", \"target\": \"Hàn Tuyệt\"}]\n"
+            "Candidate Vietnamese renderings to consider, not hard rules: {\"names\": [\"Hàn\"]}\n"
+            "Return JSON only"
+        ),
+        prompt_path="stable.md",
+        metadata_path="stable.json",
+        created_at=None,
+    )
+
+    tien_prompt = _validation_prompt(
+        record,
+        included_memory=[],
+        excluded_memory=[],
+        phase="round_1_baseline:sample_1",
+        project_slug="tien-nghich",
+    )
+    han_prompt = _validation_prompt(
+        record,
+        included_memory=[],
+        excluded_memory=[],
+        phase="round_1_baseline:sample_1",
+        project_slug="han-jue",
+    )
+
+    assert "Stable body" in tien_prompt
+    assert "Return JSON only" in tien_prompt
+    assert "韩绝" not in tien_prompt
+    assert "Temporary style profile" not in tien_prompt
+    assert "Candidate Vietnamese renderings" not in tien_prompt
+    assert "韩绝" in han_prompt
+
+
 def test_validation_prompts_use_empty_hybrid_context_when_no_support_items(monkeypatch, tmp_path: Path) -> None:
     from nts_core.approved_memory_validation import _validation_prompts_by_sample
     from nts_core.stable_prompts import StablePromptRecord

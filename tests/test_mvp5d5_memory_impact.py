@@ -966,20 +966,361 @@ def test_auto_review_rejects_conflict_and_insufficient_evidence(tmp_path: Path, 
     assert classes["candidate_weak"] == "insufficient_evidence"
 
 
-def test_tien_nghich_mining_excludes_han_jue_specific_pattern(tmp_path: Path, monkeypatch) -> None:
+def test_auto_review_rejected_memory_gate_is_source_target_specific(tmp_path: Path, monkeypatch) -> None:
+    from nts_core.memory_impact import auto_review_memory_candidates
+
+    workspace = init_workspace(tmp_path, monkeypatch)
+    created = runner.invoke(app, ["project", "create", "--workspace", str(workspace), "--slug", "auto-review", "--name", "Auto Review", "--source-lang", "zh", "--target-lang", "vi", "--json"])
+    assert created.exit_code == 0, created.output
+    ws = __import__("nts_storage.workspace", fromlist=["Workspace"]).Workspace(workspace)
+    project = parse_json(created.output)["data"]
+    rejected_target = "Khi đoạn có 王林, luôn mở rộng câu để chống nén."
+    made = runner.invoke(
+        app,
+        [
+            "memory",
+            "create",
+            "--workspace",
+            str(workspace),
+            "--type",
+            "correction",
+            "--status",
+            "deprecated",
+            "--layer",
+            "learning_candidate",
+            "--project",
+            "auto-review",
+            "--source-key",
+            "王林",
+            "--target-text",
+            rejected_target,
+            "--value-json",
+            json.dumps({"candidate_id": "candidate_old_bad", "source_pattern": "王林", "preferred_target": rejected_target}, ensure_ascii=False),
+            "--rules-json",
+            json.dumps({"preferred_target": rejected_target}, ensure_ascii=False),
+            "--confidence-score",
+            "0.8",
+            "--json",
+        ],
+    )
+    assert made.exit_code == 0, made.output
+    run_dir = workspace / "artifacts" / "memory_candidate_mining" / "auto-review_mining_signature_fixture"
+    run_dir.mkdir(parents=True)
+    rows = [
+        {
+            "candidate_id": "candidate_wanglin_name",
+            "memory_type": "name",
+            "candidate_type": "name_memory",
+            "source_pattern": "王林",
+            "preferred_target": "Vương Lâm",
+            "scope": {"project_slug": "auto-review", "project_id": project["id"]},
+            "confidence": 0.9,
+            "evidence_count": 2,
+            "evidence": [{"source_excerpt": "王林"}, {"source_excerpt": "王林"}],
+            "status": "pending_review",
+            "review_status": "high_confidence_approve_candidate",
+        },
+        {
+            "candidate_id": "candidate_same_rejected_signature",
+            "memory_type": "correction_rule",
+            "candidate_type": "correction_rule_memory",
+            "source_pattern": "王林",
+            "preferred_target": rejected_target,
+            "scope": {"project_slug": "auto-review", "project_id": project["id"]},
+            "confidence": 0.9,
+            "evidence_count": 2,
+            "evidence": [{"source_excerpt": "王林"}, {"source_excerpt": "王林"}],
+            "status": "pending_review",
+            "review_status": "high_confidence_approve_candidate",
+        },
+    ]
+    (run_dir / "mined_memory_candidates.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+    (run_dir / "candidate_conflicts.json").write_text(json.dumps({"conflicts": []}), encoding="utf-8")
+
+    result = auto_review_memory_candidates(ws, project_slug="auto-review", candidate_run=str(run_dir))
+
+    assert result["activated_candidate_ids"] == ["candidate_wanglin_name"]
+    bundle = json.loads(Path(result["candidate_bundle"]).read_text(encoding="utf-8"))
+    classes = {candidate["candidate_id"]: candidate["auto_review_classification"] for candidate in bundle["candidates"]}
+    reasons = {candidate["candidate_id"]: candidate["auto_review_reasons"] for candidate in bundle["candidates"]}
+    assert classes["candidate_wanglin_name"] == "safe_positive"
+    assert classes["candidate_same_rejected_signature"] == "harmful"
+    assert reasons["candidate_same_rejected_signature"] == ["previously_rolled_back_or_rejected_candidate"]
+
+
+def test_auto_review_allows_nontriggering_bundle_rollback_revalidation(tmp_path: Path, monkeypatch) -> None:
+    from nts_core.memory_impact import auto_review_memory_candidates
+
+    workspace = init_workspace(tmp_path, monkeypatch)
+    created = runner.invoke(app, ["project", "create", "--workspace", str(workspace), "--slug", "auto-review", "--name", "Auto Review", "--source-lang", "zh", "--target-lang", "vi", "--json"])
+    assert created.exit_code == 0, created.output
+    ws = __import__("nts_storage.workspace", fromlist=["Workspace"]).Workspace(workspace)
+    project = parse_json(created.output)["data"]
+    old_candidate_id = "candidate_old_nontriggering"
+    made = runner.invoke(
+        app,
+        [
+            "memory",
+            "create",
+            "--workspace",
+            str(workspace),
+            "--type",
+            "name",
+            "--status",
+            "deprecated",
+            "--layer",
+            "learning_candidate",
+            "--project",
+            "auto-review",
+            "--source-key",
+            "王卓",
+            "--target-text",
+            "Vương Trác",
+            "--value-json",
+            json.dumps({"candidate_id": old_candidate_id, "source_pattern": "王卓", "preferred_target": "Vương Trác"}, ensure_ascii=False),
+            "--rules-json",
+            json.dumps({"preferred_target": "Vương Trác"}, ensure_ascii=False),
+            "--confidence-score",
+            "0.9",
+            "--json",
+        ],
+    )
+    assert made.exit_code == 0, made.output
+    diagnostic_dir = workspace / "artifacts" / "memory_regression" / "diag_fixture"
+    diagnostic_dir.mkdir(parents=True)
+    diagnostic_path = diagnostic_dir / "chapter_1_regression_report.json"
+    diagnostic_path.write_text(json.dumps({"candidate_classifications": {old_candidate_id: "insufficient_evidence"}}, ensure_ascii=False), encoding="utf-8")
+    (diagnostic_dir / "memory_trigger_trace.json").write_text(
+        json.dumps(
+            {
+                "trace": [
+                    {
+                        "candidate_id": old_candidate_id,
+                        "source_match": False,
+                        "preferred_count_baseline": 0,
+                        "preferred_count_memory": 0,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    run_dir = workspace / "artifacts" / "memory_candidate_mining" / "auto-review_revalidation_fixture"
+    run_dir.mkdir(parents=True)
+    candidate = {
+        "candidate_id": "candidate_revalidate_nontriggering",
+        "revalidation_original_candidate_id": old_candidate_id,
+        "prior_regression_diagnostic": str(diagnostic_path),
+        "memory_type": "name",
+        "candidate_type": "name_memory",
+        "source_pattern": "王卓",
+        "preferred_target": "Vương Trác",
+        "scope": {"project_slug": "auto-review", "project_id": project["id"]},
+        "confidence": 0.9,
+        "evidence_count": 2,
+        "evidence": [{"source_excerpt": "王卓"}, {"source_excerpt": "王卓"}],
+        "status": "pending_review",
+        "review_status": "high_confidence_approve_candidate",
+    }
+    (run_dir / "mined_memory_candidates.jsonl").write_text(json.dumps(candidate, ensure_ascii=False) + "\n", encoding="utf-8")
+    (run_dir / "candidate_conflicts.json").write_text(json.dumps({"conflicts": []}), encoding="utf-8")
+
+    result = auto_review_memory_candidates(ws, project_slug="auto-review", candidate_run=str(run_dir))
+
+    assert result["activated_candidate_ids"] == ["candidate_revalidate_nontriggering"]
+    bundle = json.loads(Path(result["candidate_bundle"]).read_text(encoding="utf-8"))
+    reasons = bundle["candidates"][0]["auto_review_reasons"]
+    assert "revalidation_allowed_after_nontriggering_bundle_rollback" in reasons
+
+
+def test_auto_review_allows_safe_neutral_unchanged_trigger_revalidation(tmp_path: Path, monkeypatch) -> None:
+    from nts_core.memory_impact import auto_review_memory_candidates
+
+    workspace = init_workspace(tmp_path, monkeypatch)
+    created = runner.invoke(app, ["project", "create", "--workspace", str(workspace), "--slug", "auto-review", "--name", "Auto Review", "--source-lang", "zh", "--target-lang", "vi", "--json"])
+    assert created.exit_code == 0, created.output
+    ws = __import__("nts_storage.workspace", fromlist=["Workspace"]).Workspace(workspace)
+    project = parse_json(created.output)["data"]
+    old_candidate_id = "candidate_old_safe_neutral"
+    made = runner.invoke(
+        app,
+        [
+            "memory",
+            "create",
+            "--workspace",
+            str(workspace),
+            "--type",
+            "name",
+            "--status",
+            "deprecated",
+            "--layer",
+            "learning_candidate",
+            "--project",
+            "auto-review",
+            "--source-key",
+            "铁柱",
+            "--target-text",
+            "Thiết Trụ",
+            "--value-json",
+            json.dumps({"candidate_id": old_candidate_id, "source_pattern": "铁柱", "preferred_target": "Thiết Trụ"}, ensure_ascii=False),
+            "--rules-json",
+            json.dumps({"preferred_target": "Thiết Trụ"}, ensure_ascii=False),
+            "--confidence-score",
+            "0.9",
+            "--json",
+        ],
+    )
+    assert made.exit_code == 0, made.output
+    diagnostic_dir = workspace / "artifacts" / "memory_regression" / "safe_neutral_diag_fixture"
+    diagnostic_dir.mkdir(parents=True)
+    diagnostic_path = diagnostic_dir / "chapter_1_regression_report.json"
+    diagnostic_path.write_text(json.dumps({"candidate_classifications": {old_candidate_id: "safe_neutral"}}, ensure_ascii=False), encoding="utf-8")
+    (diagnostic_dir / "memory_trigger_trace.json").write_text(
+        json.dumps(
+            {
+                "trace": [
+                    {
+                        "candidate_id": old_candidate_id,
+                        "source_match": True,
+                        "preferred_count_baseline": 5,
+                        "preferred_count_memory": 5,
+                        "preferred_in_baseline_output": True,
+                        "forbidden_variant_hits": [],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    run_dir = workspace / "artifacts" / "memory_candidate_mining" / "auto-review_safe_neutral_revalidation_fixture"
+    run_dir.mkdir(parents=True)
+    candidate = {
+        "candidate_id": "candidate_revalidate_safe_neutral",
+        "revalidation_original_candidate_id": old_candidate_id,
+        "prior_regression_diagnostic": str(diagnostic_path),
+        "memory_type": "name",
+        "candidate_type": "name_memory",
+        "source_pattern": "铁柱",
+        "preferred_target": "Thiết Trụ",
+        "scope": {"project_slug": "auto-review", "project_id": project["id"]},
+        "confidence": 0.9,
+        "evidence_count": 2,
+        "evidence": [{"source_excerpt": "铁柱"}, {"source_excerpt": "铁柱"}],
+        "status": "pending_review",
+        "review_status": "high_confidence_approve_candidate",
+    }
+    (run_dir / "mined_memory_candidates.jsonl").write_text(json.dumps(candidate, ensure_ascii=False) + "\n", encoding="utf-8")
+    (run_dir / "candidate_conflicts.json").write_text(json.dumps({"conflicts": []}), encoding="utf-8")
+
+    result = auto_review_memory_candidates(ws, project_slug="auto-review", candidate_run=str(run_dir))
+
+    assert result["activated_candidate_ids"] == ["candidate_revalidate_safe_neutral"]
+    bundle = json.loads(Path(result["candidate_bundle"]).read_text(encoding="utf-8"))
+    reasons = bundle["candidates"][0]["auto_review_reasons"]
+    assert "revalidation_allowed_after_nontriggering_bundle_rollback" in reasons
+
+
+def test_mining_confidence_rewards_aligned_human_preferred_evidence() -> None:
+    from nts_core.memory_impact import _pattern_evidence
+
+    rows = [
+        {
+            "round": 1,
+            "chapter_id": 9,
+            "sample_id": "sample_9",
+            "source_text": "王林取出石珠。",
+            "human_reference": "Vương Lâm lấy thạch châu ra.",
+            "baseline_output": "Vương Lâm lấy hạt châu đá ra.",
+            "memory_output": "",
+        },
+        {
+            "round": 2,
+            "chapter_id": 9,
+            "sample_id": "sample_9",
+            "source_text": "王林取出石珠。",
+            "human_reference": "Vương Lâm lấy thạch châu ra.",
+            "baseline_output": "Vương Lâm lấy hạt châu đá ra.",
+            "memory_output": "",
+        },
+    ]
+    aligned = _pattern_evidence(
+        {"source_pattern": "石珠", "preferred_target": "thạch châu", "rejected_variants": []},
+        rows,
+    )
+    unaligned = _pattern_evidence(
+        {"source_pattern": "王浩", "preferred_target": "Vương Hạo", "rejected_variants": []},
+        [{**row, "source_text": "王浩在旁边。", "human_reference": "Một người đứng bên cạnh."} for row in rows],
+    )
+
+    assert aligned["human_preferred_hits"] == 2
+    assert aligned["confidence"] == 0.75
+    assert unaligned["human_preferred_hits"] == 0
+    assert unaligned["confidence"] == 0.7
+
+
+def test_tien_nghich_mining_uses_project_patterns_and_excludes_han_jue(tmp_path: Path, monkeypatch) -> None:
     workspace = init_workspace(tmp_path, monkeypatch)
     created = runner.invoke(app, ["project", "create", "--workspace", str(workspace), "--slug", "tien-nghich", "--name", "Tien Nghich", "--source-lang", "zh", "--target-lang", "vi", "--json"])
     assert created.exit_code == 0, created.output
     run_dir = workspace / "artifacts" / "approved_memory_validation" / "fake_tien_nghich_validation"
     run_dir.mkdir(parents=True, exist_ok=True)
-    summary = {"schema_version": "approved_memory_validation_summary_v1", "validation_run_id": run_dir.name, "final_decision": "FAIL"}
+    summary = {
+        "schema_version": "approved_memory_validation_summary_v1",
+        "validation_run_id": run_dir.name,
+        "final_decision": "FAIL",
+        "round_results": [
+            {
+                "round": 1,
+                "sample_deltas": [
+                    {
+                        "chapter_id": 1,
+                        "sample_id": "sample_1",
+                        "delta": -1.0,
+                        "baseline_score": 80,
+                        "memory_score": 79,
+                    }
+                ],
+            },
+            {
+                "round": 2,
+                "sample_deltas": [
+                    {
+                        "chapter_id": 1,
+                        "sample_id": "sample_1",
+                        "delta": 0.0,
+                        "baseline_score": 80,
+                        "memory_score": 80,
+                    }
+                ],
+            },
+        ],
+    }
     (run_dir / "final_validation_summary.json").write_text(json.dumps(summary), encoding="utf-8")
     (run_dir / "validation_job_state.json").write_text(json.dumps({"project_slug": "tien-nghich", "validation_run_id": run_dir.name}), encoding="utf-8")
-    evidence_rows = {"rows": [{"round": 1, "chapter_id": 1, "sample_id": "sample_1", "source_text": "王林看着众人。", "human_reference": "Vương Lâm nhìn mọi người.", "baseline_output": "Hắn nhìn mọi người.", "memory_output": "Hắn nhìn mọi người.", "score_delta": -1.0}]}
-    (run_dir / "evaluation_rows.json").write_text(json.dumps(evidence_rows, ensure_ascii=False), encoding="utf-8")
+    (run_dir / "selected_samples.json").write_text(
+        json.dumps(
+            {
+                "samples": [
+                    {
+                        "chapter_id": 1,
+                        "sample_id": "sample_1",
+                        "source_text": "王林看着众人。",
+                        "target_text": "Vương Lâm nhìn mọi người.",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     mined = runner.invoke(app, ["learn", "mine-memory-candidates", "--workspace", str(workspace), "--project", "tien-nghich", "--validation-run", str(run_dir), "--json"])
     assert mined.exit_code == 0, mined.output
     data = parse_json(mined.output)["data"]
     text = Path(data["report_paths"]["jsonl"]).read_text(encoding="utf-8")
     assert "韩绝" not in text
+    assert "青冥魔教" not in text
+    assert "王林" in text
+    assert "Vương Lâm" in text

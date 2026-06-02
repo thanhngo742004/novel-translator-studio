@@ -25,7 +25,7 @@ from nts_core.eval_harness import (
 )
 from nts_core.memory import add_evidence, create_memory_item, update_memory_status
 from nts_core.projects import get_project_by_slug
-from nts_core.stable_prompts import StablePromptBlocker, StablePromptRecord, load_approved_stable_prompt
+from nts_core.stable_prompts import StablePromptBlocker, StablePromptRecord, load_approved_stable_prompt, prompt_text_for_project
 from nts_storage.database import connection, insert_task_run, new_id, utc_now
 from nts_storage.workspace import Workspace
 
@@ -381,11 +381,12 @@ def prepare_learning_dataset(
 def _stable_prompt_for_learning(
     stable_prompt: StablePromptRecord,
     *,
+    project_slug: str | None = None,
     test_memory_bundle: dict[str, Any] | None = None,
     strategy: str | None = None,
 ) -> str:
     sections = [
-        stable_prompt.prompt_text,
+        prompt_text_for_project(stable_prompt, project_slug),
         "",
         "Production learning evaluation mode:",
         "- Use the approved stable prompt as the base behavior.",
@@ -431,6 +432,7 @@ def run_learning_evaluation(
     selected_chapters = parse_chapter_selection(chapters)
     prompt_text = _stable_prompt_for_learning(
         stable_prompt,
+        project_slug=project_slug,
         test_memory_bundle=test_memory_bundle,
         strategy=strategy,
     )

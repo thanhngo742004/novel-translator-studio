@@ -30,7 +30,7 @@ from nts_core.eval_harness import (
 )
 from nts_core.memory import build_bundle
 from nts_core.projects import get_project_by_id, get_project_by_slug
-from nts_core.stable_prompts import StablePromptBlocker, StablePromptRecord, load_approved_stable_prompt
+from nts_core.stable_prompts import StablePromptBlocker, StablePromptRecord, load_approved_stable_prompt, prompt_text_for_project
 from nts_core.text_import import get_chapter, list_chapters, list_segments
 from nts_storage.database import (
     connection,
@@ -404,13 +404,14 @@ def _production_sample(
 def build_production_prompt(
     *,
     stable_prompt: StablePromptRecord,
+    project_slug: str | None = None,
     sample: dict[str, Any],
     memory_bundle: dict[str, Any],
     glossary: dict[str, Any],
     dictionary_block: str | None = None,
     support_block: str | None = None,
 ) -> tuple[str, str]:
-    system_sections = [stable_prompt.prompt_text, ""]
+    system_sections = [prompt_text_for_project(stable_prompt, project_slug), ""]
     rendered_support_block = support_block or dictionary_block
     if rendered_support_block:
         system_sections.extend([rendered_support_block, ""])
@@ -1049,6 +1050,7 @@ def translate_chapter_stable(
     )
     system_prompt, user_prompt = build_production_prompt(
         stable_prompt=stable_prompt,
+        project_slug=project["slug"],
         sample=sample,
         memory_bundle=bundle,
         glossary=glossary,

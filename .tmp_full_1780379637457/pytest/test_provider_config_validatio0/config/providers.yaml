@@ -1,0 +1,10 @@
+
+providers:
+  ckey_openai_compatible:
+    type: OpenAI-compatible chat/completions
+    base_url: https://ckey.vn/v1
+    api_key_env: CKEY_API_KEY
+    route: chat/completions
+    models:
+      - gpt-5.5
+      - gpt-5.4-mini

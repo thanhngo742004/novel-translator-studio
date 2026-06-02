@@ -268,6 +268,9 @@ def test_hybrid_support_dedupes_conflicts_and_filters_ineligible_memory(tmp_path
     selected_ids = {row["item_id"] for row in bundle["selected_items"]}
     dropped_reasons = {row.get("drop_reason") for row in bundle["dropped_items"]}
     assert "Project support for this source:" in rendered
+    assert "Treat support as local terminology only" in rendered
+    assert "do not rephrase surrounding text" in rendered
+    assert "If applying an entry would cause omission" in rendered
     assert "灵根资质 => Linh căn tư chất" in rendered
     assert "Wrong Target" not in rendered
     assert "skills" not in rendered

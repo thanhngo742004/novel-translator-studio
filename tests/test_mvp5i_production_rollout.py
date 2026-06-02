@@ -17,7 +17,9 @@ from nts_core.production_translation import (
     _production_verification,
     _repair_unsafe_units,
     _split_source_text,
+    build_production_prompt,
 )
+from nts_core.stable_prompts import StablePromptRecord
 from nts_storage.database import connection, json_dumps, utc_now
 from nts_storage.workspace import init_workspace
 
@@ -27,6 +29,43 @@ runner = CliRunner()
 
 def parse_json(output: str) -> dict:
     return json.loads(output)
+
+
+def test_production_prompt_strips_cross_project_stable_glossary() -> None:
+    record = StablePromptRecord(
+        prompt_id="han-jue_mvp48_candidate",
+        prompt_version=None,
+        source_eval_run_id="han-jue_eval_123",
+        language_pair=None,
+        domain=None,
+        quality_summary={},
+        stable_gate_summary={},
+        approval_status="approved",
+        approval_path=None,
+        prompt_text=(
+            "Stable body\n"
+            "Required glossary mappings when the source term appears: [{\"source\": \"韩绝\", \"target\": \"Hàn Tuyệt\"}]\n"
+            "Candidate Vietnamese renderings to consider, not hard rules: {\"names\": [\"Hàn\"]}\n"
+            "Return JSON only"
+        ),
+        prompt_path="stable.md",
+        metadata_path="stable.json",
+        created_at=None,
+    )
+    sample = {"chapter_id": 1, "paragraph_pairs": [], "source_text": "王林看着众人。"}
+
+    system_prompt, _user_prompt = build_production_prompt(
+        stable_prompt=record,
+        project_slug="tien-nghich",
+        sample=sample,
+        memory_bundle={"items": []},
+        glossary={},
+    )
+
+    assert "Stable body" in system_prompt
+    assert "Production translation mode:" in system_prompt
+    assert "韩绝" not in system_prompt
+    assert "Candidate Vietnamese renderings" not in system_prompt
 
 
 def _workspace_with_text(tmp_path: Path, text: str) -> Path:

@@ -883,6 +883,9 @@ def _render_block(items: list[SupportItem]) -> str:
     lines.extend(
         [
             "- Use entries only when the exact Chinese source appears in this chunk.",
+            "- Treat support as local terminology only; preserve all source meaning, details, and paragraph boundaries.",
+            "- If the target term already appears naturally, do not rephrase surrounding text just because support is present.",
+            "- If applying an entry would cause omission, addition, length drift, or an unnatural sentence, ignore that entry.",
             "- Do not apply unrelated entries.",
         ]
     )

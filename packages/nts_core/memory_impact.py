@@ -88,6 +88,50 @@ ADDITIONAL_MINING_PATTERNS: list[dict[str, Any]] = [
 MINING_PATTERNS: list[dict[str, Any]] = [*KNOWN_LEARNING_PATTERNS, *ADDITIONAL_MINING_PATTERNS]
 
 
+TIEN_NGHICH_MINING_PATTERNS: list[dict[str, Any]] = [
+    {
+        "candidate_type": "name_memory",
+        "memory_type": "name",
+        "source_pattern": "王林",
+        "preferred_target": "Vương Lâm",
+        "rejected_variants": ["Wang Lin", "Vương Linh"],
+        "reason": "tien_nghich_canon_main_character_name_from_human_reference",
+    },
+    {
+        "candidate_type": "name_memory",
+        "memory_type": "name",
+        "source_pattern": "铁柱",
+        "preferred_target": "Thiết Trụ",
+        "rejected_variants": ["Tie Zhu", "Thiết Chủ"],
+        "reason": "tien_nghich_canon_childhood_name_from_human_reference",
+    },
+    {
+        "candidate_type": "name_memory",
+        "memory_type": "name",
+        "source_pattern": "王卓",
+        "preferred_target": "Vương Trác",
+        "rejected_variants": ["Wang Zhuo", "Vương Chác"],
+        "reason": "tien_nghich_canon_character_name_from_human_reference",
+    },
+    {
+        "candidate_type": "name_memory",
+        "memory_type": "name",
+        "source_pattern": "王浩",
+        "preferred_target": "Vương Hạo",
+        "rejected_variants": ["Wang Hao"],
+        "reason": "tien_nghich_canon_character_name_from_human_reference",
+    },
+    {
+        "candidate_type": "term_memory",
+        "memory_type": "term",
+        "source_pattern": "石珠",
+        "preferred_target": "thạch châu",
+        "rejected_variants": ["đá châu", "hạt châu đá"],
+        "reason": "tien_nghich_canon_object_term_from_human_reference",
+    },
+]
+
+
 
 def _project_mining_patterns(project_slug: str) -> list[dict[str, Any]]:
     project_key = project_slug.strip().lower()
@@ -99,7 +143,10 @@ def _project_mining_patterns(project_slug: str) -> list[dict[str, Any]]:
         if project_key != "han-jue" and (source == "韩绝" or "han_jue" in reason or "han_jue" in source.lower()):
             continue
         patterns.append(pattern)
-    patterns.extend(ADDITIONAL_MINING_PATTERNS)
+    if project_key == "han-jue":
+        patterns.extend(ADDITIONAL_MINING_PATTERNS)
+    elif project_key == "tien-nghich":
+        patterns.extend(TIEN_NGHICH_MINING_PATTERNS)
     return patterns
 
 def approved_memory_ablation_root(workspace: Workspace) -> Path:
@@ -790,11 +837,20 @@ def _pattern_evidence(pattern: dict[str, Any], rows: list[dict[str, Any]]) -> di
                 "ai_missing_preferred": ai_missing_preferred,
             }
         )
-    confidence = min(0.92, 0.45 + 0.1 * len(evidence) + 0.05 * len(chapters) + (0.05 if rejected_hits else 0))
+    human_preferred_hits = sum(1 for item in evidence if item.get("human_preferred_hit"))
+    confidence = min(
+        0.92,
+        0.45
+        + 0.1 * len(evidence)
+        + 0.05 * len(chapters)
+        + (0.05 if rejected_hits else 0)
+        + (0.05 if human_preferred_hits >= 2 else 0),
+    )
     return {
         "evidence_count": len(evidence),
         "chapter_spread": len(chapters),
         "rejected_variant_hits": rejected_hits,
+        "human_preferred_hits": human_preferred_hits,
         "confidence": round(confidence, 3) if evidence else 0.0,
         "evidence": evidence[:20],
     }
@@ -1197,6 +1253,38 @@ def _candidate_id_from_memory(memory: dict[str, Any]) -> str | None:
     value = memory.get("value_json") or {}
     candidate_id = value.get("candidate_id")
     return str(candidate_id) if candidate_id else None
+
+
+def _scoped_revalidation_allowed(candidate: dict[str, Any]) -> bool:
+    diagnostic = candidate.get("prior_regression_diagnostic") or candidate.get("revalidation_diagnostic")
+    original_id = str(candidate.get("revalidation_original_candidate_id") or candidate.get("candidate_id") or "")
+    if not diagnostic or not original_id:
+        return False
+    try:
+        payload = read_json(Path(str(diagnostic)))
+    except Exception:
+        return False
+    classifications = payload.get("candidate_classifications") or {}
+    classification = classifications.get(original_id)
+    if classification not in {"safe_neutral", "insufficient_evidence"}:
+        return False
+    trace_path = Path(str(diagnostic)).with_name("memory_trigger_trace.json")
+    try:
+        trace_payload = read_json(trace_path)
+    except Exception:
+        return False
+    for row in trace_payload.get("trace", []):
+        if str(row.get("candidate_id") or "") != original_id:
+            continue
+        preferred_unchanged = int(row.get("preferred_count_memory") or 0) == int(row.get("preferred_count_baseline") or 0)
+        if not preferred_unchanged:
+            return False
+        if not bool(row.get("source_match")):
+            return True
+        if classification == "safe_neutral":
+            return not bool(row.get("forbidden_variant_hits") or []) and bool(row.get("preferred_in_baseline_output"))
+        return False
+    return False
 
 
 def _candidate_rows_by_id(memories: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -1820,10 +1908,16 @@ def auto_review_memory_candidates(
     conflicts_payload = read_json(run_path / "candidate_conflicts.json") if (run_path / "candidate_conflicts.json").exists() else {"conflicts": []}
     conflict_ids = {str(item.get("candidate_id")) for item in conflicts_payload.get("conflicts", [])}
     active_index = _existing_memory_index(_memory_rows(workspace, project_slug, statuses={"active", "pending"}))
-    rejected_sources = {
-        _memory_source(item)
+    rejected_rows = [
+        item
         for item in _memory_rows(workspace, project_slug, statuses={"deprecated", "rejected"})
-        if (item.get("value_json") or {}).get("candidate_id")
+        if _candidate_id_from_memory(item)
+    ]
+    rejected_candidate_ids = {str(candidate_id) for item in rejected_rows if (candidate_id := _candidate_id_from_memory(item))}
+    rejected_source_targets = {
+        (_memory_source(item), _normalize_text(_memory_target(item)))
+        for item in rejected_rows
+        if _memory_source(item) and _memory_target(item)
     }
     classified: list[dict[str, Any]] = []
     activatable: list[str] = []
@@ -1854,9 +1948,12 @@ def auto_review_memory_candidates(
             classification = "insufficient_evidence"
             reasons.append("missing_trigger_or_target")
         existing = active_index.get(source, [])
-        if source in rejected_sources:
+        revalidation_allowed = _scoped_revalidation_allowed(candidate)
+        if (cid in rejected_candidate_ids or (source, _normalize_text(target)) in rejected_source_targets) and not revalidation_allowed:
             classification = "harmful"
-            reasons.append("previously_rolled_back_or_rejected_source")
+            reasons.append("previously_rolled_back_or_rejected_candidate")
+        elif revalidation_allowed:
+            reasons.append("revalidation_allowed_after_nontriggering_bundle_rollback")
         if any(_normalize_text(_memory_target(item)) != _normalize_text(target) for item in existing):
             classification = "conflict"
             reasons.append("active_target_conflict")

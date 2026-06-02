@@ -43,7 +43,7 @@ from nts_core.learning_loop import (
 )
 from nts_core.projects import get_project_by_slug
 from nts_core.rules import load_all_project_rules, load_approved_rules
-from nts_core.stable_prompts import StablePromptRecord, load_approved_stable_prompt
+from nts_core.stable_prompts import StablePromptRecord, load_approved_stable_prompt, prompt_text_for_project
 from nts_storage.database import connection, insert_task_run, row_to_dict, utc_now
 from nts_storage.workspace import Workspace
 
@@ -1545,11 +1545,12 @@ def _validation_prompt(
     included_memory: list[dict[str, Any]],
     excluded_memory: list[dict[str, Any]],
     phase: str,
+    project_slug: str | None = None,
     dictionary_block: str | None = None,
     support_block: str | None = None,
 ) -> str:
     sections = [
-        stable_prompt.prompt_text,
+        prompt_text_for_project(stable_prompt, project_slug),
         "",
     ]
     rendered_support_block = support_block or dictionary_block
@@ -2062,6 +2063,7 @@ def _validation_prompts_by_sample(
             included_memory=included,
             excluded_memory=excluded_memory,
             phase=f"{phase}:{sample_id}",
+            project_slug=project_slug,
             dictionary_block=dictionary_context.get("block_text") if dictionary_enabled else None,
             support_block=hybrid_context.get("block_text") if hybrid_enabled else None,
         )
@@ -4565,6 +4567,7 @@ def resume_approved_memory_validation(
                     included_memory=baseline_memory,
                     excluded_memory=baseline_excluded,
                     phase=f"round_{round_index}_baseline",
+                    project_slug=str(state.get("project_slug") or ""),
                 )
                 prompt_by_sample = _validation_prompts_by_sample(
                     run_dir,
@@ -4612,6 +4615,7 @@ def resume_approved_memory_validation(
                     included_memory=memory_pass_memory,
                     excluded_memory=[],
                     phase=memory_phase_name,
+                    project_slug=str(state.get("project_slug") or ""),
                 )
                 prompt_by_sample = _validation_prompts_by_sample(
                     run_dir,
