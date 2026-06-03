@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0f172a" />
+    <title>NTS Studio</title>
+    <link rel="stylesheet" href="styles.css?v=phase7.5-browser-reality-fix" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Bỏ qua điều hướng</a>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Điều hướng chính">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">N</div>
+          <div>
+            <p class="eyebrow">Local-First</p>
+            <h1>NTS Studio</h1>
+          </div>
+        </div>
+        <nav class="nav-list" id="nav-list"></nav>
+        <div class="sidebar-note">
+          <strong>Hồ sơ an toàn đã kiểm chứng</strong>
+          <span>Rules chỉ dùng để QA, không đưa vào prompt dịch.</span>
+        </div>
+      </aside>
+
+      <main id="main" class="main-panel" tabindex="-1">
+        <section class="topbar" aria-labelledby="page-title">
+          <div>
+            <p class="eyebrow" id="page-kicker">Dịch truyện dài sang tiếng Việt</p>
+            <h2 id="page-title">Bạn muốn làm gì hôm nay?</h2>
+          </div>
+          <div class="status-pill" id="readiness-pill" aria-live="polite">Đang kiểm tra…</div>
+        </section>
+
+        <section class="page active" id="page-home" aria-labelledby="home-title">
+          <div class="hero-card">
+            <div>
+              <p class="eyebrow">Trang chủ</p>
+              <h3 id="home-title">Bạn muốn làm gì hôm nay?</h3>
+              <p>Chọn một việc chính. Chi tiết kỹ thuật được ẩn để bạn tập trung vào bản dịch.</p>
+            </div>
+            <div class="hero-actions">
+              <button class="primary" type="button" data-action="home.create_project">Tạo dự án truyện mới</button>
+              <button type="button" data-action="home.continue_project">Tiếp tục dịch truyện</button>
+              <button type="button" data-action="home.review_queue">Xem bản dịch cần kiểm tra</button>
+            </div>
+          </div>
+          <div class="status-grid" id="status-grid" aria-live="polite"></div>
+          <section class="panel" aria-labelledby="recent-projects-title">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Dự án gần đây</p>
+                <h3 id="recent-projects-title">Truyện đang làm</h3>
+              </div>
+              <button type="button" data-action="home.check_ltp">Kiểm tra lại LTP</button>
+              <button type="button" data-action="home.open_settings">Mở cài đặt API</button>
+            </div>
+            <div class="project-list" id="home-projects"></div>
+          </section>
+        </section>
+
+        <section class="page" id="page-projects" aria-labelledby="projects-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Dự án truyện</p>
+              <h3 id="projects-title">Theo dõi tiến độ từng truyện</h3>
+            </div>
+            <button class="primary" type="button" data-action="home.create_project">Tạo dự án truyện mới</button>
+          </div>
+          <div class="project-list" id="project-cards"></div>
+          <article class="panel wizard" aria-labelledby="wizard-title">
+            <p class="eyebrow">Tạo dự án mới</p>
+            <h3 id="wizard-title">7 bước đơn giản</h3>
+            <ol class="wizard-steps" id="wizard-steps"></ol>
+            <form class="form-grid" id="project-form">
+              <label>Tên ngắn dự án <input name="slug" autocomplete="off" placeholder="han-jue…" required /></label>
+              <label>Tên truyện <input name="name" autocomplete="off" placeholder="Hàn Tuyệt…" required /></label>
+              <label>Ngôn ngữ gốc <input name="source_lang" autocomplete="off" value="zh" required /></label>
+              <label>Ngôn ngữ đích <input name="target_lang" autocomplete="off" value="vi" required /></label>
+            </form>
+            <div class="button-row">
+              <button type="button" data-action="wizard.choose_file">Chọn file</button>
+              <button type="button" data-action="wizard.scan_chapters">Quét chương</button>
+              <button type="button" data-action="wizard.nlp_detect">Nhận diện tự động</button>
+              <button type="button" data-action="wizard.next">Tiếp tục</button>
+              <button class="primary" type="button" data-action="wizard.create">Tạo dự án</button>
+            </div>
+          </article>
+        </section>
+
+        <section class="page" id="page-translate" aria-labelledby="translate-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Dịch truyện</p>
+              <h3 id="translate-title">Chọn mức dịch phù hợp</h3>
+            </div>
+            <select id="project-select" name="project" aria-label="Chọn dự án"></select>
+          </div>
+          <div class="preset-grid">
+            <button type="button" data-action="translate.trial_1">Dịch thử 1 chương</button>
+            <button type="button" data-action="translate.trial_3">Dịch thử 3 chương</button>
+            <button type="button" data-action="translate.trial_10">Dịch thử 10 chương</button>
+            <button type="button" data-action="translate.batch_20">Dịch 20 chương</button>
+            <button type="button" data-action="translate.batch_50">Dịch 50 chương</button>
+            <button type="button" data-action="translate.resume">Tiếp tục từ chỗ dừng</button>
+          </div>
+          <article class="panel">
+            <div class="form-grid">
+              <label>Chương bắt đầu <input id="chapter-start" name="chapter_start" type="number" min="1" step="1" value="1" /></label>
+              <label>Chương kết thúc <input id="chapter-end" name="chapter_end" type="number" min="1" step="1" value="20" /></label>
+            </div>
+            <p class="status-line" id="chapter-range-message">Sẽ dịch chương 1–20</p>
+            <div class="safe-options">
+              <label><input type="checkbox" checked disabled /> Dùng từ điển đã duyệt</label>
+              <label><input type="checkbox" checked disabled /> Dùng ghi nhớ đã duyệt</label>
+              <label><input type="checkbox" checked disabled /> Tạo báo cáo chi tiết</label>
+              <label><input id="resumable-option" type="checkbox" checked /> Cho phép tiếp tục nếu bị dừng</label>
+            </div>
+            <div class="button-row">
+              <button class="primary" type="button" data-action="translate.start">Bắt đầu dịch</button>
+              <button type="button" data-action="translate.pause" disabled aria-describedby="pause-note">Tạm dừng</button>
+              <button type="button" data-action="translate.stop_after_current">Dừng sau chương hiện tại</button>
+              <button type="button" data-action="translate.technical">Xem chi tiết kỹ thuật</button>
+            </div>
+            <p class="muted" id="pause-note">Tạm dừng trực tiếp: Sắp hỗ trợ.</p>
+            <div class="job-status" id="translation-job-status" aria-live="polite">Chưa có tác vụ dịch nào được tạo.</div>
+            <div class="progress-panel" id="translation-progress-panel" hidden>
+              <div class="progress-meta">
+                <strong id="progress-project">Dự án</strong>
+                <span id="progress-range">Chương 1–1</span>
+                <span id="progress-status">queued</span>
+              </div>
+              <progress id="translation-progress" max="100" value="0">0%</progress>
+              <dl class="progress-grid">
+                <div><dt>Chương hiện tại</dt><dd id="progress-current-chapter">—</dd></div>
+                <div><dt>Chunk hiện tại</dt><dd id="progress-current-chunk">—</dd></div>
+                <div><dt>Chương hoàn tất</dt><dd id="progress-chapters">0 / 0</dd></div>
+                <div><dt>Chunk hoàn tất</dt><dd id="progress-chunks">0 / —</dd></div>
+                <div><dt>Phần trăm</dt><dd id="progress-percent">0%</dd></div>
+                <div><dt>Đã chạy</dt><dd id="progress-elapsed">0s</dd></div>
+                <div><dt>Ước tính còn lại</dt><dd id="progress-eta">—</dd></div>
+                <div><dt>Run ID</dt><dd id="progress-run-id">—</dd></div>
+              </dl>
+              <p id="progress-message">Đang chờ tác vụ.</p>
+              <p class="muted" id="progress-artifact">Artifact: —</p>
+              <div class="button-row">
+                <button type="button" data-action="job.details">Xem chi tiết</button>
+                <button type="button" data-action="job.open_artifacts">Mở thư mục kết quả</button>
+                <button type="button" data-action="job.resume">Tiếp tục từ chỗ dừng</button>
+                <button type="button" data-action="job.stop_after_current">Dừng sau chương hiện tại</button>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <section class="page" id="page-review" aria-labelledby="review-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Kiểm tra bản dịch</p>
+              <h3 id="review-title">Duyệt bản dịch cần xem lại</h3>
+            </div>
+            <button type="button" data-action="review.open_item">Mở đoạn cần kiểm tra</button>
+          </div>
+          <div class="review-layout">
+            <aside class="queue" id="review-queue">Không có bản dịch nào cần kiểm tra.</aside>
+            <article class="review-editor">
+              <label>Bản gốc <textarea id="source-text" name="source_text" readonly>Chọn một mục để xem bản gốc.</textarea></label>
+              <label>Bản dịch hiện tại <textarea id="current-translation" name="current_translation" readonly>Chọn một mục để xem bản dịch.</textarea></label>
+              <label>Bản đã chỉnh sửa <textarea id="reviewed-output" name="reviewed_output" placeholder="Nhập bản dịch đã chỉnh sửa…"></textarea></label>
+              <div class="button-row">
+                <button type="button" data-action="review.save">Lưu chỉnh sửa</button>
+                <button class="primary" type="button" data-action="review.learn">Lưu &amp; cho hệ thống học</button>
+                <button type="button" data-action="review.save_only">Không học, chỉ lưu bản dịch</button>
+                <button type="button" data-action="review.mark_reviewed">Đánh dấu đã kiểm tra</button>
+                <button type="button" data-action="review.skip">Bỏ qua</button>
+                <button type="button" data-action="review.toggle_source">Xem bản gốc</button>
+                <button type="button" data-action="review.technical">Xem chi tiết kỹ thuật</button>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="page" id="page-export" aria-labelledby="export-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Xuất file</p>
+              <h3 id="export-title">Tạo file để đọc hoặc kiểm tra</h3>
+            </div>
+          </div>
+          <article class="panel export-panel">
+            <p>TXT và gói kiểm tra được nối với backend. EPUB được hiển thị rõ là sắp hỗ trợ.</p>
+            <div class="button-row">
+              <button class="primary" type="button" data-action="export.txt">Xuất TXT</button>
+              <button type="button" data-action="export.epub" disabled>Xuất EPUB — Sắp hỗ trợ</button>
+              <button type="button" data-action="export.review_package">Xuất gói kiểm tra</button>
+              <button type="button" data-action="export.copy_path">Sao chép đường dẫn</button>
+            </div>
+          </article>
+        </section>
+
+        <section class="page" id="page-settings" aria-labelledby="settings-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Cài đặt</p>
+              <h3 id="settings-title">Kiểm tra workspace, API và LTP</h3>
+            </div>
+          </div>
+          <div class="settings-grid">
+            <article class="panel">
+              <h4>Workspace</h4>
+              <p id="workspace-path">Đang kiểm tra…</p>
+              <label>Đường dẫn workspace <input id="workspace-input" name="workspace_path" autocomplete="off" placeholder="C:\\path\\to\\workspace" /></label>
+              <div class="button-row">
+                <button type="button" data-action="settings.open_workspace">Mở workspace</button>
+                <button type="button" data-action="settings.choose_workspace">Chọn workspace</button>
+              </div>
+            </article>
+            <article class="panel"><h4>LTP</h4><p id="ltp-status">Đang kiểm tra…</p><button type="button" data-action="settings.check_ltp">Kiểm tra LTP</button><button type="button" data-action="settings.start_ltp">Khởi động LTP</button></article>
+            <article class="panel debug-panel" aria-labelledby="debug-version-title">
+              <h4 id="debug-version-title">Phiên bản & thao tác</h4>
+              <p id="gui-version-label">GUI build: phase7.5 / đang tải…</p>
+              <p id="backend-version-label">Backend: đang tải…</p>
+              <button type="button" data-action="settings.refresh_status">Làm mới trạng thái</button>
+              <h5>Lần bấm gần nhất</h5>
+              <dl class="debug-log" id="debug-action-log">
+                <div><dt>button id</dt><dd>Chưa có thao tác</dd></div>
+                <div><dt>endpoint</dt><dd>—</dd></div>
+                <div><dt>payload</dt><dd>—</dd></div>
+                <div><dt>response</dt><dd>—</dd></div>
+              </dl>
+            </article>
+          </div>
+          <article class="panel provider-settings" aria-labelledby="provider-settings-title">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">API dịch</p>
+                <h4 id="provider-settings-title">Cấu hình provider cho GUI</h4>
+              </div>
+              <p class="muted" id="provider-status">Không hiển thị raw API key.</p>
+            </div>
+            <form class="form-grid" id="provider-form">
+              <label>Tên provider <input name="provider_name" autocomplete="off" placeholder="openai-main" required /></label>
+              <label>Loại provider
+                <select name="provider_type" required>
+                  <option value="mock">mock</option>
+                  <option value="openai_responses">openai_responses</option>
+                  <option value="openai_chat_compatible">openai_chat_compatible</option>
+                  <option value="anthropic_messages">anthropic_messages</option>
+                  <option value="google_gemini">google_gemini</option>
+                </select>
+              </label>
+              <label>Base URL <input name="base_url" autocomplete="off" placeholder="https://api.openai.com/v1" /></label>
+              <label>Model chính <input name="primary_model" autocomplete="off" placeholder="gpt-5.5" required /></label>
+              <label>Model dự phòng <input name="fallback_model" autocomplete="off" placeholder="gpt-5.4-mini" /></label>
+              <label>API key <input name="api_key" type="password" autocomplete="new-password" placeholder="Nhập key mới hoặc để nguyên" /></label>
+              <label>Timeout giây <input name="timeout_seconds" type="number" min="1" step="1" value="30" /></label>
+              <label>Số lần thử lại <input name="max_retries" type="number" min="0" step="1" value="2" /></label>
+            </form>
+            <div class="button-row">
+              <button type="button" data-action="settings.edit_provider">Sửa cấu hình</button>
+              <button class="primary" type="button" data-action="settings.save_provider">Lưu cấu hình</button>
+              <button type="button" data-action="settings.check_api">Kiểm tra API</button>
+              <button type="button" data-action="settings.clear_api_key">Xóa API key</button>
+              <button type="button" data-action="settings.cancel_provider">Hủy thay đổi</button>
+              <button type="button" data-action="settings.api_help">Mở hướng dẫn cấu hình API</button>
+            </div>
+            <p class="muted" id="provider-config-path">Cấu hình GUI lưu riêng trong workspace.</p>
+          </article>
+        </section>
+
+        <section class="page" id="page-manga" aria-labelledby="manga-title">
+          <article class="panel coming-soon">
+            <p class="eyebrow">Manga / Ảnh</p>
+            <h3 id="manga-title">Sắp ra mắt</h3>
+            <p>Tính năng dự kiến: OCR, nhận diện khung thoại, thứ tự đọc, dịch nội dung ảnh, chèn chữ tiếng Việt, xuất CBZ/PDF.</p>
+            <p class="warning">Phase 7 không có OCR, xử lý ảnh, nhập ảnh hay production manga action.</p>
+            <div class="button-row">
+              <button type="button" data-action="manga.plan">Tìm hiểu kế hoạch</button>
+              <button type="button" data-action="manga.close">Đóng</button>
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="technical-dialog" aria-labelledby="technical-title">
+      <h3 id="technical-title">Xem chi tiết kỹ thuật</h3>
+      <pre id="technical-content"></pre>
+      <button type="button" id="close-technical">Đóng</button>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="app.js?v=phase7.5-browser-reality-fix"></script>
+  </body>
+</html>

@@ -22,15 +22,15 @@ dev = [
 
 [project.scripts]
 nts = "nts_cli.main:app"
+nts-gui-backend = "nts_gui_backend.server:main"
 
 [tool.setuptools.packages.find]
-where = ["packages", "apps/cli"]
+where = ["packages", "apps/cli", "apps/gui/backend"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["packages", "apps/cli"]
+pythonpath = ["packages", "apps/cli", "apps/gui/backend"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-

@@ -37,6 +37,7 @@ credentials/
 token*
 *api_key*
 *apikey*
+gui_provider.local.json
 
 # Local Codex / agent memory / personal configs
 .codex/
@@ -73,6 +74,7 @@ Thumbs.db
 *.log
 logs/
 # temp/test artifacts
+tmp/
 .tmp/
 .codex_pytest_tmp/
 .p1/
@@ -109,3 +111,4 @@ test_data/translation_eval/
 .agentmemory/
 agentmemory_data/
 iii-data/
+.tmp_*/
