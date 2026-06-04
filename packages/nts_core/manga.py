@@ -25,7 +25,12 @@ from nts_storage.workspace import Workspace
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 SUPPORTED_ARCHIVE_EXTENSIONS = {".cbz", ".zip"}
 MANGA_MANIFEST_SCHEMA_VERSION = "phase9a.page_manifest.v1"
+MANGA_PREPROCESS_SCHEMA_VERSION = "phase9b.preprocess_manifest.v1"
 MANGA_HASH_ALGORITHM = "sha256"
+MANGA_PREPROCESS_NORMALIZED_FORMAT = "png"
+MANGA_PREPROCESS_MAX_DIMENSION = 2400
+MANGA_PREVIEW_MAX_DIMENSION = 320
+MANGA_THRESHOLD_VALUE = 180
 MANGA_ARTIFACT_SUBDIRS = [
     "import",
     "preprocessing",
@@ -155,6 +160,82 @@ def _image_dimensions(data: bytes, name: str) -> tuple[int | None, int | None]:
     if suffix == ".webp":
         return _webp_dimensions(data)
     return None, None
+
+
+def _load_pillow():
+    try:
+        from PIL import Image, ImageOps
+    except Exception as exc:
+        raise ValueError(
+            "BLOCKED_IMAGE_LIBRARY: Pillow is required for deterministic image preprocessing."
+        ) from exc
+    return Image, ImageOps
+
+
+def _relative_to_workspace(workspace: Workspace, path: Path) -> str:
+    return path.relative_to(workspace.path).as_posix()
+
+
+def _artifact_root_for_run(workspace: Workspace, *, project_slug: str, run_id: str) -> Path:
+    return workspace.path / "artifacts" / "manga" / project_slug / run_id
+
+
+def _page_manifest_path(workspace: Workspace, *, project_slug: str, run_id: str) -> Path:
+    return _artifact_root_for_run(workspace, project_slug=project_slug, run_id=run_id) / "page_manifest.json"
+
+
+def _load_page_manifest(workspace: Workspace, *, project_slug: str, run_id: str) -> dict[str, Any]:
+    manifest_path = _page_manifest_path(workspace, project_slug=project_slug, run_id=run_id)
+    if not manifest_path.exists():
+        raise ValueError(f"BLOCKED_MANIFEST_INCOMPLETE: page manifest not found for run {run_id}.")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("BLOCKED_MANIFEST_INCOMPLETE: page manifest is not valid JSON.") from exc
+    if manifest.get("project_slug") != project_slug or manifest.get("run_id") != run_id:
+        raise ValueError("BLOCKED_MANIFEST_INCOMPLETE: page manifest project/run mismatch.")
+    pages = manifest.get("pages")
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("BLOCKED_MANIFEST_INCOMPLETE: page manifest has no pages.")
+    for page in pages:
+        if not isinstance(page, dict) or not page.get("page_id") or not page.get("artifact_relpath"):
+            raise ValueError("BLOCKED_MANIFEST_INCOMPLETE: page entry lacks image reference.")
+    return manifest
+
+
+def _ensure_preprocess_dirs(artifact_root: Path) -> dict[str, Path]:
+    base = artifact_root / "preprocessing"
+    dirs = {
+        "base": base,
+        "pages": base / "pages",
+        "ocr_variants": base / "ocr_variants",
+        "previews": base / "previews",
+    }
+    for directory in dirs.values():
+        directory.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def _save_png(image: Any, path: Path, *, force: bool) -> None:
+    if path.exists() and not force:
+        return
+    image.save(path, format="PNG", optimize=False)
+
+
+def _resize_for_policy(image: Any, *, max_dimension: int) -> tuple[Any, bool]:
+    width, height = image.size
+    largest = max(width, height)
+    if largest <= max_dimension:
+        return image.copy(), False
+    scale = max_dimension / largest
+    new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    resample = getattr(type(image), "Resampling", None)
+    method = resample.LANCZOS if resample is not None else 1
+    return image.resize(new_size, method), True
+
+
+def _image_checksum(path: Path) -> str:
+    return sha256_file(path)
 
 
 def _collect_folder_images(path: Path) -> tuple[list[ImageSource], list[str]]:
@@ -530,6 +611,240 @@ def import_manga_pages(
             result_data=result,
         )
         conn.commit()
+    return {"task_run_id": task_id, **result}
+
+
+def preprocess_manga_pages(
+    workspace: Workspace,
+    *,
+    project_slug: str,
+    run_id: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    project = get_project_by_slug(workspace, project_slug)
+    Image, ImageOps = _load_pillow()
+    page_manifest = _load_page_manifest(workspace, project_slug=project_slug, run_id=run_id)
+    artifact_root = _artifact_root_for_run(workspace, project_slug=project_slug, run_id=run_id)
+    preprocess_dirs = _ensure_preprocess_dirs(artifact_root)
+    preprocess_manifest_path = preprocess_dirs["base"] / "preprocess_manifest.json"
+    preprocess_summary_path = preprocess_dirs["base"] / "preprocess_summary.md"
+
+    if preprocess_manifest_path.exists() and not force:
+        existing_manifest = json.loads(preprocess_manifest_path.read_text(encoding="utf-8"))
+        return {
+            "project_id": project["id"],
+            "project_slug": project_slug,
+            "run_id": run_id,
+            "preprocess_manifest_path": _relative_to_workspace(workspace, preprocess_manifest_path),
+            "preprocess_summary_path": _relative_to_workspace(workspace, preprocess_summary_path),
+            "pages_processed": existing_manifest.get("page_count", 0),
+            "warnings": existing_manifest.get("warnings", []),
+            "rerun_reused_existing": True,
+            "force": False,
+            "manifest": existing_manifest,
+        }
+
+    now = utc_now()
+    records: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    with connection(workspace.db_path) as conn:
+        task_id = insert_task_run(
+            conn,
+            task_type="manga.preprocess",
+            status="running",
+            stage="preprocess_pages",
+            project_id=project["id"],
+            input_data={"project": project_slug, "run_id": run_id, "force": force},
+            result_data={},
+        )
+        for page in page_manifest["pages"]:
+            page_id = str(page["page_id"])
+            page_index = int(page["page_index"])
+            source_rel = str(page["artifact_relpath"])
+            source_path = workspace.path / source_rel
+            page_warnings: list[str] = []
+            if not source_path.exists():
+                raise ValueError(
+                    f"BLOCKED_MANIFEST_INCOMPLETE: source artifact missing for page {page_id}."
+                )
+            original_checksum = sha256_file(source_path)
+            with Image.open(source_path) as source_image:
+                exif_orientation = None
+                try:
+                    exif_orientation = source_image.getexif().get(274)
+                except Exception:
+                    page_warnings.append("exif_orientation_unreadable")
+                oriented = ImageOps.exif_transpose(source_image)
+                orientation_applied = exif_orientation not in (None, 1)
+                normalized_rgb = oriented.convert("RGB")
+                normalized, resized = _resize_for_policy(
+                    normalized_rgb, max_dimension=MANGA_PREPROCESS_MAX_DIMENSION
+                )
+                if resized:
+                    page_warnings.append(
+                        f"resized_to_max_dimension:{MANGA_PREPROCESS_MAX_DIMENSION}"
+                    )
+                stem = f"{page_index:04d}_{page_id}"
+                normalized_path = preprocess_dirs["pages"] / f"{stem}_normalized.png"
+                grayscale_path = preprocess_dirs["ocr_variants"] / f"{stem}_grayscale.png"
+                threshold_path = preprocess_dirs["ocr_variants"] / f"{stem}_threshold.png"
+                preview_path = preprocess_dirs["previews"] / f"{stem}_preview.png"
+
+                _save_png(normalized, normalized_path, force=force)
+                grayscale = normalized.convert("L")
+                _save_png(grayscale, grayscale_path, force=force)
+                contrast = ImageOps.autocontrast(grayscale)
+                threshold = contrast.point(
+                    lambda value: 255 if value >= MANGA_THRESHOLD_VALUE else 0,
+                    mode="L",
+                )
+                _save_png(threshold, threshold_path, force=force)
+                preview, _preview_resized = _resize_for_policy(
+                    normalized_rgb, max_dimension=MANGA_PREVIEW_MAX_DIMENSION
+                )
+                _save_png(preview, preview_path, force=force)
+
+            if sha256_file(source_path) != original_checksum:
+                raise ValueError(f"Source artifact changed during preprocessing for page {page_id}.")
+
+            page_warnings.extend(
+                warning
+                for warning in [
+                    "width_missing_in_source_manifest" if page.get("width") is None else None,
+                    "height_missing_in_source_manifest" if page.get("height") is None else None,
+                ]
+                if warning is not None
+            )
+            normalized_width, normalized_height = _png_dimensions(
+                normalized_path.read_bytes()
+            )
+            record = {
+                "page_id": page_id,
+                "source_artifact": source_rel,
+                "normalized_artifact": _relative_to_workspace(workspace, normalized_path),
+                "ocr_variant_artifacts": {
+                    "grayscale": _relative_to_workspace(workspace, grayscale_path),
+                    "threshold": _relative_to_workspace(workspace, threshold_path),
+                },
+                "preview_artifact": _relative_to_workspace(workspace, preview_path),
+                "width": normalized_width,
+                "height": normalized_height,
+                "format": MANGA_PREPROCESS_NORMALIZED_FORMAT,
+                "orientation_applied": orientation_applied,
+                "warnings": page_warnings,
+            }
+            records.append(record)
+            warnings.extend(f"{page_id}:{warning}" for warning in page_warnings)
+
+            for artifact_kind, artifact_path in [
+                ("preprocess.normalized", normalized_path),
+                ("preprocess.ocr.grayscale", grayscale_path),
+                ("preprocess.ocr.threshold", threshold_path),
+                ("preprocess.preview", preview_path),
+            ]:
+                conn.execute(
+                    """
+                    INSERT INTO manga_page_artifacts (
+                        id, page_id, artifact_kind, path, checksum_sha256, metadata_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_id("mangaartifact"),
+                        page_id,
+                        artifact_kind,
+                        _relative_to_workspace(workspace, artifact_path),
+                        _image_checksum(artifact_path),
+                        json_dumps({"run_id": run_id, "stage": "preprocessing"}),
+                        now,
+                    ),
+                )
+
+        manifest = {
+            "schema_version": MANGA_PREPROCESS_SCHEMA_VERSION,
+            "project_id": project["id"],
+            "project_slug": project_slug,
+            "run_id": run_id,
+            "source_manifest": _relative_to_workspace(
+                workspace, _page_manifest_path(workspace, project_slug=project_slug, run_id=run_id)
+            ),
+            "created_at": now,
+            "force": force,
+            "page_count": len(records),
+            "pages": records,
+            "format_policy": {
+                "normalized_format": MANGA_PREPROCESS_NORMALIZED_FORMAT,
+                "ocr_variants": ["grayscale", "threshold"],
+                "threshold_value": MANGA_THRESHOLD_VALUE,
+            },
+            "size_policy": {
+                "max_dimension": MANGA_PREPROCESS_MAX_DIMENSION,
+                "preview_max_dimension": MANGA_PREVIEW_MAX_DIMENSION,
+                "upscale": False,
+            },
+            "warnings": warnings,
+        }
+        preprocess_manifest_path.write_text(json_dumps(manifest) + "\n", encoding="utf-8")
+        summary_lines = [
+            "# Manga Preprocessing Summary",
+            "",
+            f"- Schema version: `{MANGA_PREPROCESS_SCHEMA_VERSION}`",
+            f"- Project: `{project_slug}`",
+            f"- Run ID: `{run_id}`",
+            f"- Pages processed: `{len(records)}`",
+            f"- Normalized format: `{MANGA_PREPROCESS_NORMALIZED_FORMAT}`",
+            "- OCR variants: `grayscale`, `threshold`",
+            f"- Preview max dimension: `{MANGA_PREVIEW_MAX_DIMENSION}`",
+            f"- Warning count: `{len(warnings)}`",
+            "",
+        ]
+        preprocess_summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+        rel_manifest = _relative_to_workspace(workspace, preprocess_manifest_path)
+        rel_summary = _relative_to_workspace(workspace, preprocess_summary_path)
+        conn.execute(
+            """
+            INSERT INTO manga_preprocess_runs (
+                id, run_id, project_id, project_slug, source_manifest_path,
+                artifact_root, preprocess_manifest_path, page_count, force,
+                warnings_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("mangapreprocess"),
+                run_id,
+                project["id"],
+                project_slug,
+                manifest["source_manifest"],
+                _relative_to_workspace(workspace, artifact_root),
+                rel_manifest,
+                len(records),
+                1 if force else 0,
+                json_dumps(warnings),
+                now,
+                now,
+            ),
+        )
+        result = {
+            "project_id": project["id"],
+            "project_slug": project_slug,
+            "run_id": run_id,
+            "preprocess_manifest_path": rel_manifest,
+            "preprocess_summary_path": rel_summary,
+            "pages_processed": len(records),
+            "warnings": warnings,
+            "rerun_reused_existing": False,
+            "force": force,
+            "manifest": manifest,
+        }
+        update_task_run(
+            conn,
+            task_id=task_id,
+            status="success",
+            stage="completed",
+            result_data=result,
+        )
+        conn.commit()
+
     return {"task_run_id": task_id, **result}
 
 

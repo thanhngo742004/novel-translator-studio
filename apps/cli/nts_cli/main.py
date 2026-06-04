@@ -88,6 +88,7 @@ from nts_core.manga import (
     import_manga_boxes,
     import_manga_pages,
     list_manga_pages,
+    preprocess_manga_pages,
 )
 from nts_core.memory import (
     add_evidence,
@@ -1605,6 +1606,23 @@ def manga_import(
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
+@manga_app.command("preprocess")
+def manga_preprocess(
+    run_id: Annotated[str, typer.Argument(help="Phase 9A manga import run ID.")],
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing preprocessing artifacts.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = preprocess_manga_pages(ws, project_slug=project, run_id=run_id, force=force)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    task_run_id = result.get("task_run_id")
+    _print(success_envelope(result, task_run_id=task_run_id), json_output)
 
 
 @manga_pages_app.command("list")

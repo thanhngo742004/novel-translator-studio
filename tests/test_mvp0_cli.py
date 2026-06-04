@@ -64,7 +64,7 @@ def test_repeated_init_is_idempotent_and_does_not_overwrite_configs(tmp_path: Pa
         migration_versions = [
             row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")
         ]
-    assert migration_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert migration_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 
 def test_file_based_migration_initializes_core_tables_and_metadata(tmp_path: Path) -> None:

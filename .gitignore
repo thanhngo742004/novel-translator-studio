@@ -110,3 +110,5 @@ test_data/translation_eval/
 .agentmemory/
 agentmemory_data/
 iii-data/
+
+tmp/

@@ -86,7 +86,7 @@ def test_manga_migration_creates_required_tables(tmp_path: Path) -> None:
         "manga_projects",
         "manga_import_runs",
     }.issubset(tables)
-    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 
 def test_import_image_folder_registers_pages_checksum_and_warns_for_unsupported(
