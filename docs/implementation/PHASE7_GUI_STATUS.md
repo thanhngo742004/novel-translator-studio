@@ -72,7 +72,7 @@ Phase 7.5 Browser Reality Fix is implemented as a local **NTS Studio** GUI that 
 
 ## Phase 7.5 Hardening Evidence
 
-- Source evidence after hardening: `app_js.hash = 341d9116dab6`; `backend_service.hash = 0e31335e075a`.
+- Source evidence after hardening: `app_js.hash = 341d9116dab6`; `backend_service.hash = 9bbf052829cf`.
 - Independent Claude audit evidence before hardening: focused GUI tests `36 passed`; full suite `268 passed`; provider preflight `ok=true`, `route_status=primary_ok`, `chosen_model=gpt-5.5`, `message="Kiểm tra API thành công."`.
 - Independent Claude HTTP job: `job_fbe1719bda084eb7a408b188f42a4b54`; browser job: `job_204625ff2b284135a548d51f5f7b2895`; browser result: `Production rollout PASS`.
 - Path traversal evidence: `POST /api/system/open-path` with `C:\Windows\System32` returned `403 unsafe_path`.
@@ -102,9 +102,9 @@ Phase 7.5 Browser Reality Fix is implemented as a local **NTS Studio** GUI that 
 - Provider preflight now uses the same Phase 6 `write_provider_preflight` path as production rollout after writing the GUI-saved provider into workspace config.
 - Real direct GUI job smoke with `.env.local` provider: `gui-smoke` one-chapter trial created `job_361bf0e9d1054643b04372d920e91cb3`, ran `run_controlled_production_rollout`, reached `completed`, `percent: 100`, `chapters_completed: 1/1`, `chunks_completed: 1/1`, `final_decision: PASS`, `qa_pass: true`, `qa_blocking_issue_count: 0`, `rules_rendered_count: 0`, `api_calls_used: 1`.
 - Real job artifact path: `tmp/phase7_5_gui_real_smoke_utf8/artifacts/gui_jobs/job_361bf0e9d1054643b04372d920e91cb3/production_rollout`.
-- Real Edge browser smoke through DevTools: visible Phase 7.5 labels, backend `phase7.5-browser-reality-fix`, LTP off as `ltp_server: LTP chưa chạy (unavailable)`, provider status `Kiểm tra API thành công.`, redacted API key, and one-chapter translation completed `Production rollout PASS`, `chapters_completed: 1/1`, `chunks_completed: 1/1`, `percent: 100`, with no raw key in page text.
-- Real Edge smoke artifacts: `tmp/phase7_5_initial.png`, `tmp/phase7_5_settings_ltp_workspace.png`, `tmp/phase7_5_provider_test.png`, `tmp/phase7_5_translation_job.png`, and `tmp/phase7_5_browser_smoke_evidence.json`.
-- Real Edge open-folder smoke: `settings.open_workspace` called `POST /api/workspace/open-folder` and returned `opened: true`, `method: explorer.exe`, `target: output_root`, `path: <workspace>/artifacts/exports`; `projects.open` calls `POST /api/projects/{project}/open-folder` and now targets `<workspace>/artifacts/exports/<project>/txt_chapters`, so users land in the single folder containing TXT chapter files instead of the internal rollout tree.
+- Chromium browser smoke through Chrome DevTools MCP: visible Phase 7.5 labels, backend `phase7.5-browser-reality-fix`, LTP off as `ltp_server: LTP chưa chạy (unavailable)`, provider status `Kiểm tra API thành công.`, redacted API key, and one-chapter translation completed `Production rollout PASS`, `chapters_completed: 1/1`, `chunks_completed: 1/1`, `percent: 100`, with no raw key in page text. Edge was not directly verified in that audit environment.
+- Chromium smoke artifacts: `tmp/phase7_5_initial.png`, `tmp/phase7_5_settings_ltp_workspace.png`, `tmp/phase7_5_provider_test.png`, `tmp/phase7_5_translation_job.png`, and `tmp/phase7_5_browser_smoke_evidence.json`.
+- Chromium open-folder smoke: `settings.open_workspace` called `POST /api/workspace/open-folder` and returned `opened: true`, `method: explorer.exe`, `target: output_root`, `path: <workspace>/artifacts/exports`; `projects.open` calls `POST /api/projects/{project}/open-folder` and now targets `<workspace>/artifacts/exports/<project>/txt_chapters`, so users land in the single folder containing TXT chapter files instead of the internal rollout tree.
 - Open-folder smoke artifact: `tmp/phase7_5_open_folder_browser_evidence.json`.
 - Phase 7.5 browser smoke checklist artifact: `docs/implementation/PHASE7_5_BROWSER_SMOKE_CHECKLIST.md`.
 - Phase 7.5 button reality audit artifact: `docs/implementation/PHASE7_5_BUTTON_REALITY_AUDIT.md`.

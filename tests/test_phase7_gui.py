@@ -12,10 +12,12 @@ import nts_gui_backend.service as gui_service_module
 from nts_core.projects import create_project
 from nts_gui_backend.service import (
     GUI_PROVIDER_CONFIG_RELATIVE_PATH,
+    GUI_PROVIDER_PREFLIGHT_RELATIVE_PATH,
     JOB_LOCK,
     JOB_REGISTRY,
     SAFE_TRANSLATION_DEFAULTS,
     VISIBLE_BUTTON_WIRING,
+    GuiServiceError,
     GuiService,
 )
 from nts_storage.database import connection, json_dumps, new_id, utc_now
@@ -41,6 +43,40 @@ def _project(workspace_path: Path, slug: str = "demo") -> dict[str, str]:
         domain="novel",
         genre=None,
     )
+
+
+def _save_real_gui_provider(
+    service: GuiService,
+    *,
+    provider_name: str = "gui-provider",
+    base_url: str = "https://api.example.test/v1",
+    primary_model: str = "gui-primary",
+    fallback_model: str = "gui-fallback",
+    api_key: str = "secret-provider-key",
+) -> dict[str, object]:
+    return service.handle(
+        "POST",
+        "/api/settings/provider",
+        {
+            "provider_name": provider_name,
+            "provider_type": "openai_chat_compatible",
+            "base_url": base_url,
+            "primary_model": primary_model,
+            "fallback_model": fallback_model,
+            "api_key": api_key,
+        },
+    )
+
+
+def _mark_real_gui_provider_preflight(
+    service: GuiService,
+    workspace_path: Path,
+    *,
+    chosen_model: str = "gui-primary",
+) -> None:
+    workspace = init_workspace(workspace_path)
+    settings = service._load_provider_settings(workspace, include_secret=True)
+    service._save_provider_preflight_success(workspace, settings, chosen_model, "primary_ok", 1)
 
 
 def _review_fixture(workspace_path: Path, project: dict[str, str]) -> str:
@@ -140,7 +176,7 @@ def test_provider_settings_save_load_redacts_secret(tmp_path: Path) -> None:
         "/api/settings/provider",
         {
             "provider_name": "gui-openai",
-            "provider_type": "openai_responses",
+            "provider_type": "openai_chat_compatible",
             "base_url": "https://api.example.test/v1",
             "primary_model": "gpt-test-primary",
             "fallback_model": "gpt-test-fallback",
@@ -178,7 +214,7 @@ def test_provider_test_returns_actionable_redacted_result(tmp_path: Path, monkey
         "/api/settings/provider/test",
         {
             "provider_name": "gui-openai",
-            "provider_type": "openai_responses",
+            "provider_type": "openai_chat_compatible",
             "base_url": "https://api.example.test/v1",
             "primary_model": "gpt-test-primary",
             "api_key": "secret-provider-key",
@@ -210,7 +246,7 @@ def test_provider_test_failure_is_actionable_and_redacted(tmp_path: Path, monkey
         "/api/settings/provider/test",
         {
             "provider_name": "gui-openai",
-            "provider_type": "openai_responses",
+            "provider_type": "openai_chat_compatible",
             "base_url": "https://api.example.test/v1",
             "primary_model": "missing-model",
             "fallback_model": "missing-fallback",
@@ -238,7 +274,7 @@ def test_provider_test_redacts_under_real_http_error(tmp_path: Path, monkeypatch
         "/api/settings/provider/test",
         {
             "provider_name": "gui-openai",
-            "provider_type": "openai_responses",
+            "provider_type": "openai_chat_compatible",
             "base_url": "https://api.example.test/v1",
             "primary_model": "gpt-test-primary",
             "api_key": "secret-provider-key",
@@ -288,7 +324,7 @@ def test_provider_preflight_normalizes_base_url_and_uses_core_preflight(tmp_path
         "/api/settings/provider/test",
         {
             "provider_name": "gui-openai",
-            "provider_type": "openai_compatible",
+            "provider_type": "openai_chat_compatible",
             "base_url": "https://api.example.test/v1/v1",
             "primary_model": "gpt-test-primary",
             "api_key": "secret-provider-key",
@@ -313,7 +349,7 @@ def test_provider_key_can_be_replaced_and_cleared(tmp_path: Path) -> None:
         "/api/settings/provider",
         {
             "provider_name": "gui-openai",
-            "provider_type": "openai_responses",
+            "provider_type": "openai_chat_compatible",
             "base_url": "https://api.one.test/v1",
             "primary_model": "model-one",
             "api_key": "first-secret",
@@ -324,7 +360,7 @@ def test_provider_key_can_be_replaced_and_cleared(tmp_path: Path) -> None:
         "/api/settings/provider",
         {
             "provider_name": "gui-openai",
-            "provider_type": "openai_responses",
+            "provider_type": "openai_chat_compatible",
             "base_url": "https://api.two.test/v1",
             "primary_model": "model-two",
             "api_key": "second-secret",
@@ -335,7 +371,7 @@ def test_provider_key_can_be_replaced_and_cleared(tmp_path: Path) -> None:
         "/api/settings/provider",
         {
             "provider_name": "gui-openai",
-            "provider_type": "openai_responses",
+            "provider_type": "openai_chat_compatible",
             "base_url": "https://api.two.test/v1",
             "primary_model": "model-two",
             "clear_api_key": True,
@@ -352,22 +388,108 @@ def test_provider_key_can_be_replaced_and_cleared(tmp_path: Path) -> None:
     assert cleared["settings"]["api_key"] == ""
 
 
+def test_real_provider_requires_successful_preflight_before_translation(tmp_path: Path, monkeypatch) -> None:
+    service, workspace_path = _service(tmp_path)
+    _project(workspace_path)
+    monkeypatch.setattr(GuiService, "_run_translation_job", lambda self, job_id: None)
+    _save_real_gui_provider(service)
+
+    try:
+        service.handle("POST", "/api/projects/demo/translate/trial", {"chapter_start": 1, "chapter_end": 1})
+    except GuiServiceError as exc:
+        assert exc.code == "provider_not_tested"
+        assert "Kiểm tra API" in exc.message
+    else:
+        raise AssertionError("Expected provider_not_tested")
+
+
+def test_successful_preflight_allows_translation_start(tmp_path: Path, monkeypatch) -> None:
+    service, workspace_path = _service(tmp_path)
+    _project(workspace_path)
+    monkeypatch.setattr(GuiService, "_run_translation_job", lambda self, job_id: None)
+
+    def fake_preflight(_settings: dict[str, object]) -> tuple[str, str]:
+        return "gui-primary", "primary_ok"
+
+    monkeypatch.setattr(GuiService, "_real_provider_preflight", staticmethod(fake_preflight))
+    _save_real_gui_provider(service)
+    result = service.handle("POST", "/api/settings/provider/test")
+    started = service.handle("POST", "/api/projects/demo/translate/trial", {"chapter_start": 1, "chapter_end": 1})
+
+    assert result["ok"] is True
+    assert started["status"] == "queued"
+    assert started["payload"]["provider"]["provider_type"] == "openai_chat_compatible"
+
+
+def test_provider_settings_change_invalidates_preflight(tmp_path: Path, monkeypatch) -> None:
+    service, workspace_path = _service(tmp_path)
+    _project(workspace_path)
+    monkeypatch.setattr(GuiService, "_run_translation_job", lambda self, job_id: None)
+    _save_real_gui_provider(service, api_key="first-secret")
+    _mark_real_gui_provider_preflight(service, workspace_path)
+    assert (workspace_path / GUI_PROVIDER_PREFLIGHT_RELATIVE_PATH).exists()
+
+    _save_real_gui_provider(service, api_key="second-secret")
+
+    assert not (workspace_path / GUI_PROVIDER_PREFLIGHT_RELATIVE_PATH).exists()
+    try:
+        service.handle("POST", "/api/projects/demo/translate/trial", {"chapter_start": 1, "chapter_end": 1})
+    except GuiServiceError as exc:
+        assert exc.code == "provider_not_tested"
+        assert "Kiểm tra API" in exc.message
+    else:
+        raise AssertionError("Expected stale preflight to be invalidated")
+
+
+def test_preflight_metadata_does_not_store_raw_api_key(tmp_path: Path, monkeypatch) -> None:
+    service, workspace_path = _service(tmp_path)
+
+    def fake_preflight(_settings: dict[str, object]) -> tuple[str, str]:
+        return "gui-primary", "primary_ok"
+
+    monkeypatch.setattr(GuiService, "_real_provider_preflight", staticmethod(fake_preflight))
+    _save_real_gui_provider(service, api_key="raw-secret-provider-key")
+    result = service.handle("POST", "/api/settings/provider/test")
+    metadata_path = workspace_path / GUI_PROVIDER_PREFLIGHT_RELATIVE_PATH
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata_text = metadata_path.read_text(encoding="utf-8")
+
+    assert result["ok"] is True
+    assert "raw-secret-provider-key" not in metadata_text
+    assert metadata["identity"]["api_key_hash"]
+    assert "api_key" not in metadata["identity"]
+    assert len(metadata["identity"]["api_key_hash"]) == 64
+
+
+def test_unsupported_provider_type_is_rejected(tmp_path: Path) -> None:
+    service, _workspace_path = _service(tmp_path)
+
+    try:
+        service.handle(
+            "POST",
+            "/api/settings/provider",
+            {
+                "provider_name": "gui-openai",
+                "provider_type": "openai_responses",
+                "base_url": "https://api.example.test/v1",
+                "primary_model": "gpt-test-primary",
+                "api_key": "secret-provider-key",
+            },
+        )
+    except GuiServiceError as exc:
+        assert exc.code == "unsupported_provider_type"
+        assert "openai_chat_compatible" in exc.message
+        assert "mock" in exc.message
+    else:
+        raise AssertionError("Expected unsupported_provider_type")
+
+
 def test_translation_payload_uses_safe_defaults_and_no_raw_nlp_cache(tmp_path: Path, monkeypatch) -> None:
     service, workspace_path = _service(tmp_path)
     _project(workspace_path)
     monkeypatch.setattr(GuiService, "_run_translation_job", lambda self, job_id: None)
-    service.handle(
-        "POST",
-        "/api/settings/provider",
-        {
-            "provider_name": "gui-provider",
-            "provider_type": "openai_responses",
-            "base_url": "https://api.example.test/v1",
-            "primary_model": "gui-primary",
-            "fallback_model": "gui-fallback",
-            "api_key": "secret-provider-key",
-        },
-    )
+    _save_real_gui_provider(service)
+    _mark_real_gui_provider_preflight(service, workspace_path)
 
     result = service.handle(
         "POST",
@@ -434,18 +556,8 @@ def test_translation_job_invokes_phase6_rollout_with_gui_provider(tmp_path: Path
         return summary
 
     monkeypatch.setattr(gui_service_module, "run_controlled_production_rollout", fake_rollout)
-    service.handle(
-        "POST",
-        "/api/settings/provider",
-        {
-            "provider_name": "gui-provider",
-            "provider_type": "openai_responses",
-            "base_url": "https://api.example.test/v1",
-            "primary_model": "gui-primary",
-            "fallback_model": "gui-fallback",
-            "api_key": "secret-provider-key",
-        },
-    )
+    _save_real_gui_provider(service)
+    _mark_real_gui_provider_preflight(service, workspace_path)
 
     started = service.handle("POST", "/api/projects/demo/translate/batch", {"chapter_start": 1, "chapter_end": 3})
     deadline = time.monotonic() + 3
@@ -491,12 +603,13 @@ def test_translation_job_readiness_uses_saved_provider_not_frontend_payload(tmp_
     service.save_provider_settings(
         {
             "provider_name": "gui-provider",
-            "provider_type": "openai_compatible",
+            "provider_type": "openai_chat_compatible",
             "base_url": "https://api.example.test/v1",
             "primary_model": "gui-primary",
             "api_key": "secret-provider-key",
         }
     )
+    _mark_real_gui_provider_preflight(service, workspace_path)
     payload = service.translation_payload({"chapter_start": 1, "chapter_end": 1})
     payload["provider"] = service.get_provider_settings()
 
@@ -955,6 +1068,21 @@ def test_phase75_status_doc_hashes_match_disk() -> None:
     for label, value in expected.items():
         assert f"{label} = {value}" in status_doc
         assert f"{label} = {value}" in smoke_doc
+
+
+def test_phase75_docs_do_not_overclaim_edge_browser_smoke() -> None:
+    docs = "\n".join(
+        [
+            Path("docs/implementation/PHASE7_GUI_STATUS.md").read_text(encoding="utf-8"),
+            Path("docs/implementation/PHASE7_5_BROWSER_SMOKE_CHECKLIST.md").read_text(encoding="utf-8"),
+        ]
+    )
+
+    assert "Real Edge browser smoke" not in docs
+    assert "Real Edge smoke" not in docs
+    assert "Real Edge open-folder smoke" not in docs
+    assert "Chromium" in docs
+    assert "Chrome DevTools" in docs
 
 
 def test_phase75_release_assets_are_not_git_ignored() -> None:

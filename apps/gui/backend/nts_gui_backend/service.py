@@ -36,6 +36,8 @@ SAFE_TRANSLATION_DEFAULTS: dict[str, Any] = {
 }
 
 GUI_PROVIDER_CONFIG_RELATIVE_PATH = Path("config") / "gui_provider.local.json"
+GUI_PROVIDER_PREFLIGHT_RELATIVE_PATH = Path("config") / "gui_provider_preflight.local.json"
+SUPPORTED_GUI_PROVIDER_TYPES = {"mock", "openai_chat_compatible"}
 DEFAULT_GUI_PROVIDER_SETTINGS: dict[str, Any] = {
     "provider_name": "mock",
     "provider_type": "mock",
@@ -284,6 +286,7 @@ class GuiService:
             "api_key": str(api_key or ""),
             "updated_at": utc_now(),
         }
+        self._validate_supported_provider_type(settings["provider_type"])
         if not settings["provider_name"]:
             raise GuiServiceError("provider_name_required", "Provider name is required.")
         if not settings["provider_type"]:
@@ -297,6 +300,7 @@ class GuiService:
             path.chmod(0o600)
         except OSError:
             pass
+        self._delete_provider_preflight_metadata(workspace)
         return {
             "settings": self._redact_provider_settings(settings),
             "config_path": str(path),
@@ -312,8 +316,10 @@ class GuiService:
         else:
             preview = self._redact_provider_settings(settings)
         provider_type = str(settings.get("provider_type") or "mock")
+        self._validate_supported_provider_type(provider_type)
         started = time.perf_counter()
         if provider_type == "mock":
+            self._save_provider_preflight_success(workspace, settings, str(settings.get("primary_model") or "mock"), "mock_pass", 0)
             return {
                 "ok": True,
                 "provider": settings.get("provider_name"),
@@ -327,6 +333,7 @@ class GuiService:
                 "settings": preview,
             }
         if not settings.get("api_key"):
+            self._delete_provider_preflight_metadata(workspace)
             return {
                 "ok": False,
                 "provider": settings.get("provider_name"),
@@ -342,6 +349,8 @@ class GuiService:
             }
         try:
             chosen_model, route_status = self._real_provider_preflight(settings)
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            self._save_provider_preflight_success(workspace, settings, chosen_model, route_status, latency_ms)
             return {
                 "ok": True,
                 "provider": settings.get("provider_name"),
@@ -350,11 +359,12 @@ class GuiService:
                 "fallback_model": settings.get("fallback_model"),
                 "chosen_model": chosen_model,
                 "route_status": route_status,
-                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "latency_ms": latency_ms,
                 "message": "Kiểm tra API thành công.",
                 "settings": preview,
             }
         except Exception as exc:
+            self._delete_provider_preflight_metadata(workspace)
             classified = self._classify_provider_preflight_error(exc)
             return {
                 "ok": False,
@@ -706,8 +716,13 @@ class GuiService:
         project = get_project_by_slug(workspace, project_slug)
         provider = self._provider_runtime_summary(workspace)
         payload["provider"] = provider
-        if provider.get("provider_type") != "mock" and not provider.get("api_key_configured"):
-            raise GuiServiceError("provider_not_ready", "Chưa kiểm tra được API. Hãy vào Cài đặt và bấm Kiểm tra API.")
+        provider_type = str(provider.get("provider_type") or "mock")
+        self._validate_supported_provider_type(provider_type)
+        if provider_type != "mock":
+            if not provider.get("api_key_configured"):
+                raise GuiServiceError("provider_not_ready", "Chưa kiểm tra được API. Hãy vào Cài đặt và bấm Kiểm tra API trước khi bắt đầu dịch.")
+            if not self._has_matching_provider_preflight_success(workspace):
+                raise GuiServiceError("provider_not_tested", "Chưa kiểm tra được API. Hãy vào Cài đặt và bấm Kiểm tra API trước khi bắt đầu dịch.")
         self._write_gui_provider_to_workspace(workspace)
         job_id = new_id("job")
         artifact_path = workspace.path / "artifacts" / "gui_jobs" / job_id
@@ -1018,6 +1033,85 @@ class GuiService:
         redacted["api_key"] = REDACTED_SECRET if redacted["api_key_configured"] else ""
         return redacted
 
+    def _validate_supported_provider_type(self, provider_type: str) -> None:
+        if provider_type not in SUPPORTED_GUI_PROVIDER_TYPES:
+            supported = ", ".join(sorted(SUPPORTED_GUI_PROVIDER_TYPES))
+            raise GuiServiceError(
+                "unsupported_provider_type",
+                f"Provider type '{provider_type}' is not supported in Phase 7.5 GUI. Use one of: {supported}.",
+                400,
+            )
+
+    def _provider_preflight_path(self, workspace: Workspace) -> Path:
+        return workspace.path / GUI_PROVIDER_PREFLIGHT_RELATIVE_PATH
+
+    def _api_key_fingerprint(self, api_key: str) -> str:
+        return sha256(f"nts-gui-provider-key:{api_key}".encode("utf-8")).hexdigest()
+
+    def _provider_preflight_identity(self, settings: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "provider_name": str(settings.get("provider_name") or ""),
+            "provider_type": str(settings.get("provider_type") or ""),
+            "base_url": self._normalize_provider_base_url(str(settings.get("base_url") or "")),
+            "primary_model": str(settings.get("primary_model") or ""),
+            "fallback_model": str(settings.get("fallback_model") or ""),
+            "api_key_hash": self._api_key_fingerprint(str(settings.get("api_key") or "")),
+        }
+
+    def _provider_settings_fingerprint(self, settings: dict[str, Any]) -> str:
+        identity = self._provider_preflight_identity(settings)
+        raw = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return sha256(raw.encode("utf-8")).hexdigest()
+
+    def _save_provider_preflight_success(
+        self,
+        workspace: Workspace,
+        settings: dict[str, Any],
+        chosen_model: str,
+        route_status: str,
+        latency_ms: int,
+    ) -> None:
+        path = self._provider_preflight_path(workspace)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            "status": "passed",
+            "fingerprint": self._provider_settings_fingerprint(settings),
+            "identity": self._provider_preflight_identity(settings),
+            "chosen_model": chosen_model,
+            "route_status": route_status,
+            "latency_ms": latency_ms,
+            "tested_at": utc_now(),
+        }
+        path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+    def _load_provider_preflight_metadata(self, workspace: Workspace) -> dict[str, Any]:
+        path = self._provider_preflight_path(workspace)
+        if not path.exists():
+            return {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    def _delete_provider_preflight_metadata(self, workspace: Workspace) -> None:
+        try:
+            self._provider_preflight_path(workspace).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _has_matching_provider_preflight_success(self, workspace: Workspace) -> bool:
+        settings = self._load_provider_settings(workspace, include_secret=True)
+        metadata = self._load_provider_preflight_metadata(workspace)
+        return (
+            metadata.get("status") == "passed"
+            and metadata.get("fingerprint") == self._provider_settings_fingerprint(settings)
+        )
+
     def _file_version(self, path: Path) -> dict[str, Any]:
         try:
             stat = path.stat()
@@ -1135,7 +1229,9 @@ class GuiService:
     def _write_gui_provider_to_workspace(self, workspace: Workspace) -> dict[str, Any]:
         settings = self._load_provider_settings(workspace, include_secret=True)
         provider_name = str(settings.get("provider_name") or "mock")
-        if provider_name == "mock" or settings.get("provider_type") == "mock":
+        provider_type = str(settings.get("provider_type") or "mock")
+        self._validate_supported_provider_type(provider_type)
+        if provider_name == "mock" or provider_type == "mock":
             return settings
         path = workspace.config_dir / "providers.yaml"
         try:
@@ -1146,7 +1242,7 @@ class GuiService:
                 data = {}
             providers = data.setdefault("providers", {})
             providers[provider_name] = {
-                "type": "openai_chat_compatible",
+                "type": provider_type,
                 "base_url": str(settings.get("base_url") or "").rstrip("/"),
                 "api_key_env": GUI_PROVIDER_ENV_VAR,
                 "models": [value for value in [settings.get("primary_model"), settings.get("fallback_model")] if value],
