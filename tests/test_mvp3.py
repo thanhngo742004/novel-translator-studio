@@ -91,7 +91,7 @@ def test_export_bundles_migration_exists(tmp_path: Path) -> None:
         }
         versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations")]
     assert "export_bundles" in tables
-    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
 
 def test_export_bundle_includes_active_memory_and_excludes_non_active(tmp_path: Path) -> None:

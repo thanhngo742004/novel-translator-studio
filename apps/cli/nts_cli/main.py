@@ -87,8 +87,10 @@ from nts_core.manga import (
     export_manga_manifest,
     import_manga_boxes,
     import_manga_pages,
+    list_manga_boxes,
     list_manga_pages,
     preprocess_manga_pages,
+    run_manga_detection,
 )
 from nts_core.memory import (
     add_evidence,
@@ -1625,6 +1627,22 @@ def manga_preprocess(
     _print(success_envelope(result, task_run_id=task_run_id), json_output)
 
 
+@manga_app.command("detect")
+def manga_detect(
+    run_id: Annotated[str, typer.Argument(help="Phase 9A/9B manga run ID.")],
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    adapter: Annotated[str, typer.Option("--adapter", help="Detection adapter ID.")] = "mock",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        result = run_manga_detection(ws, project_slug=project, run_id=run_id, adapter_id=adapter)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope(result, task_run_id=result["task_run_id"]), json_output)
+
+
 @manga_pages_app.command("list")
 def manga_pages_list(
     project: Annotated[str, typer.Option("--project", help="Project slug.")],
@@ -1637,6 +1655,21 @@ def manga_pages_list(
     except (WorkspaceError, ValueError) as exc:
         _fail("VALIDATION_ERROR", str(exc), 4, json_output)
     _print(success_envelope({"pages": pages}), json_output)
+
+
+@manga_boxes_app.command("list")
+def manga_boxes_list(
+    project: Annotated[str, typer.Option("--project", help="Project slug.")],
+    workspace: WorkspaceOption = None,
+    page_index: Annotated[Optional[int], typer.Option("--page-index", help="Optional page index.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    try:
+        ws = discover_workspace(_workspace_arg(workspace))
+        boxes = list_manga_boxes(ws, project_slug=project, page_index=page_index)
+    except (WorkspaceError, ValueError) as exc:
+        _fail("VALIDATION_ERROR", str(exc), 4, json_output)
+    _print(success_envelope({"boxes": boxes}), json_output)
 
 
 @manga_boxes_app.command("import")
