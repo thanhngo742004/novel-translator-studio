@@ -47,6 +47,7 @@ iii-data/
 
 # NTS local workspaces and generated artifacts
 workspace*/
+artifacts/manga/
 artifacts/
 *.sqlite
 *.sqlite3

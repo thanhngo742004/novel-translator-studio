@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
+import struct
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +23,23 @@ from nts_storage.workspace import Workspace
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+SUPPORTED_ARCHIVE_EXTENSIONS = {".cbz", ".zip"}
+MANGA_MANIFEST_SCHEMA_VERSION = "phase9a.page_manifest.v1"
+MANGA_HASH_ALGORITHM = "sha256"
+MANGA_ARTIFACT_SUBDIRS = [
+    "import",
+    "preprocessing",
+    "detection",
+    "ocr",
+    "reading_order",
+    "translation",
+    "cleaning",
+    "rendering",
+    "qa",
+    "export",
+    "provider",
+    "human_review",
+]
 
 
 @dataclass(frozen=True)
@@ -30,6 +47,7 @@ class ImageSource:
     name: str
     data: bytes | None
     path: Path | None
+    source_relpath: str
 
 
 def _safe_name(name: str) -> str:
@@ -43,6 +61,102 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _stable_id(prefix: str, *parts: object) -> str:
+    payload = "|".join(str(part) for part in parts)
+    return f"{prefix}_{_sha256_bytes(payload.encode('utf-8'))[:32]}"
+
+
+def _source_path_hash(path: Path) -> str:
+    return _sha256_bytes(str(path.resolve()).encode("utf-8"))
+
+
+def _image_format_from_suffix(name: str) -> str:
+    suffix = Path(name).suffix.lower().lstrip(".")
+    if suffix == "jpg":
+        return "jpeg"
+    return suffix
+
+
+def _png_dimensions(data: bytes) -> tuple[int | None, int | None]:
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        return struct.unpack(">II", data[16:24])
+    return None, None
+
+
+def _jpeg_dimensions(data: bytes) -> tuple[int | None, int | None]:
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None, None
+    index = 2
+    sof_markers = {
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    }
+    while index + 4 <= len(data):
+        while index < len(data) and data[index] != 0xFF:
+            index += 1
+        while index < len(data) and data[index] == 0xFF:
+            index += 1
+        if index >= len(data):
+            break
+        marker = data[index]
+        index += 1
+        if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            continue
+        if index + 2 > len(data):
+            break
+        segment_length = struct.unpack(">H", data[index : index + 2])[0]
+        if segment_length < 2 or index + segment_length > len(data):
+            break
+        if marker in sof_markers and segment_length >= 7:
+            height = struct.unpack(">H", data[index + 3 : index + 5])[0]
+            width = struct.unpack(">H", data[index + 5 : index + 7])[0]
+            return width, height
+        index += segment_length
+    return None, None
+
+
+def _webp_dimensions(data: bytes) -> tuple[int | None, int | None]:
+    if len(data) < 30 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None, None
+    chunk = data[12:16]
+    if chunk == b"VP8X" and len(data) >= 30:
+        width = int.from_bytes(data[24:27], "little") + 1
+        height = int.from_bytes(data[27:30], "little") + 1
+        return width, height
+    if chunk == b"VP8L" and len(data) >= 25 and data[20] == 0x2F:
+        bits = int.from_bytes(data[21:25], "little")
+        width = (bits & 0x3FFF) + 1
+        height = ((bits >> 14) & 0x3FFF) + 1
+        return width, height
+    if chunk == b"VP8 " and len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":
+        width = struct.unpack("<H", data[26:28])[0] & 0x3FFF
+        height = struct.unpack("<H", data[28:30])[0] & 0x3FFF
+        return width, height
+    return None, None
+
+
+def _image_dimensions(data: bytes, name: str) -> tuple[int | None, int | None]:
+    suffix = Path(name).suffix.lower()
+    if suffix == ".png":
+        return _png_dimensions(data)
+    if suffix in {".jpg", ".jpeg"}:
+        return _jpeg_dimensions(data)
+    if suffix == ".webp":
+        return _webp_dimensions(data)
+    return None, None
+
+
 def _collect_folder_images(path: Path) -> tuple[list[ImageSource], list[str]]:
     warnings: list[str] = []
     images: list[ImageSource] = []
@@ -50,13 +164,13 @@ def _collect_folder_images(path: Path) -> tuple[list[ImageSource], list[str]]:
         if not entry.is_file():
             continue
         if entry.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
-            images.append(ImageSource(name=entry.name, data=None, path=entry))
+            images.append(ImageSource(name=entry.name, data=None, path=entry, source_relpath=entry.name))
         else:
             warnings.append(f"unsupported_file_ignored:{entry.name}")
     return images, warnings
 
 
-def _collect_cbz_images(path: Path) -> tuple[list[ImageSource], list[str]]:
+def _collect_archive_images(path: Path) -> tuple[list[ImageSource], list[str]]:
     warnings: list[str] = []
     images: list[ImageSource] = []
     try:
@@ -73,10 +187,11 @@ def _collect_cbz_images(path: Path) -> tuple[list[ImageSource], list[str]]:
                         name=Path(info.filename).name,
                         data=archive.read(info),
                         path=None,
+                        source_relpath=info.filename,
                     )
                 )
     except zipfile.BadZipFile as exc:
-        raise ValueError(f"Invalid CBZ archive: {path}") from exc
+        raise ValueError(f"Invalid CBZ/ZIP archive: {path}") from exc
     return images, warnings
 
 
@@ -87,11 +202,19 @@ def _collect_images(path: Path) -> tuple[list[ImageSource], list[str], str]:
     if resolved.is_dir():
         images, warnings = _collect_folder_images(resolved)
         source_kind = "folder"
-    elif resolved.is_file() and resolved.suffix.lower() == ".cbz":
-        images, warnings = _collect_cbz_images(resolved)
-        source_kind = "cbz"
+    elif resolved.is_file() and resolved.suffix.lower() in SUPPORTED_ARCHIVE_EXTENSIONS:
+        images, warnings = _collect_archive_images(resolved)
+        source_kind = "cbz" if resolved.suffix.lower() == ".cbz" else "zip"
+    elif resolved.is_file() and resolved.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+        images = [ImageSource(name=resolved.name, data=None, path=resolved, source_relpath=resolved.name)]
+        warnings = []
+        source_kind = "single_image"
+    elif resolved.is_file() and resolved.suffix.lower() == ".pdf":
+        raise ValueError(
+            "BLOCKED_PDF_IMPORT_ADAPTER_NOT_CONFIGURED: PDF import adapter is not configured."
+        )
     else:
-        raise ValueError("Manga import supports folders and .cbz archives only.")
+        raise ValueError("Manga import supports folders, single images, .cbz, and .zip archives only.")
     if not images:
         raise ValueError("No supported manga image files found.")
     return images, warnings, source_kind
@@ -105,6 +228,85 @@ def _read_image_source(source: ImageSource) -> tuple[bytes, str]:
     return source.path.read_bytes(), sha256_file(source.path)
 
 
+def _create_artifact_root(workspace: Workspace, *, project_slug: str, run_id: str) -> Path:
+    artifact_root = workspace.path / "artifacts" / "manga" / project_slug / run_id
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    for subdir in MANGA_ARTIFACT_SUBDIRS:
+        (artifact_root / subdir).mkdir(parents=True, exist_ok=True)
+    (artifact_root / "import" / "pages").mkdir(parents=True, exist_ok=True)
+    return artifact_root
+
+
+def _ensure_manga_project(conn, *, project: dict[str, Any], now: str) -> str:
+    manga_project_id = _stable_id("mangaproject", project["id"], project["slug"])
+    conn.execute(
+        """
+        INSERT INTO manga_projects (
+            id, project_id, project_slug, title, source_lang, target_lang,
+            reading_direction, content_type, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id) DO UPDATE SET
+            project_slug = excluded.project_slug,
+            title = excluded.title,
+            source_lang = excluded.source_lang,
+            target_lang = excluded.target_lang,
+            updated_at = excluded.updated_at
+        """,
+        (
+            manga_project_id,
+            project["id"],
+            project["slug"],
+            project["name"],
+            project["source_lang"],
+            project["target_lang"],
+            "right_to_left",
+            "manga_image",
+            now,
+            now,
+        ),
+    )
+    return manga_project_id
+
+
+def _write_import_artifacts(
+    *,
+    artifact_root: Path,
+    manifest: dict[str, Any],
+    warnings: list[str],
+    source_kind: str,
+    source_label: str,
+) -> tuple[Path, Path, Path]:
+    manifest_path = artifact_root / "page_manifest.json"
+    warnings_path = artifact_root / "import" / "import_warnings.json"
+    summary_path = artifact_root / "import" / "import_summary.md"
+    manifest_path.write_text(json_dumps(manifest) + "\n", encoding="utf-8")
+    warnings_path.write_text(
+        json_dumps(
+            {
+                "schema_version": MANGA_MANIFEST_SCHEMA_VERSION,
+                "warning_count": len(warnings),
+                "warnings": warnings,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary_lines = [
+        "# Manga Import Summary",
+        "",
+        f"- Schema version: `{MANGA_MANIFEST_SCHEMA_VERSION}`",
+        f"- Source type: `{source_kind}`",
+        f"- Source label: `{source_label}`",
+        f"- Page count: `{manifest['page_count']}`",
+        f"- Hash algorithm: `{MANGA_HASH_ALGORITHM}`",
+        f"- Warning count: `{len(warnings)}`",
+        "- PDF import: `BLOCKED_PDF_IMPORT_ADAPTER_NOT_CONFIGURED`",
+        "",
+    ]
+    summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+    return manifest_path, summary_path, warnings_path
+
+
 def import_manga_pages(
     workspace: Workspace,
     *,
@@ -114,47 +316,84 @@ def import_manga_pages(
     project = get_project_by_slug(workspace, project_slug)
     images, warnings, source_kind = _collect_images(path)
     now = utc_now()
-    artifact_dir = workspace.path / "artifacts" / "manga" / project_slug / "pages"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    run_id = new_id("mangarun")
+    artifact_root = _create_artifact_root(workspace, project_slug=project_slug, run_id=run_id)
+    page_artifact_dir = artifact_root / "import" / "pages"
+    source_label = path.resolve().name
+    duplicate_first_seen: dict[str, str] = {}
     pages: list[dict[str, Any]] = []
 
     with connection(workspace.db_path) as conn:
+        manga_project_id = _ensure_manga_project(conn, project=project, now=now)
         task_id = insert_task_run(
             conn,
             task_type="manga.import",
             status="running",
             stage="import_pages",
             project_id=project["id"],
-            input_data={"path": str(path.resolve()), "project": project_slug},
+            input_data={
+                "source_label": source_label,
+                "source_path_hash": _source_path_hash(path),
+                "source_kind": source_kind,
+                "project": project_slug,
+            },
             result_data={},
+        )
+        conn.execute(
+            "UPDATE manga_pages SET status = ?, updated_at = ? WHERE project_id = ? AND status = ?",
+            ("superseded", now, project["id"], "active"),
         )
         for page_index, source in enumerate(images, start=1):
             data, checksum = _read_image_source(source)
-            page_id = new_id("mangapage")
+            width, height = _image_dimensions(data, source.name)
+            page_id = _stable_id("mangapage", project["id"], page_index, checksum)
+            duplicate_of = duplicate_first_seen.get(checksum)
+            if duplicate_of is None:
+                duplicate_first_seen[checksum] = page_id
+            else:
+                warnings.append(f"duplicate_page_hash:{page_id}:duplicates:{duplicate_of}:{checksum}")
             dest_name = f"{page_index:04d}_{checksum[:12]}_{_safe_name(source.name)}"
-            dest_path = artifact_dir / dest_name
+            dest_path = page_artifact_dir / dest_name
             if not dest_path.exists():
                 dest_path.write_bytes(data)
             rel_path = dest_path.relative_to(workspace.path).as_posix()
             page = {
                 "id": page_id,
+                "page_id": page_id,
                 "project_id": project["id"],
                 "chapter_id": None,
                 "page_index": page_index,
+                "display_name": source.name,
+                "source_relpath": source.source_relpath,
                 "image_path": rel_path,
+                "artifact_relpath": rel_path,
                 "checksum_sha256": checksum,
+                "image_hash": checksum,
                 "width": None,
                 "height": None,
+                "format": _image_format_from_suffix(source.name),
                 "status": "active",
+                "excluded": False,
+                "exclude_reason": None,
                 "created_at": now,
                 "updated_at": now,
             }
+            page["width"] = width
+            page["height"] = height
             conn.execute(
                 """
                 INSERT INTO manga_pages (
                     id, project_id, chapter_id, page_index, image_path, checksum_sha256,
                     width, height, status, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    page_index = excluded.page_index,
+                    image_path = excluded.image_path,
+                    checksum_sha256 = excluded.checksum_sha256,
+                    width = excluded.width,
+                    height = excluded.height,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
                 """,
                 (
                     page_id,
@@ -182,16 +421,103 @@ def import_manga_pages(
                     "original",
                     rel_path,
                     checksum,
-                    json_dumps({"source_name": source.name, "source_kind": source_kind}),
+                    json_dumps(
+                        {
+                            "source_name": source.name,
+                            "source_relpath": source.source_relpath,
+                            "source_kind": source_kind,
+                            "run_id": run_id,
+                            "format": page["format"],
+                            "width": width,
+                            "height": height,
+                        }
+                    ),
                     now,
                 ),
             )
             pages.append(page)
 
+        manifest_pages = [
+            {
+                "page_id": page["page_id"],
+                "page_index": page["page_index"],
+                "display_name": page["display_name"],
+                "source_relpath": page["source_relpath"],
+                "image_hash": page["image_hash"],
+                "width": page["width"],
+                "height": page["height"],
+                "format": page["format"],
+                "artifact_relpath": page["artifact_relpath"],
+                "excluded": page["excluded"],
+                "exclude_reason": page["exclude_reason"],
+            }
+            for page in pages
+        ]
+        manifest = {
+            "schema_version": MANGA_MANIFEST_SCHEMA_VERSION,
+            "project_id": project["id"],
+            "project_slug": project_slug,
+            "run_id": run_id,
+            "source_type": source_kind,
+            "source_label": source_label,
+            "created_at": now,
+            "pages": manifest_pages,
+            "page_count": len(manifest_pages),
+            "hash_algorithm": MANGA_HASH_ALGORITHM,
+            "warnings": warnings,
+        }
+        manifest_path, summary_path, warnings_path = _write_import_artifacts(
+            artifact_root=artifact_root,
+            manifest=manifest,
+            warnings=warnings,
+            source_kind=source_kind,
+            source_label=source_label,
+        )
+        rel_artifact_root = artifact_root.relative_to(workspace.path).as_posix()
+        rel_manifest = manifest_path.relative_to(workspace.path).as_posix()
+        rel_summary = summary_path.relative_to(workspace.path).as_posix()
+        rel_warnings = warnings_path.relative_to(workspace.path).as_posix()
+        conn.execute(
+            """
+            INSERT INTO manga_import_runs (
+                id, run_id, manga_project_id, project_id, project_slug, source_type,
+                source_label, source_path_hash, artifact_root, manifest_path, page_count,
+                errors_json, warnings_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("mangaimport"),
+                run_id,
+                manga_project_id,
+                project["id"],
+                project_slug,
+                source_kind,
+                source_label,
+                _source_path_hash(path),
+                rel_artifact_root,
+                rel_manifest,
+                len(pages),
+                json_dumps([]),
+                json_dumps(warnings),
+                now,
+                now,
+            ),
+        )
         result = {
             "project_id": project["id"],
             "project_slug": project_slug,
+            "run_id": run_id,
             "source_kind": source_kind,
+            "source_type": source_kind,
+            "source_label": source_label,
+            "artifact_root": rel_artifact_root,
+            "manifest_path": rel_manifest,
+            "page_manifest_path": rel_manifest,
+            "import_summary_path": rel_summary,
+            "import_warnings_path": rel_warnings,
+            "manifest_schema_version": MANGA_MANIFEST_SCHEMA_VERSION,
+            "hash_algorithm": MANGA_HASH_ALGORITHM,
+            "pdf_import_status": "BLOCKED_PDF_IMPORT_ADAPTER_NOT_CONFIGURED",
             "pages_imported": len(pages),
             "pages": pages,
             "warnings": warnings,
@@ -513,4 +839,3 @@ def export_manga_manifest(workspace: Workspace, *, project_slug: str) -> dict[st
         "checksum_sha256": checksum,
         "manifest": manifest,
     }
-
