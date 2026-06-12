@@ -1,1 +1,0 @@
-{"model": "gpt-5.4-mini", "provider": "mock", "validation_runs": [{"validation_index": 1}], "average_score": 90, "compression_counts": [1], "ratio_summary": {"min": 1.0, "max": 1.0, "average": 1.0}, "quality_gate": "pass"}

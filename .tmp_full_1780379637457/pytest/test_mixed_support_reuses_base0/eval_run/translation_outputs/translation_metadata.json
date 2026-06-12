@@ -1,1 +1,0 @@
-{"models": ["mock"], "samples": {"sample_1": {"mock": {"baseline": true, "path": "translation_outputs/sample_1/mock_final.txt"}}, "sample_2": {"mock": {"memory": true, "path": "translation_outputs/sample_2/mock_final.txt"}}}}

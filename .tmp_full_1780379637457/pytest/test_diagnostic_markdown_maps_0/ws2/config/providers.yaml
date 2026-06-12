@@ -1,6 +1,0 @@
-providers:
-  mock:
-    type: mock
-    base_url: "mock://local"
-    api_key_env: "MOCK_API_KEY"
-    api_key_optional: true

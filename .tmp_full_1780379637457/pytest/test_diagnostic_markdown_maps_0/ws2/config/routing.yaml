@@ -1,8 +1,0 @@
-tasks:
-  language_detect:
-    primary:
-      provider: mock
-      model_class: cheap_text
-    policy:
-      structured_output: true
-      max_cost_usd: 0.001
